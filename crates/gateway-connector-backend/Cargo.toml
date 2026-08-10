@@ -1,0 +1,25 @@
+[package]
+name = "gateway-connector-backend"
+description = "Secure GatewayConnector discovery, vault, and profile backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gateway-connector-core.workspace = true
+keyring.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tiny_http.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/gateway-connector-core",
+  "crates/gateway-connector-backend",
+  "crates/gateway-connector-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+repository = "https://github.com/fran0220/gatewayconnector"
+
+[workspace.dependencies]
+gateway-connector-core = { path = "crates/gateway-connector-core" }
+gateway-connector-backend = { path = "crates/gateway-connector-backend" }
+directories = "6"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+tiny_http = "0.12"
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+zeroize = "1"
+
+# gpui-kit and every directly used GPUI crate must resolve to one exact Zed
+# revision. These pins are intentionally optional in the app crate so Linux
+# core/backend tests do not need a window system.
+gpui-kit = { git = "https://github.com/fran0220/gpui-kit", rev = "4d035b7830beb86d41ddb5c1d399e7b0704687ee" }
+gpui = { git = "https://github.com/fran0220/zed", rev = "b6755ec0ec370c8c69b4db7c065d0fa7a2cfb2b1" }
+gpui_platform = { git = "https://github.com/fran0220/zed", rev = "b6755ec0ec370c8c69b4db7c065d0fa7a2cfb2b1", features = ["font-kit"] }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"

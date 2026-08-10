@@ -1,0 +1,28 @@
+[package]
+name = "gateway-connector-app"
+description = "Neutral GatewayConnector GPUI application"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+gpui-app = ["dep:gpui", "dep:gpui-kit", "dep:gpui_platform"]
+
+[dependencies]
+directories.workspace = true
+gateway-connector-backend.workspace = true
+gateway-connector-core.workspace = true
+gpui = { workspace = true, optional = true }
+gpui-kit = { workspace = true, optional = true }
+gpui_platform = { workspace = true, optional = true }
+
+[[bin]]
+name = "gateway-connector"
+path = "src/main.rs"
+required-features = ["gpui-app"]
+
+[lints]
+workspace = true
