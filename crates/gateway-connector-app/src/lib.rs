@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use gateway_connector_backend::ConnectionResult;
+use gateway_connector_backend::{BrowserLoginOffer, ConnectionResult};
 use gateway_connector_core::{AgentId, AgentInstall, Plan, Protocol, Verification};
 
 #[derive(Debug, Default)]
@@ -11,6 +11,7 @@ pub enum AppState {
     Loading,
     FirstRun,
     Connecting,
+    BrowserLogin(Box<BrowserLoginOffer>),
     Connected {
         connection: Box<ConnectionResult>,
         installs: Vec<AgentInstall>,

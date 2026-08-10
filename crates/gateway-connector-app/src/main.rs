@@ -3,7 +3,8 @@ use std::sync::Arc;
 use directories::{ProjectDirs, UserDirs};
 use gateway_connector_app::AppState;
 use gateway_connector_backend::{
-    ApiKey, ConnectRequest, ConnectionResult, ConnectorBackend, JsonProfileStore, OsCredentialStore,
+    ApiKey, BackendError, BrowserLoginOffer, ConnectRequest, ConnectRequestWithoutCredential,
+    ConnectionResult, ConnectorBackend, JsonProfileStore, OsCredentialStore, ProbeResult,
 };
 use gateway_connector_core::{AgentId, CanonicalBaseUrl, ChangeKind, ConnectionProfile, Protocol};
 use gpui::{
@@ -12,12 +13,22 @@ use gpui::{
 };
 use gpui_kit::prelude::*;
 
+enum ConnectOutcome {
+    Connected(Box<ConnectionResult>),
+    Browser(Box<BrowserLoginOffer>),
+    Failed(String),
+}
+
 struct ConnectorView {
     backend: Arc<ConnectorBackend>,
     state: AppState,
     gateway_url: Entity<TextInput>,
     api_key: Entity<TextInput>,
+    model_search: Entity<TextInput>,
+    model_query: String,
     initial_protocol: Entity<Select>,
+    all_model: Entity<Select>,
+    all_protocol: Entity<Select>,
     model_selects: Vec<(AgentId, Entity<Select>)>,
     protocol_selects: Vec<(AgentId, Entity<Select>)>,
     save_in_flight: bool,
@@ -38,12 +49,22 @@ impl ConnectorView {
         let api_key = cx.new(|cx| {
             TextInput::new("connector.api-key", window, cx)
                 .name("API key")
-                .placeholder("Enter API key")
+                .placeholder("API key, or leave blank for advertised browser login")
                 .secret(true)
-                .required(true)
         });
         let initial_protocol =
             cx.new(|cx| protocol_select("connector.initial-protocol", window, cx));
+        let model_search = cx.new(|cx| {
+            TextInput::new("connector.model-search", window, cx)
+                .name("Search models")
+                .placeholder("Filter by model ID or provider")
+        });
+        let all_model = cx.new(|cx| {
+            Select::new("connector.all.model", window, cx)
+                .name("All Agent models")
+                .placeholder("Choose one model for all Agents")
+        });
+        let all_protocol = cx.new(|cx| protocol_select("connector.all.protocol", window, cx));
         let mut model_selects = Vec::new();
         let mut protocol_selects = Vec::new();
         for agent in AgentId::ALL {
@@ -86,13 +107,41 @@ impl ConnectorView {
             }
         })
         .detach();
+        cx.subscribe(&model_search, |this, _, event: &TextInputEvent, cx| {
+            if let TextInputEvent::Change(value) = event {
+                this.model_query = value.to_string();
+                this.sync_model_selects(cx);
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.subscribe(&all_model, |this, select, event, cx| {
+            if let SelectEvent::Selected(id) = event {
+                select.update(cx, |select, cx| select.set_selected(Some(id.clone()), cx));
+                this.use_model_for_all(id.to_string(), cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&all_protocol, |this, select, event, cx| {
+            if let SelectEvent::Selected(id) = event {
+                select.update(cx, |select, cx| select.set_selected(Some(id.clone()), cx));
+                if let Ok(protocol) = id.parse() {
+                    this.use_protocol_for_all(protocol, cx);
+                }
+            }
+        })
+        .detach();
 
         let mut view = Self {
             backend,
             state: AppState::Loading,
             gateway_url,
             api_key,
+            model_search,
+            model_query: String::new(),
             initial_protocol,
+            all_model,
+            all_protocol,
             model_selects,
             protocol_selects,
             save_in_flight: false,
@@ -137,34 +186,91 @@ impl ConnectorView {
             .selected_id()
             .and_then(|id| id.parse().ok())
             .unwrap_or(Protocol::Auto);
-        let api_key = match ApiKey::new(raw_key) {
-            Ok(api_key) => api_key,
-            Err(error) => {
-                self.state = AppState::Failed(error.to_string());
-                cx.notify();
-                return;
-            }
-        };
         let display_name = display_name(&base_url);
         let backend = Arc::clone(&self.backend);
         self.state = AppState::Connecting;
+        self.action_error = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    backend.connect(ConnectRequest {
+                    if raw_key.trim().is_empty() {
+                        return match backend.probe(&base_url) {
+                            Ok(ProbeResult::Provisioned {
+                                manifest_url,
+                                manifest,
+                                ..
+                            }) if manifest.authentication.is_some() => {
+                                ConnectOutcome::Browser(Box::new(BrowserLoginOffer {
+                                    request: ConnectRequestWithoutCredential {
+                                        display_name,
+                                        base_url,
+                                        protocol,
+                                    },
+                                    manifest_url,
+                                    manifest: *manifest,
+                                }))
+                            }
+                            Ok(_) => ConnectOutcome::Failed(
+                                "This Gateway requires an API key; enter it and try again.".into(),
+                            ),
+                            Err(error) => ConnectOutcome::Failed(error.to_string()),
+                        };
+                    }
+                    let api_key = match ApiKey::new(raw_key) {
+                        Ok(api_key) => api_key,
+                        Err(error) => return ConnectOutcome::Failed(error.to_string()),
+                    };
+                    match backend.connect(ConnectRequest {
                         display_name,
                         base_url,
                         api_key,
                         protocol,
-                    })
+                    }) {
+                        Ok(result) => ConnectOutcome::Connected(Box::new(result)),
+                        Err(BackendError::BrowserLoginRequired(offer)) => {
+                            ConnectOutcome::Browser(offer)
+                        }
+                        Err(error) => ConnectOutcome::Failed(error.to_string()),
+                    }
                 })
                 .await;
             this.update(cx, |this, cx| {
                 match result {
+                    ConnectOutcome::Connected(result) => this.complete_connection(*result, cx),
+                    ConnectOutcome::Browser(offer) => this.state = AppState::BrowserLogin(offer),
+                    ConnectOutcome::Failed(error) => this.state = AppState::Failed(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn begin_browser_login(&mut self, cx: &mut Context<Self>) {
+        let AppState::BrowserLogin(offer) = &self.state else {
+            return;
+        };
+        let offer = offer.as_ref().clone();
+        let retry = offer.clone();
+        let backend = Arc::clone(&self.backend);
+        self.state = AppState::Connecting;
+        self.action_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { backend.browser_login(offer) })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
                     Ok(result) => this.complete_connection(result, cx),
-                    Err(error) => this.state = AppState::Failed(error.to_string()),
+                    Err(error) => {
+                        this.state = AppState::BrowserLogin(Box::new(retry));
+                        this.action_error = Some(error.to_string());
+                    }
                 }
                 cx.notify();
             })
@@ -174,27 +280,6 @@ impl ConnectorView {
     }
 
     fn complete_connection(&mut self, result: ConnectionResult, cx: &mut Context<Self>) {
-        let options = result
-            .models
-            .iter()
-            .map(|model| {
-                let mut option = SelectOption::new(model.id.clone(), model.id.clone());
-                if let Some(owner) = &model.owned_by {
-                    option = option.description(owner.clone());
-                }
-                option
-            })
-            .collect::<Vec<_>>();
-        for (agent, select) in &self.model_selects {
-            let selected = result.profile.agents[agent]
-                .default_model
-                .clone()
-                .filter(|id| options.iter().any(|option| option.id.as_ref() == id));
-            select.update(cx, |select, cx| {
-                select.set_options(options.clone(), cx);
-                select.set_selected(selected.clone().map(Into::into), cx);
-            });
-        }
         for (agent, select) in &self.protocol_selects {
             let selected = result.profile.agents[agent].protocol.as_str();
             select.update(cx, |select, cx| {
@@ -205,7 +290,80 @@ impl ConnectorView {
         self.save_error = None;
         self.action_error = None;
         self.state = AppState::connected(result);
+        self.sync_model_selects(cx);
+        self.sync_all_protocol(cx);
         self.begin_projection_status(cx);
+    }
+
+    fn sync_model_selects(&self, cx: &mut Context<Self>) {
+        let AppState::Connected { connection, .. } = &self.state else {
+            return;
+        };
+        let query = self.model_query.trim().to_ascii_lowercase();
+        let options = connection
+            .models
+            .iter()
+            .filter(|model| {
+                query.is_empty()
+                    || model.id.to_ascii_lowercase().contains(&query)
+                    || model
+                        .owned_by
+                        .as_ref()
+                        .is_some_and(|owner| owner.to_ascii_lowercase().contains(&query))
+            })
+            .map(|model| {
+                let mut option = SelectOption::new(model.id.clone(), model.id.clone());
+                if let Some(owner) = &model.owned_by {
+                    option = option.description(owner.clone());
+                }
+                option
+            })
+            .collect::<Vec<_>>();
+        let options_with_selection = |selected: Option<String>| {
+            let mut selected_options = options.clone();
+            if let Some(selected) = &selected
+                && !selected_options
+                    .iter()
+                    .any(|option| option.id.as_ref() == selected)
+            {
+                let in_catalog = connection.models.iter().any(|model| &model.id == selected);
+                let option = if in_catalog {
+                    SelectOption::new(selected.clone(), format!("{selected} (selected)"))
+                        .description("Selected model is hidden by the current filter")
+                } else {
+                    SelectOption::new(selected.clone(), format!("{selected} (unavailable)"))
+                        .description("Saved choice is not in the current model catalog")
+                        .disabled(true)
+                };
+                selected_options.push(option);
+            }
+            (selected_options, selected)
+        };
+        for (agent, select) in &self.model_selects {
+            let selected = connection.profile.agents[agent].default_model.clone();
+            let (agent_options, selected) = options_with_selection(selected);
+            let disabled = self.projection_busy || agent_options.is_empty();
+            select.update(cx, move |select, cx| {
+                select.set_options(agent_options, cx);
+                select.set_selected(selected.map(Into::into), cx);
+                select.set_disabled(disabled, cx);
+            });
+        }
+        let first = connection.profile.agents[&AgentId::Claude]
+            .default_model
+            .clone();
+        let common = AgentId::ALL
+            .iter()
+            .all(|agent| connection.profile.agents[agent].default_model == first)
+            .then_some(first)
+            .flatten();
+        let (all_options, common) = options_with_selection(common);
+        let disabled = self.projection_busy || all_options.is_empty();
+        self.all_model.update(cx, move |select, cx| {
+            select.set_options(all_options, cx);
+            select.set_selected(common.map(Into::into), cx);
+            select.set_disabled(disabled, cx);
+        });
     }
 
     fn commit_selection(&mut self, agent: AgentId, cx: &mut Context<Self>) {
@@ -226,11 +384,52 @@ impl ConnectorView {
         if let Some(model) = model {
             self.state.update_model(agent, model);
         }
+        self.sync_model_selects(cx);
+        self.sync_all_protocol(cx);
+        self.queue_profile_save(cx);
+        cx.notify();
+    }
+
+    fn use_model_for_all(&mut self, model: String, cx: &mut Context<Self>) {
+        for agent in AgentId::ALL {
+            self.state.update_model(agent, model.clone());
+        }
+        self.sync_model_selects(cx);
+        self.queue_profile_save(cx);
+        cx.notify();
+    }
+
+    fn use_protocol_for_all(&mut self, protocol: Protocol, cx: &mut Context<Self>) {
+        for (agent, select) in &self.protocol_selects {
+            self.state.update_protocol(*agent, protocol);
+            select.update(cx, |select, cx| {
+                select.set_selected(Some(protocol.as_str().into()), cx)
+            });
+        }
+        self.sync_all_protocol(cx);
+        self.queue_profile_save(cx);
+        cx.notify();
+    }
+
+    fn sync_all_protocol(&self, cx: &mut Context<Self>) {
+        let AppState::Connected { connection, .. } = &self.state else {
+            return;
+        };
+        let first = connection.profile.agents[&AgentId::Claude].protocol;
+        let common = AgentId::ALL
+            .iter()
+            .all(|agent| connection.profile.agents[agent].protocol == first)
+            .then_some(first.as_str());
+        self.all_protocol.update(cx, |select, cx| {
+            select.set_selected(common.map(Into::into), cx)
+        });
+    }
+
+    fn queue_profile_save(&mut self, cx: &mut Context<Self>) {
         if let AppState::Connected { connection, .. } = &self.state {
             self.pending_save = Some(connection.profile.clone());
             self.start_profile_save(cx);
         }
-        cx.notify();
     }
 
     fn begin_projection_status(&mut self, cx: &mut Context<Self>) {
@@ -270,9 +469,41 @@ impl ConnectorView {
 
     fn set_projection_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
         self.projection_busy = busy;
-        for (_, select) in self.model_selects.iter().chain(&self.protocol_selects) {
+        for (_, select) in &self.protocol_selects {
             select.update(cx, |select, cx| select.set_disabled(busy, cx));
         }
+        self.all_protocol
+            .update(cx, |select, cx| select.set_disabled(busy, cx));
+        self.sync_model_selects(cx);
+    }
+
+    fn begin_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.projection_busy {
+            return;
+        }
+        let AppState::Connected { connection, .. } = &self.state else {
+            return;
+        };
+        let profile = connection.profile.clone();
+        let backend = Arc::clone(&self.backend);
+        self.action_error = None;
+        self.set_projection_busy(true, cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { backend.refresh(profile) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.set_projection_busy(false, cx);
+                match result {
+                    Ok(connection) => this.complete_connection(connection, cx),
+                    Err(error) => this.action_error = Some(error.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn begin_preview(&mut self, cx: &mut Context<Self>) {
@@ -424,12 +655,22 @@ impl ConnectorView {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { backend.disconnect(&profile) })
+                .spawn(async move {
+                    backend.disconnect(&profile)?;
+                    Ok::<_, gateway_connector_backend::BackendError>(profile)
+                })
                 .await;
             this.update(cx, |this, cx| {
                 this.set_projection_busy(false, cx);
                 match result {
-                    Ok(()) => {
+                    Ok(profile) => {
+                        this.gateway_url.update(cx, |input, cx| {
+                            input.set_value(profile.base_url.to_string(), cx)
+                        });
+                        let protocol = profile.agents[&AgentId::Claude].protocol.as_str();
+                        this.initial_protocol.update(cx, |select, cx| {
+                            select.set_selected(Some(protocol.into()), cx)
+                        });
                         this.pending_save = None;
                         this.save_error = None;
                         this.action_error = None;
@@ -500,8 +741,9 @@ impl ConnectorView {
                     .child(
                         FormField::new("connector.api-key.field", "API key")
                             .control("connector.api-key")
-                            .required(true)
-                            .description("Stored in the operating-system credential vault.")
+                            .description(
+                                "Stored in the operating-system credential vault. Leave blank when the platform advertises browser login.",
+                            )
                             .child(self.api_key.clone()),
                     )
                     .child(
@@ -532,6 +774,91 @@ impl ConnectorView {
             .into_any_element()
     }
 
+    fn render_browser_login(
+        &self,
+        offer: &BrowserLoginOffer,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let continue_view = cx.entity().downgrade();
+        let back_view = cx.entity().downgrade();
+        let clear_error_view = cx.entity().downgrade();
+        Card::new()
+            .id("connector.browser-login")
+            .padded(true)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(16.0))
+                    .child(div().text_size(px(24.0)).child("Browser login available"))
+                    .child(
+                        div()
+                            .text_color(cx.theme().colors.text_muted)
+                            .child(format!(
+                                "{} advertises standard browser PKCE. GatewayConnector will keep only the returned access token in the OS vault.",
+                                offer.manifest.platform.name
+                            )),
+                    )
+                    .child(
+                        DescriptionList::new("connector.browser-login.summary")
+                            .item(DescriptionItem::new(
+                                "connector.browser-login.platform",
+                                "Platform",
+                                offer.manifest.platform.name.clone(),
+                            ))
+                            .item(DescriptionItem::new(
+                                "connector.browser-login.gateway",
+                                "Gateway",
+                                offer.request.base_url.clone(),
+                            ))
+                            .item(DescriptionItem::new(
+                                "connector.browser-login.security",
+                                "Security",
+                                "S256 PKCE · loopback callback · access_token only",
+                            )),
+                    )
+                    .children(self.action_error.as_ref().map(|error| {
+                        Callout::new(error.clone(), Tone::Danger)
+                            .id("connector.browser-login.error")
+                    }))
+                    .children(self.action_error.is_some().then(|| {
+                        Button::new("connector.browser-login.clear-error")
+                            .label("Clear error")
+                            .secondary()
+                            .on_click(move |_window, cx| {
+                                let _ = clear_error_view.update(cx, |this, cx| {
+                                    this.action_error = None;
+                                    cx.notify();
+                                });
+                            })
+                    }))
+                    .child(
+                        Button::new("connector.browser-login.continue")
+                            .label("Continue in browser")
+                            .primary()
+                            .full_width(true)
+                            .on_click(move |_window, cx| {
+                                let _ = continue_view
+                                    .update(cx, |this, cx| this.begin_browser_login(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("connector.browser-login.back")
+                            .label("Back")
+                            .secondary()
+                            .full_width(true)
+                            .on_click(move |_window, cx| {
+                                let _ = back_view.update(cx, |this, cx| {
+                                    this.action_error = None;
+                                    this.state = AppState::FirstRun;
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_connected(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let AppState::Connected {
             connection,
@@ -556,6 +883,8 @@ impl ConnectorView {
                         .is_none_or(|manifest| manifest.supported_agents.contains(&install.agent))
             })
             .count();
+        let refresh_view = cx.entity().downgrade();
+        let clear_error_view = cx.entity().downgrade();
         let mut content = div()
             .flex()
             .flex_col()
@@ -570,6 +899,17 @@ impl ConnectorView {
             }))
             .children(self.action_error.as_ref().map(|error| {
                 Callout::new(error.clone(), Tone::Danger).id("connector.action-error")
+            }))
+            .children(self.action_error.is_some().then(|| {
+                Button::new("connector.clear-error")
+                    .label("Clear error")
+                    .secondary()
+                    .on_click(move |_window, cx| {
+                        let _ = clear_error_view.update(cx, |this, cx| {
+                            this.action_error = None;
+                            cx.notify();
+                        });
+                    })
             }))
             .child(
                 DescriptionList::new("connector.summary")
@@ -593,6 +933,42 @@ impl ConnectorView {
                         "Detected Agents",
                         format!("{detected} / {}", AgentId::ALL.len()),
                     )),
+            )
+            .child(
+                Button::new("connector.refresh")
+                    .label("Refresh models and online services")
+                    .secondary()
+                    .disabled(self.projection_busy)
+                    .on_click(move |_window, cx| {
+                        let _ = refresh_view.update(cx, |this, cx| this.begin_refresh(cx));
+                    }),
+            )
+            .child(
+                FormField::new("connector.model-search.field", "Search model catalog")
+                    .control("connector.model-search")
+                    .description(
+                        "Filters every Agent picker by model ID or provider; saved unavailable choices remain visible.",
+                    )
+                    .child(self.model_search.clone()),
+            )
+            .child(
+                Card::new()
+                    .id("connector.all.settings")
+                    .padded(true)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.0))
+                            .child(div().text_size(px(18.0)).child("Use for all Agents"))
+                            .child(
+                                div()
+                                    .text_color(cx.theme().colors.text_muted)
+                                    .child("Choose a shared default, then override any Agent below."),
+                            )
+                            .child(self.all_protocol.clone())
+                            .child(self.all_model.clone()),
+                    ),
             )
             .child(div().text_size(px(20.0)).child("Agent defaults"));
 
@@ -796,6 +1172,7 @@ impl Render for ConnectorView {
                 .into_any_element(),
             AppState::FirstRun => self.render_first_run(false, None, cx),
             AppState::Connecting => self.render_first_run(true, None, cx),
+            AppState::BrowserLogin(offer) => self.render_browser_login(offer, cx),
             AppState::Failed(error) => self.render_first_run(false, Some(error), cx),
             AppState::Connected { .. } => self.render_connected(cx),
         };

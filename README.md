@@ -127,11 +127,17 @@ cargo run -p gateway-connector-app --features gpui-app --bin gateway-connector
 1. Enter a Gateway base URL, API key, and initial protocol.
 2. **Connect / Test** canonicalizes the URL and resolves its model endpoint as
    shown above, without changing the configured origin.
+   If the exact-origin manifest advertises browser PKCE, the app instead shows
+   an explicit browser-login gate; the API-key field may be left blank for
+   that flow.
 3. A successful OpenAI-style `{ "data": [...] }` response is normalized,
    deduplicated, sorted, and shown in one model picker per Agent.
 4. The connected summary shows the canonical Gateway and discovered model
-   count. Protocol/model changes are serialized through an ordered save queue
-   and persisted without the credential; save failures stay visible.
+   count. The catalog can be refreshed and filtered by model ID/provider; a
+   saved choice missing from a refreshed catalog remains visibly unavailable.
+   “Use for all Agents” sets a shared protocol/model before per-Agent
+   overrides. Changes are serialized through an ordered save queue and
+   persisted without the credential; save failures stay visible.
 5. The connected view shows each canonical Agent root, detection state, and
    current ownership. **Preview changes** builds a fresh read-only plan and
    lists every managed path without changing Agent files.
@@ -145,12 +151,10 @@ cargo run -p gateway-connector-app --features gpui-app --bin gateway-connector
 
 ## Next extraction steps
 
-The GPUI shell next needs to surface the implemented browser-login gate,
-connection edit/reconnect, model refresh/search and explicit unavailable
-selections, “use for all Agents,” and simple Agent/Services/Settings pages.
-English and Simplified Chinese plus system/light/dark theme remain the neutral
-upstream locales. Provisioning-only account, usage, billing, or Model Plaza
-pages must stay hidden when those records are absent; no metrics are invented.
+The GPUI shell next needs one small page enum for Agent, Services, and Settings
+views, plus English and Simplified Chinese and explicit system/light/dark theme
+preferences. Provisioning-only account, usage, billing, or Model Plaza pages
+must stay hidden when those records are absent; no metrics are invented.
 
 Release readiness still needs CI for the Linux gate and Windows/macOS GPUI
 compile, protocol/distribution documentation, and a migration guide for
