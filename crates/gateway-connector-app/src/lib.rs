@@ -3,7 +3,71 @@
 use std::collections::BTreeSet;
 
 use gateway_connector_backend::{BrowserLoginOffer, ConnectionResult};
-use gateway_connector_core::{AgentId, AgentInstall, Plan, Protocol, Verification};
+use gateway_connector_core::{AgentId, AgentInstall, Plan, Protocol, Provisioning, Verification};
+
+pub mod preferences;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Page {
+    #[default]
+    Overview,
+    Agent(AgentId),
+    Services,
+    Account,
+    Usage,
+    Billing,
+    ModelPlaza,
+    Settings,
+}
+
+impl Page {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Agent(AgentId::Claude) => "agent.claude",
+            Self::Agent(AgentId::Codex) => "agent.codex",
+            Self::Agent(AgentId::Gemini) => "agent.gemini",
+            Self::Agent(AgentId::Grokbuild) => "agent.grokbuild",
+            Self::Agent(AgentId::Opencode) => "agent.opencode",
+            Self::Services => "services",
+            Self::Account => "account",
+            Self::Usage => "usage",
+            Self::Billing => "billing",
+            Self::ModelPlaza => "model-plaza",
+            Self::Settings => "settings",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Some(match id {
+            "overview" => Self::Overview,
+            "agent.claude" => Self::Agent(AgentId::Claude),
+            "agent.codex" => Self::Agent(AgentId::Codex),
+            "agent.gemini" => Self::Agent(AgentId::Gemini),
+            "agent.grokbuild" => Self::Agent(AgentId::Grokbuild),
+            "agent.opencode" => Self::Agent(AgentId::Opencode),
+            "services" => Self::Services,
+            "account" => Self::Account,
+            "usage" => Self::Usage,
+            "billing" => Self::Billing,
+            "model-plaza" => Self::ModelPlaza,
+            "settings" => Self::Settings,
+            _ => return None,
+        })
+    }
+
+    pub fn available(self, provisioning: Option<&Provisioning>) -> bool {
+        match self {
+            Self::Services => provisioning
+                .is_some_and(|value| !value.mcp_servers.is_empty() || !value.skills.is_empty()),
+            Self::Account => provisioning.is_some_and(|value| value.account.is_some()),
+            Self::Usage => provisioning.is_some_and(|value| value.usage.is_some()),
+            Self::Billing => provisioning.is_some_and(|value| value.billing.is_some()),
+            Self::ModelPlaza => provisioning.is_some_and(|value| value.model_plaza.is_some()),
+            Self::Overview | Self::Agent(_) | Self::Settings => true,
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub enum AppState {
@@ -138,6 +202,21 @@ mod tests {
             panic!("connected state")
         };
         assert!(preview.is_none());
+    }
+
+    #[test]
+    fn direct_mode_has_no_invented_service_or_platform_pages() {
+        for page in [
+            Page::Services,
+            Page::Account,
+            Page::Usage,
+            Page::Billing,
+            Page::ModelPlaza,
+        ] {
+            assert!(!page.available(None), "{page:?}");
+        }
+        assert!(Page::Agent(AgentId::Claude).available(None));
+        assert!(Page::Settings.available(None));
     }
 
     struct PlanFixture;

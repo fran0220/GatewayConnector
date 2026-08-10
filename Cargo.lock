@@ -1939,12 +1939,17 @@ name = "gateway-connector-app"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "fs2",
  "gateway-connector-backend",
  "gateway-connector-core",
  "gpui",
  "gpui-kit",
  "gpui_platform",
+ "serde",
+ "serde_json",
+ "sys-locale",
  "tempfile",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

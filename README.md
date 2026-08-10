@@ -44,7 +44,8 @@ gateway-connector-backend
 gateway-connector-app
   Pure application state
   Optional GPUI/gpui-kit binary with first-run, discovery, Agent selection,
-  connected summary, and real preview/apply/verify/disconnect flow
+  conditional connected shell, and real preview/apply/verify/disconnect flow
+  Credential-free locale/theme preferences replaced atomically
 ```
 
 The projection engine retains the proven five adapters—Claude Code, Codex CLI,
@@ -132,29 +133,31 @@ cargo run -p gateway-connector-app --features gpui-app --bin gateway-connector
    that flow.
 3. A successful OpenAI-style `{ "data": [...] }` response is normalized,
    deduplicated, sorted, and shown in one model picker per Agent.
-4. The connected summary shows the canonical Gateway and discovered model
+4. The authenticated shell shows the canonical Gateway and discovered model
    count. The catalog can be refreshed and filtered by model ID/provider; a
    saved choice missing from a refreshed catalog remains visibly unavailable.
    “Use for all Agents” sets a shared protocol/model before per-Agent
    overrides. Changes are serialized through an ordered save queue and
    persisted without the credential; save failures stay visible.
-5. The connected view shows each canonical Agent root, detection state, and
-   current ownership. **Preview changes** builds a fresh read-only plan and
-   lists every managed path without changing Agent files.
+5. Five distinct Agent pages show each canonical root, detection state,
+   ownership, protocol, and model. **Preview changes** builds a fresh read-only
+   plan and lists every managed path without changing Agent files. Apply stays
+   disabled with an explicit reason until a current preview exists.
 6. **Apply** rechecks the vault credential and every previewed file/receipt
    snapshot, performs the transaction, and verifies the result. **Verify** can
    be rerun to report later drift. **Disconnect** removes owned configuration
    before deleting the only credential that can open the ownership receipt.
-7. A later launch reloads the profile, retrieves the key from the OS vault, and
-   refreshes `/v1/models` while preserving the stable profile ID and valid
-   Agent selections.
+7. Provisioned MCP/Skills and account, usage, billing, and Model Plaza pages
+   appear only when the schema-v2 response supplies their source records.
+   Direct connections have none of these pages and invent no service data.
+   The full Model Plaza catalog is searchable but is never used for Agent
+   selectors.
+8. Settings persist English/Simplified Chinese and system/light/dark appearance
+   outside profile JSON. A later launch reloads the profile, retrieves the key
+   from the OS vault, and refreshes `/v1/models` while preserving the stable
+   profile ID and valid Agent selections.
 
 ## Next extraction steps
-
-The GPUI shell next needs one small page enum for Agent, Services, and Settings
-views, plus English and Simplified Chinese and explicit system/light/dark theme
-preferences. Provisioning-only account, usage, billing, or Model Plaza pages
-must stay hidden when those records are absent; no metrics are invented.
 
 Release readiness still needs CI for the Linux gate and Windows/macOS GPUI
 compile, protocol/distribution documentation, and a migration guide for

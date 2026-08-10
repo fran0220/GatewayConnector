@@ -1,17 +1,20 @@
 use std::sync::Arc;
 
 use directories::{ProjectDirs, UserDirs};
-use gateway_connector_app::AppState;
+use gateway_connector_app::{
+    AppState, Page,
+    preferences::{Locale, PreferenceStore, Preferences, ThemePreference},
+};
 use gateway_connector_backend::{
     ApiKey, BackendError, BrowserLoginOffer, ConnectRequest, ConnectRequestWithoutCredential,
     ConnectionResult, ConnectorBackend, JsonProfileStore, OsCredentialStore, ProbeResult,
 };
 use gateway_connector_core::{AgentId, CanonicalBaseUrl, ChangeKind, ConnectionProfile, Protocol};
 use gpui::{
-    App, Bounds, Context, Entity, IntoElement, ParentElement, Render, Styled, Window, WindowBounds,
-    WindowOptions, div, prelude::*, px, size,
+    App, Bounds, Context, Entity, FontWeight, IntoElement, ParentElement, Render, Styled, Window,
+    WindowAppearance, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
-use gpui_kit::prelude::*;
+use gpui_kit::{assets::Icon, prelude::*};
 
 enum ConnectOutcome {
     Connected(Box<ConnectionResult>),
@@ -22,10 +25,17 @@ enum ConnectOutcome {
 struct ConnectorView {
     backend: Arc<ConnectorBackend>,
     state: AppState,
+    page: Page,
+    preference_store: PreferenceStore,
+    preferences: Preferences,
+    language_select: Entity<Select>,
+    theme_select: Entity<Select>,
     gateway_url: Entity<TextInput>,
     api_key: Entity<TextInput>,
     model_search: Entity<TextInput>,
     model_query: String,
+    plaza_search: Entity<TextInput>,
+    plaza_query: String,
     initial_protocol: Entity<Select>,
     all_model: Entity<Select>,
     all_protocol: Entity<Select>,
@@ -39,16 +49,40 @@ struct ConnectorView {
 }
 
 impl ConnectorView {
-    fn new(backend: Arc<ConnectorBackend>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        backend: Arc<ConnectorBackend>,
+        preference_store: PreferenceStore,
+        preferences: Preferences,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let locale = preferences.locale;
+        let language_select = cx.new(|cx| {
+            Select::new("connector.language", window, cx)
+                .name(locale.text("Language"))
+                .options(
+                    Locale::ALL.map(|value| SelectOption::new(value.id(), value.display_name())),
+                )
+                .selected(locale.id())
+        });
+        let theme_select = cx.new(|cx| {
+            Select::new("connector.theme", window, cx)
+                .name(locale.text("Theme"))
+                .options(
+                    ThemePreference::ALL
+                        .map(|value| SelectOption::new(value.id(), value.display_name(locale))),
+                )
+                .selected(preferences.theme.id())
+        });
         let gateway_url = cx.new(|cx| {
             TextInput::new("connector.gateway-url", window, cx)
-                .name("Gateway base URL")
+                .name(locale.text("Gateway base URL"))
                 .placeholder("https://gateway.example.com or https://gateway.example.com/v1")
                 .required(true)
         });
         let api_key = cx.new(|cx| {
             TextInput::new("connector.api-key", window, cx)
-                .name("API key")
+                .name(locale.text("API key"))
                 .placeholder("API key, or leave blank for advertised browser login")
                 .secret(true)
         });
@@ -56,8 +90,13 @@ impl ConnectorView {
             cx.new(|cx| protocol_select("connector.initial-protocol", window, cx));
         let model_search = cx.new(|cx| {
             TextInput::new("connector.model-search", window, cx)
-                .name("Search models")
+                .name(locale.text("Search model catalog"))
                 .placeholder("Filter by model ID or provider")
+        });
+        let plaza_search = cx.new(|cx| {
+            TextInput::new("connector.model-plaza.search", window, cx)
+                .name(locale.text("Search model catalog"))
+                .placeholder("Filter by model ID, provider, or tag")
         });
         let all_model = cx.new(|cx| {
             Select::new("connector.all.model", window, cx)
@@ -115,6 +154,13 @@ impl ConnectorView {
             }
         })
         .detach();
+        cx.subscribe(&plaza_search, |this, _, event: &TextInputEvent, cx| {
+            if let TextInputEvent::Change(value) = event {
+                this.plaza_query = value.to_string();
+                cx.notify();
+            }
+        })
+        .detach();
         cx.subscribe(&all_model, |this, select, event, cx| {
             if let SelectEvent::Selected(id) = event {
                 select.update(cx, |select, cx| select.set_selected(Some(id.clone()), cx));
@@ -131,14 +177,69 @@ impl ConnectorView {
             }
         })
         .detach();
+        cx.subscribe(&language_select, |this, _, event, cx| {
+            let SelectEvent::Selected(id) = event else {
+                return;
+            };
+            let Some(locale) = Locale::from_id(id) else {
+                return;
+            };
+            let mut preferences = this.preferences.clone();
+            preferences.locale = locale;
+            if let Err(error) = this.preference_store.save(&preferences) {
+                this.action_error = Some(format!(
+                    "{}: {error}",
+                    this.preferences
+                        .locale
+                        .text("Preference could not be saved")
+                ));
+                cx.notify();
+                return;
+            }
+            this.preferences = preferences;
+            this.sync_localized_controls(cx);
+            cx.notify();
+        })
+        .detach();
+        cx.subscribe(&theme_select, |this, _, event, cx| {
+            let SelectEvent::Selected(id) = event else {
+                return;
+            };
+            let Some(theme) = ThemePreference::from_id(id) else {
+                return;
+            };
+            let mut preferences = this.preferences.clone();
+            preferences.theme = theme;
+            if let Err(error) = this.preference_store.save(&preferences) {
+                this.action_error = Some(format!(
+                    "{}: {error}",
+                    this.preferences
+                        .locale
+                        .text("Preference could not be saved")
+                ));
+                cx.notify();
+                return;
+            }
+            this.preferences = preferences;
+            apply_theme(theme, cx);
+            cx.notify();
+        })
+        .detach();
 
         let mut view = Self {
             backend,
             state: AppState::Loading,
+            page: Page::Overview,
+            preference_store,
+            preferences,
+            language_select,
+            theme_select,
             gateway_url,
             api_key,
             model_search,
             model_query: String::new(),
+            plaza_search,
+            plaza_query: String::new(),
             initial_protocol,
             all_model,
             all_protocol,
@@ -150,8 +251,47 @@ impl ConnectorView {
             projection_busy: false,
             action_error: None,
         };
+        cx.observe_window_appearance(window, |this, window, cx| {
+            if this.preferences.theme == ThemePreference::System {
+                activate_theme_for(window.appearance(), cx);
+            }
+        })
+        .detach();
         view.begin_resume(cx);
         view
+    }
+
+    fn text(&self, english: &'static str) -> &'static str {
+        self.preferences.locale.text(english)
+    }
+
+    fn sync_localized_controls(&self, cx: &mut Context<Self>) {
+        let locale = self.preferences.locale;
+        self.language_select.update(cx, |select, cx| {
+            select.set_name(locale.text("Language"), cx);
+            select.set_selected(Some(locale.id().into()), cx);
+        });
+        self.theme_select.update(cx, |select, cx| {
+            select.set_name(locale.text("Theme"), cx);
+            select.set_options(
+                ThemePreference::ALL
+                    .map(|value| SelectOption::new(value.id(), value.display_name(locale)))
+                    .to_vec(),
+                cx,
+            );
+            select.set_selected(Some(self.preferences.theme.id().into()), cx);
+        });
+        self.gateway_url.update(cx, |input, cx| {
+            input.set_name(locale.text("Gateway base URL"), cx)
+        });
+        self.api_key
+            .update(cx, |input, cx| input.set_name(locale.text("API key"), cx));
+        self.model_search.update(cx, |input, cx| {
+            input.set_name(locale.text("Search model catalog"), cx)
+        });
+        self.plaza_search.update(cx, |input, cx| {
+            input.set_name(locale.text("Search model catalog"), cx)
+        });
     }
 
     fn begin_resume(&mut self, cx: &mut Context<Self>) {
@@ -289,6 +429,9 @@ impl ConnectorView {
         self.api_key.update(cx, |input, cx| input.set_value("", cx));
         self.save_error = None;
         self.action_error = None;
+        if !self.page.available(result.provisioning.as_ref()) {
+            self.page = Page::Overview;
+        }
         self.state = AppState::connected(result);
         self.sync_model_selects(cx);
         self.sync_all_protocol(cx);
@@ -674,6 +817,7 @@ impl ConnectorView {
                         this.pending_save = None;
                         this.save_error = None;
                         this.action_error = None;
+                        this.page = Page::Overview;
                         this.state = AppState::FirstRun;
                     }
                     Err(error) => this.action_error = Some(error.to_string()),
@@ -716,6 +860,7 @@ impl ConnectorView {
         error: Option<&str>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let locale = self.preferences.locale;
         let this = cx.entity().downgrade();
         Card::new()
             .id("connector.first-run")
@@ -725,29 +870,44 @@ impl ConnectorView {
                     .flex()
                     .flex_col()
                     .gap(px(16.0))
-                    .child(div().text_size(px(24.0)).child("Connect a Gateway"))
+                    .child(
+                        div()
+                            .text_size(px(24.0))
+                            .child(locale.text("Connect a Gateway")),
+                    )
                     .child(div().text_color(cx.theme().colors.text_muted).child(
-                        "Enter any OpenAI-compatible Gateway. A platform manifest is optional.",
+                        locale.text(
+                            "Enter any OpenAI-compatible Gateway. A platform manifest is optional.",
+                        ),
                     ))
                     .child(
-                        FormField::new("connector.gateway-url.field", "Gateway base URL")
+                        FormField::new(
+                            "connector.gateway-url.field",
+                            locale.text("Gateway base URL"),
+                        )
                             .control("connector.gateway-url")
                             .required(true)
                             .description(
-                                "Root or nested prefix; /v1 and /v1/models forms are also accepted. HTTPS except loopback.",
+                                locale.text("Root or nested prefix; /v1 and /v1/models forms are also accepted. HTTPS except loopback."),
                             )
                             .child(self.gateway_url.clone()),
                     )
                     .child(
-                        FormField::new("connector.api-key.field", "API key")
+                        FormField::new(
+                            "connector.api-key.field",
+                            locale.text("API key"),
+                        )
                             .control("connector.api-key")
                             .description(
-                                "Stored in the operating-system credential vault. Leave blank when the platform advertises browser login.",
+                                locale.text("Stored in the operating-system credential vault. Leave blank when the platform advertises browser login."),
                             )
                             .child(self.api_key.clone()),
                     )
                     .child(
-                        FormField::new("connector.initial-protocol.field", "Default protocol")
+                        FormField::new(
+                            "connector.initial-protocol.field",
+                            locale.text("Default protocol"),
+                        )
                             .control("connector.initial-protocol")
                             .required(true)
                             .child(self.initial_protocol.clone()),
@@ -759,9 +919,9 @@ impl ConnectorView {
                     .child(
                         Button::new("connector.connect")
                             .label(if connecting {
-                                "Testing connection"
+                                locale.text("Testing connection")
                             } else {
-                                "Connect / Test"
+                                locale.text("Connect / Test")
                             })
                             .primary()
                             .full_width(true)
@@ -779,6 +939,7 @@ impl ConnectorView {
         offer: &BrowserLoginOffer,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let locale = self.preferences.locale;
         let continue_view = cx.entity().downgrade();
         let back_view = cx.entity().downgrade();
         let clear_error_view = cx.entity().downgrade();
@@ -790,7 +951,11 @@ impl ConnectorView {
                     .flex()
                     .flex_col()
                     .gap(px(16.0))
-                    .child(div().text_size(px(24.0)).child("Browser login available"))
+                    .child(
+                        div()
+                            .text_size(px(24.0))
+                            .child(locale.text("Browser login available")),
+                    )
                     .child(
                         div()
                             .text_color(cx.theme().colors.text_muted)
@@ -803,17 +968,17 @@ impl ConnectorView {
                         DescriptionList::new("connector.browser-login.summary")
                             .item(DescriptionItem::new(
                                 "connector.browser-login.platform",
-                                "Platform",
+                                locale.text("Platform"),
                                 offer.manifest.platform.name.clone(),
                             ))
                             .item(DescriptionItem::new(
                                 "connector.browser-login.gateway",
-                                "Gateway",
+                                locale.text("Gateway"),
                                 offer.request.base_url.clone(),
                             ))
                             .item(DescriptionItem::new(
                                 "connector.browser-login.security",
-                                "Security",
+                                locale.text("Security"),
                                 "S256 PKCE · loopback callback · access_token only",
                             )),
                     )
@@ -823,7 +988,7 @@ impl ConnectorView {
                     }))
                     .children(self.action_error.is_some().then(|| {
                         Button::new("connector.browser-login.clear-error")
-                            .label("Clear error")
+                            .label(locale.text("Clear error"))
                             .secondary()
                             .on_click(move |_window, cx| {
                                 let _ = clear_error_view.update(cx, |this, cx| {
@@ -834,7 +999,7 @@ impl ConnectorView {
                     }))
                     .child(
                         Button::new("connector.browser-login.continue")
-                            .label("Continue in browser")
+                            .label(locale.text("Continue in browser"))
                             .primary()
                             .full_width(true)
                             .on_click(move |_window, cx| {
@@ -844,7 +1009,7 @@ impl ConnectorView {
                     )
                     .child(
                         Button::new("connector.browser-login.back")
-                            .label("Back")
+                            .label(locale.text("Back"))
                             .secondary()
                             .full_width(true)
                             .on_click(move |_window, cx| {
@@ -855,6 +1020,369 @@ impl ConnectorView {
                                 });
                             }),
                     ),
+            )
+            .into_any_element()
+    }
+
+    fn navigation(&self, cx: &mut Context<Self>) -> Sidebar {
+        let AppState::Connected { connection, .. } = &self.state else {
+            unreachable!("navigation requires connected state")
+        };
+        let locale = self.preferences.locale;
+        let mut platform_items = Vec::new();
+        for (page, label, icon) in [
+            (Page::Services, "Online services", Icon::Widget),
+            (Page::Account, "Account", Icon::Global),
+            (Page::Usage, "Usage", Icon::List),
+            (Page::Billing, "Billing", Icon::Document),
+            (Page::ModelPlaza, "Model Plaza", Icon::Magnifier),
+        ] {
+            if page.available(connection.provisioning.as_ref()) {
+                platform_items.push(SidebarItem::new(page.id(), locale.text(label)).icon(icon));
+            }
+        }
+        let handle = cx.entity().downgrade();
+        Sidebar::new("connector.sidebar")
+            .active(self.page.id())
+            .header(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .p(px(8.0))
+                    .child(gpui_kit::assets::icon(Icon::Global).size(px(18.0)))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(locale.text("GatewayConnector")),
+                    ),
+            )
+            .section(
+                SidebarSection::new("connection")
+                    .item(
+                        SidebarItem::new("overview", locale.text("Connection")).icon(Icon::Global),
+                    )
+                    .item(
+                        SidebarItem::new("agents", locale.text("Agents"))
+                            .icon(Icon::Terminal)
+                            .children(AgentId::ALL.map(|agent| {
+                                SidebarItem::new(Page::Agent(agent).id(), agent.display_name())
+                                    .icon(agent_icon(agent))
+                            })),
+                    ),
+            )
+            .section(SidebarSection::new("platform").items(platform_items))
+            .section(
+                SidebarSection::new("preferences").item(
+                    SidebarItem::new("settings", locale.text("Settings")).icon(Icon::Settings),
+                ),
+            )
+            .footer(StatusLine::new(locale.text("Connected"), Tone::Success))
+            .on_select(move |id, _, cx| {
+                let Some(page) = Page::from_id(id.as_ref()) else {
+                    return;
+                };
+                let _ = handle.update(cx, |this, cx| {
+                    this.page = page;
+                    cx.notify();
+                });
+            })
+    }
+
+    fn render_services(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let AppState::Connected { connection, .. } = &self.state else {
+            unreachable!("services require connected state")
+        };
+        let locale = self.preferences.locale;
+        let Some(provisioning) = connection.provisioning.as_ref() else {
+            return EmptyState::new(
+                "connector.services.empty",
+                locale.text("No online services were provisioned."),
+            )
+            .kind(EmptyKind::Empty)
+            .into_any_element();
+        };
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(page_title(locale.text("Online services")))
+            .child(
+                div()
+                    .text_color(cx.theme().colors.text_muted)
+                    .child(locale.text("Direct connections do not invent MCP servers or Skills.")),
+            );
+        if !provisioning.mcp_servers.is_empty() {
+            let mut servers = Card::new()
+                .id("connector.services.mcp")
+                .padded(true)
+                .child(div().text_size(px(18.0)).child(locale.text("MCP servers")));
+            for server in &provisioning.mcp_servers {
+                servers = servers.child(
+                    ListRow::new()
+                        .id(format!("connector.service.mcp.{}", server.id))
+                        .child(div().flex_1().child(server.name.clone()))
+                        .child(Badge::new("online").success()),
+                );
+            }
+            content = content.child(servers);
+        }
+        if !provisioning.skills.is_empty() {
+            let mut skills = Card::new()
+                .id("connector.services.skills")
+                .padded(true)
+                .child(div().text_size(px(18.0)).child(locale.text("Skills")));
+            for skill in &provisioning.skills {
+                let synchronized = connection.synchronized_skills.contains_key(&skill.id);
+                skills = skills.child(
+                    ListRow::new()
+                        .id(format!("connector.service.skill.{}", skill.id))
+                        .child(div().flex_1().child(skill.name.clone()))
+                        .child(Badge::new(skill.version.clone()).neutral())
+                        .child(Badge::new(if synchronized {
+                            "synchronized"
+                        } else {
+                            "pending"
+                        })),
+                );
+            }
+            content = content.child(skills);
+        }
+        content.into_any_element()
+    }
+
+    fn render_account(&self) -> gpui::AnyElement {
+        let AppState::Connected { connection, .. } = &self.state else {
+            unreachable!("account requires connected state")
+        };
+        let account = connection
+            .provisioning
+            .as_ref()
+            .and_then(|value| value.account.as_ref())
+            .expect("account page is conditional");
+        let locale = self.preferences.locale;
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(page_title(locale.text("Account")))
+            .child(
+                DescriptionList::new("connector.account")
+                    .item(DescriptionItem::new(
+                        "connector.account.display-name",
+                        locale.text("Display name"),
+                        account.display_name.clone(),
+                    ))
+                    .item(DescriptionItem::new(
+                        "connector.account.username",
+                        locale.text("Username"),
+                        account.username.clone(),
+                    ))
+                    .item(DescriptionItem::new(
+                        "connector.account.email",
+                        locale.text("Email"),
+                        account.email.clone(),
+                    ))
+                    .item(DescriptionItem::new(
+                        "connector.account.group",
+                        locale.text("Group"),
+                        account.group.clone(),
+                    )),
+            )
+            .into_any_element()
+    }
+
+    fn render_usage(&self) -> gpui::AnyElement {
+        let AppState::Connected { connection, .. } = &self.state else {
+            unreachable!("usage requires connected state")
+        };
+        let usage = connection
+            .provisioning
+            .as_ref()
+            .and_then(|value| value.usage.as_ref())
+            .expect("usage page is conditional");
+        let locale = self.preferences.locale;
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(page_title(locale.text("Usage")))
+            .child(
+                DescriptionList::new("connector.usage")
+                    .item(DescriptionItem::new(
+                        "connector.usage.remaining",
+                        locale.text("Wallet remaining"),
+                        usage.wallet_quota_remaining.to_string(),
+                    ))
+                    .item(DescriptionItem::new(
+                        "connector.usage.used",
+                        locale.text("Lifetime used"),
+                        usage.lifetime_quota_used.to_string(),
+                    ))
+                    .item(DescriptionItem::new(
+                        "connector.usage.requests",
+                        locale.text("Lifetime requests"),
+                        usage.lifetime_request_count.to_string(),
+                    )),
+            )
+            .into_any_element()
+    }
+
+    fn render_billing(&self) -> gpui::AnyElement {
+        let AppState::Connected { connection, .. } = &self.state else {
+            unreachable!("billing requires connected state")
+        };
+        let billing = connection
+            .provisioning
+            .as_ref()
+            .and_then(|value| value.billing.as_ref())
+            .expect("billing page is conditional");
+        let locale = self.preferences.locale;
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(page_title(locale.text("Billing")))
+            .child(
+                DescriptionList::new("connector.billing")
+                    .item(DescriptionItem::new(
+                        "connector.billing.portal",
+                        locale.text("Portal"),
+                        billing.portal_url.to_string(),
+                    ))
+                    .item(DescriptionItem::new(
+                        "connector.billing.fallback",
+                        locale.text("Wallet fallback allowed"),
+                        locale.text(if billing.wallet_fallback_allowed {
+                            "Yes"
+                        } else {
+                            "No"
+                        }),
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(px(18.0))
+                    .child(locale.text("Subscriptions")),
+            );
+        if billing.subscriptions.is_empty() {
+            content = content.child(locale.text("No active subscriptions."));
+        }
+        for subscription in &billing.subscriptions {
+            content = content.child(
+                ListRow::new()
+                    .id(format!("connector.subscription.{}", subscription.id))
+                    .child(format!("Plan {}", subscription.plan_id))
+                    .child(Badge::new(subscription.status.clone()).neutral()),
+            );
+        }
+        content.into_any_element()
+    }
+
+    fn render_model_plaza(&self) -> gpui::AnyElement {
+        let AppState::Connected { connection, .. } = &self.state else {
+            unreachable!("Model Plaza requires connected state")
+        };
+        let plaza = connection
+            .provisioning
+            .as_ref()
+            .and_then(|value| value.model_plaza.as_ref())
+            .expect("Model Plaza page is conditional");
+        let locale = self.preferences.locale;
+        let query = self.plaza_query.trim().to_ascii_lowercase();
+        let matches = plaza.models.iter().filter(|model| {
+            query.is_empty()
+                || model.id.to_ascii_lowercase().contains(&query)
+                || model
+                    .description
+                    .as_ref()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains(&query))
+                || model
+                    .vendor
+                    .as_ref()
+                    .is_some_and(|value| value.name.to_ascii_lowercase().contains(&query))
+                || model
+                    .tags
+                    .iter()
+                    .any(|value| value.to_ascii_lowercase().contains(&query))
+        });
+        let mut models = Card::new().id("connector.model-plaza.models");
+        let mut count = 0usize;
+        for model in matches.take(200) {
+            count += 1;
+            let provider = model
+                .vendor
+                .as_ref()
+                .map(|value| value.name.clone())
+                .unwrap_or_else(|| locale.text("Provider").to_owned());
+            models = models.child(
+                ListRow::new()
+                    .id(format!("connector.model-plaza.{}", model.id))
+                    .child(div().flex_1().min_w_0().child(model.id.clone()))
+                    .child(Badge::new(provider).neutral())
+                    .child(Badge::new(locale.text(if model.chat_capable {
+                        "Chat capable"
+                    } else {
+                        "Other model"
+                    }))),
+            );
+        }
+        if count == 0 {
+            models = models.child(locale.text("No models match this search."));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(page_title(locale.text("Model Plaza")))
+            .child(DescriptionList::new("connector.model-plaza.summary").item(
+                DescriptionItem::new(
+                    "connector.model-plaza.portal",
+                    locale.text("Portal"),
+                    plaza.portal_url.to_string(),
+                ),
+            ))
+            .child(self.plaza_search.clone())
+            .child(models)
+            .into_any_element()
+    }
+
+    fn render_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let locale = self.preferences.locale;
+        let disconnect_view = cx.entity().downgrade();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(page_title(locale.text("Settings")))
+            .child(
+                SettingsSection::new("connector.settings.preferences", locale.text("Settings"))
+                    .row(
+                        SettingsRow::new("connector.settings.language", locale.text("Language"))
+                            .control(self.language_select.clone()),
+                    )
+                    .row(
+                        SettingsRow::new("connector.settings.theme", locale.text("Theme"))
+                            .control(self.theme_select.clone()),
+                    ),
+            )
+            .child(page_title(locale.text("Security facts")))
+            .child(
+                Callout::new(
+                    locale.text("Credentials stay in the OS vault. Bearers are sent only to exact allowlisted origins. Agent changes require a fresh preview."),
+                    Tone::Info,
+                )
+                .id("connector.security-facts"),
+            )
+            .child(
+                Button::new("connector.disconnect")
+                    .label(locale.text("Disconnect Gateway and remove managed configuration"))
+                    .danger()
+                    .full_width(true)
+                    .disabled(self.projection_busy || self.save_in_flight)
+                    .on_click(move |_window, cx| {
+                        let _ = disconnect_view.update(cx, |this, cx| this.begin_disconnect(cx));
+                    }),
             )
             .into_any_element()
     }
@@ -870,6 +1398,15 @@ impl ConnectorView {
         else {
             unreachable!("connected renderer requires connected state")
         };
+        match self.page {
+            Page::Services => return self.render_services(cx),
+            Page::Account => return self.render_account(),
+            Page::Usage => return self.render_usage(),
+            Page::Billing => return self.render_billing(),
+            Page::ModelPlaza => return self.render_model_plaza(),
+            Page::Settings => return self.render_settings(cx),
+            Page::Overview | Page::Agent(_) => {}
+        }
         let profile = &connection.profile;
         let models = &connection.models;
         let detected = installs.iter().filter(|install| install.detected).count();
@@ -885,11 +1422,20 @@ impl ConnectorView {
             .count();
         let refresh_view = cx.entity().downgrade();
         let clear_error_view = cx.entity().downgrade();
+        let locale = self.preferences.locale;
+        let selected_agent = match self.page {
+            Page::Agent(agent) => Some(agent),
+            _ => None,
+        };
         let mut content = div()
             .flex()
             .flex_col()
             .gap(px(16.0))
-            .child(StatusLine::new("Connected", Tone::Success).id("connector.status"))
+            .child(page_title(match selected_agent {
+                Some(agent) => agent.display_name(),
+                None => locale.text("Connection overview"),
+            }))
+            .child(StatusLine::new(locale.text("Connected"), Tone::Success).id("connector.status"))
             .children(self.save_error.as_ref().map(|error| {
                 Callout::new(
                     format!("Could not persist the latest Agent choices: {error}"),
@@ -902,7 +1448,7 @@ impl ConnectorView {
             }))
             .children(self.action_error.is_some().then(|| {
                 Button::new("connector.clear-error")
-                    .label("Clear error")
+                    .label(locale.text("Clear error"))
                     .secondary()
                     .on_click(move |_window, cx| {
                         let _ = clear_error_view.update(cx, |this, cx| {
@@ -910,48 +1456,54 @@ impl ConnectorView {
                             cx.notify();
                         });
                     })
-            }))
-            .child(
+            }));
+
+        if selected_agent.is_none() {
+            content = content
+                .child(
                 DescriptionList::new("connector.summary")
                     .item(DescriptionItem::new(
                         "connector.summary.gateway",
-                        "Gateway",
+                        locale.text("Gateway"),
                         profile.base_url.to_string(),
                     ))
                     .item(DescriptionItem::new(
                         "connector.summary.models",
-                        "Models",
+                        locale.text("Models"),
                         models.len().to_string(),
                     ))
                     .item(DescriptionItem::new(
                         "connector.summary.profile",
-                        "Profile",
+                        locale.text("Profile"),
                         profile.display_name.clone(),
                     ))
                     .item(DescriptionItem::new(
                         "connector.summary.agents",
-                        "Detected Agents",
+                        locale.text("Detected Agents"),
                         format!("{detected} / {}", AgentId::ALL.len()),
                     )),
-            )
-            .child(
+                )
+                .child(
                 Button::new("connector.refresh")
-                    .label("Refresh models and online services")
+                    .label(locale.text("Refresh models and online services"))
                     .secondary()
                     .disabled(self.projection_busy)
                     .on_click(move |_window, cx| {
                         let _ = refresh_view.update(cx, |this, cx| this.begin_refresh(cx));
                     }),
-            )
-            .child(
-                FormField::new("connector.model-search.field", "Search model catalog")
+                )
+                .child(
+                FormField::new(
+                    "connector.model-search.field",
+                    locale.text("Search model catalog"),
+                )
                     .control("connector.model-search")
                     .description(
-                        "Filters every Agent picker by model ID or provider; saved unavailable choices remain visible.",
+                        locale.text("Filters every Agent picker by model ID or provider; saved unavailable choices remain visible."),
                     )
                     .child(self.model_search.clone()),
-            )
-            .child(
+                )
+                .child(
                 Card::new()
                     .id("connector.all.settings")
                     .padded(true)
@@ -960,19 +1512,26 @@ impl ConnectorView {
                             .flex()
                             .flex_col()
                             .gap(px(10.0))
-                            .child(div().text_size(px(18.0)).child("Use for all Agents"))
+                            .child(
+                                div()
+                                    .text_size(px(18.0))
+                                    .child(locale.text("Use for all Agents")),
+                            )
                             .child(
                                 div()
                                     .text_color(cx.theme().colors.text_muted)
-                                    .child("Choose a shared default, then override any Agent below."),
+                                    .child(locale.text("Choose a shared default, then override any Agent on its page.")),
                             )
                             .child(self.all_protocol.clone())
                             .child(self.all_model.clone()),
                     ),
-            )
-            .child(div().text_size(px(20.0)).child("Agent defaults"));
+                );
+        }
 
         for agent in AgentId::ALL {
+            if selected_agent != Some(agent) {
+                continue;
+            }
             let install = installs.iter().find(|install| install.agent == agent);
             let detected = install.is_some_and(|install| install.detected);
             let supported = connection
@@ -980,17 +1539,17 @@ impl ConnectorView {
                 .as_ref()
                 .is_none_or(|manifest| manifest.supported_agents.contains(&agent));
             let ownership = if managed_agents.contains(&agent) {
-                "Managed by this connection"
+                locale.text("Managed by this connection")
             } else {
-                "Not managed"
+                locale.text("Not managed")
             };
             let location = install
                 .map(|install| install.root.display().to_string())
                 .unwrap_or_else(|| "Checking standard root…".into());
             let availability = match (detected, supported) {
-                (true, true) => "Detected",
-                (false, true) => "Not detected",
-                (_, false) => "Not advertised by this platform",
+                (true, true) => locale.text("Detected"),
+                (false, true) => locale.text("Not detected"),
+                (_, false) => locale.text("Not advertised by this platform"),
             };
             let protocol = self
                 .protocol_selects
@@ -1015,11 +1574,26 @@ impl ConnectorView {
                             .flex()
                             .flex_col()
                             .gap(px(10.0))
-                            .child(div().text_size(px(18.0)).child(agent.display_name()))
                             .child(
-                                div()
-                                    .text_color(cx.theme().colors.text_muted)
-                                    .child(format!("{availability} · {ownership}\n{location}")),
+                                DescriptionList::new(format!(
+                                    "connector.{}.details",
+                                    agent.as_str()
+                                ))
+                                .item(DescriptionItem::new(
+                                    format!("connector.{}.detected", agent.as_str()),
+                                    locale.text("Detected"),
+                                    availability,
+                                ))
+                                .item(DescriptionItem::new(
+                                    format!("connector.{}.ownership", agent.as_str()),
+                                    locale.text("Connection"),
+                                    ownership,
+                                ))
+                                .item(DescriptionItem::new(
+                                    format!("connector.{}.root", agent.as_str()),
+                                    locale.text("Root"),
+                                    location,
+                                )),
                             )
                             .child(protocol)
                             .child(model),
@@ -1038,9 +1612,9 @@ impl ConnectorView {
                     .child(
                         Button::new("connector.preview")
                             .label(if self.projection_busy {
-                                "Working…"
+                                locale.text("Working…")
                             } else {
-                                "Preview changes"
+                                locale.text("Preview changes")
                             })
                             .secondary()
                             .disabled(
@@ -1054,7 +1628,7 @@ impl ConnectorView {
                     )
                     .child(
                         Button::new("connector.apply")
-                            .label("Apply")
+                            .label(locale.text("Apply"))
                             .primary()
                             .disabled(
                                 self.projection_busy || preview.is_none() || verification.is_some(),
@@ -1065,7 +1639,7 @@ impl ConnectorView {
                     )
                     .child(
                         Button::new("connector.verify")
-                            .label("Verify")
+                            .label(locale.text("Verify"))
                             .secondary()
                             .disabled(self.projection_busy || verification.is_none())
                             .on_click(move |_window, cx| {
@@ -1075,18 +1649,28 @@ impl ConnectorView {
             )
             .children((supported_detected == 0).then(|| {
                 Callout::new(
-                    "Install a supported Agent before previewing configuration changes.",
+                    locale
+                        .text("Install a supported Agent before previewing configuration changes."),
                     Tone::Info,
                 )
                 .id("connector.no-agents")
             }))
             .children(models.is_empty().then(|| {
                 Callout::new(
-                    "The Gateway currently offers no chat-capable models.",
+                    locale.text("The Gateway currently offers no chat-capable models."),
                     Tone::Warning,
                 )
                 .id("connector.no-models")
-            }));
+            }))
+            .children(
+                (supported_detected > 0 && !models.is_empty() && preview.is_none()).then(|| {
+                    Callout::new(
+                        locale.text("Preview again after changing any Agent protocol or model."),
+                        Tone::Info,
+                    )
+                    .id("connector.preview-required")
+                }),
+            );
 
         if let Some(plan) = preview {
             let mut changes = Card::new().id("connector.preview-changes");
@@ -1102,12 +1686,12 @@ impl ConnectorView {
                 changes = changes.child(
                     ListRow::new()
                         .id("connector.preview.empty")
-                        .child("No Agent file changes are needed."),
+                        .child(locale.text("No Agent file changes are needed.")),
                 );
             }
             content = content.child(
                 Callout::new(
-                    "Fresh preview ready. No Agent files have been changed yet.",
+                    locale.text("Fresh preview ready. No Agent files have been changed yet."),
                     Tone::Info,
                 )
                 .id("connector.preview-summary"),
@@ -1117,7 +1701,9 @@ impl ConnectorView {
 
         if let Some(verification) = verification {
             let message = if verification.ok {
-                "Applied configuration matches the preview.".to_owned()
+                locale
+                    .text("Applied configuration matches the preview.")
+                    .to_owned()
             } else {
                 format!(
                     "Verification found drift:\n{}",
@@ -1141,18 +1727,6 @@ impl ConnectorView {
                 .id("connector.verification"),
             );
         }
-
-        let disconnect_view = cx.entity().downgrade();
-        content = content.child(
-            Button::new("connector.disconnect")
-                .label("Disconnect Gateway and remove managed configuration")
-                .danger()
-                .full_width(true)
-                .disabled(self.projection_busy || self.save_in_flight)
-                .on_click(move |_window, cx| {
-                    let _ = disconnect_view.update(cx, |this, cx| this.begin_disconnect(cx));
-                }),
-        );
         Card::new()
             .id("connector.connected")
             .padded(true)
@@ -1164,11 +1738,15 @@ impl ConnectorView {
 impl Render for ConnectorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let connected = matches!(self.state, AppState::Connected { .. });
         let content = match &self.state {
             AppState::Loading => Card::new()
                 .id("connector.loading")
                 .padded(true)
-                .child(StatusLine::new("Loading saved connection", Tone::Info))
+                .child(StatusLine::new(
+                    self.text("Loading saved connection"),
+                    Tone::Info,
+                ))
                 .into_any_element(),
             AppState::FirstRun => self.render_first_run(false, None, cx),
             AppState::Connecting => self.render_first_run(true, None, cx),
@@ -1176,14 +1754,31 @@ impl Render for ConnectorView {
             AppState::Failed(error) => self.render_first_run(false, Some(error), cx),
             AppState::Connected { .. } => self.render_connected(cx),
         };
-        div()
+        let root = div()
             .id("connector.root")
             .size_full()
-            .overflow_y_scroll()
             .bg(theme.colors.canvas)
             .font_family(theme.typography.sans.clone())
-            .text_color(theme.colors.text)
-            .child(
+            .text_color(theme.colors.text);
+        if connected {
+            root.flex().child(self.navigation(cx)).child(
+                div()
+                    .id("connector.shell.content")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(800.0))
+                            .mx_auto()
+                            .p(px(32.0))
+                            .child(content),
+                    ),
+            )
+        } else {
+            root.overflow_y_scroll().child(
                 div()
                     .w_full()
                     .max_w(px(680.0))
@@ -1191,7 +1786,51 @@ impl Render for ConnectorView {
                     .p(px(32.0))
                     .child(content),
             )
+        }
     }
+}
+
+fn page_title(title: &str) -> impl IntoElement {
+    div()
+        .text_size(px(24.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(title.to_owned())
+}
+
+fn agent_icon(agent: AgentId) -> Icon {
+    match agent {
+        AgentId::Claude => Icon::Chat,
+        AgentId::Codex => Icon::Terminal,
+        AgentId::Gemini => Icon::Global,
+        AgentId::Grokbuild => Icon::Command,
+        AgentId::Opencode => Icon::Document,
+    }
+}
+
+fn activate_theme_for(appearance: WindowAppearance, cx: &mut App) {
+    let theme = match appearance {
+        WindowAppearance::Light | WindowAppearance::VibrantLight => "studio-light",
+        WindowAppearance::Dark | WindowAppearance::VibrantDark => "studio-dark",
+    };
+    gpui_kit::theme::activate_theme(theme, cx);
+}
+
+fn apply_theme(preference: ThemePreference, cx: &mut App) {
+    let appearance = match preference {
+        ThemePreference::System => {
+            cx.set_window_appearance(None);
+            cx.window_appearance()
+        }
+        ThemePreference::Light => {
+            cx.set_window_appearance(Some(WindowAppearance::Light));
+            WindowAppearance::Light
+        }
+        ThemePreference::Dark => {
+            cx.set_window_appearance(Some(WindowAppearance::Dark));
+            WindowAppearance::Dark
+        }
+    };
+    activate_theme_for(appearance, cx);
 }
 
 fn protocol_select(
@@ -1248,11 +1887,17 @@ fn main() {
         })
         .expect("initialize GatewayConnector backend"),
     );
+    let preference_store =
+        PreferenceStore::new(directories.data_local_dir().join("ui-preferences.json"));
+    let preferences = preference_store.load();
     let application = gpui_platform::application().with_assets(gpui_kit::assets::Assets);
     application.run(move |cx: &mut App| {
         gpui_kit::install(cx);
-        let bounds = Bounds::centered(None, size(px(760.0), px(860.0)), cx);
+        apply_theme(preferences.theme, cx);
+        let bounds = Bounds::centered(None, size(px(1120.0), px(760.0)), cx);
         let backend = Arc::clone(&backend);
+        let preference_store = preference_store.clone();
+        let preferences = preferences.clone();
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -1260,7 +1905,7 @@ fn main() {
             },
             move |window, cx| {
                 let backend = Arc::clone(&backend);
-                cx.new(|cx| ConnectorView::new(backend, window, cx))
+                cx.new(|cx| ConnectorView::new(backend, preference_store, preferences, window, cx))
             },
         )
         .expect("open GatewayConnector window");

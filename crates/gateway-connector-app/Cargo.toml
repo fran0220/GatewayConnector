@@ -13,11 +13,18 @@ gpui-app = ["dep:gpui", "dep:gpui-kit", "dep:gpui_platform"]
 
 [dependencies]
 directories.workspace = true
+fs2.workspace = true
 gateway-connector-backend.workspace = true
 gateway-connector-core.workspace = true
 gpui = { workspace = true, optional = true }
 gpui-kit = { workspace = true, optional = true }
 gpui_platform = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sys-locale.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile.workspace = true
