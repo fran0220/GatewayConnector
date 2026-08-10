@@ -1,11 +1,15 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use gateway_connector_core::{CanonicalBaseUrl, ConnectionProfile, ProfileError, Protocol};
+use gateway_connector_core::{
+    CanonicalBaseUrl, ConnectionManifest, ConnectionMode, ConnectionProfile, CredentialKind,
+    ProfileError, Protocol, Provisioning,
+};
 use thiserror::Error;
 
 use crate::{
-    ApiKey, CredentialStore, DiscoveryError, GatewayClient, ModelDescriptor, ProfileStore,
-    StoreError, VaultError,
+    ApiKey, Browser, CredentialStore, DiscoveryError, Distribution, DistributionError,
+    GENERIC_DISTRIBUTION, GatewayClient, ManifestLocation, ModelDescriptor, ProfileStore,
+    StoreError, SystemBrowser, VaultError,
 };
 
 #[derive(Debug)]
@@ -20,6 +24,33 @@ pub struct ConnectRequest {
 pub struct ConnectionResult {
     pub profile: ConnectionProfile,
     pub models: Vec<ModelDescriptor>,
+    pub manifest: Option<ConnectionManifest>,
+    pub provisioning: Option<Provisioning>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProbeResult {
+    Direct {
+        base_url: CanonicalBaseUrl,
+    },
+    Provisioned {
+        base_url: CanonicalBaseUrl,
+        manifest_url: url::Url,
+        manifest: Box<ConnectionManifest>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct BrowserLoginOffer {
+    pub request: ConnectRequestWithoutCredential,
+    pub manifest_url: url::Url,
+    pub manifest: ConnectionManifest,
+}
+#[derive(Debug, Clone)]
+pub struct ConnectRequestWithoutCredential {
+    pub display_name: String,
+    pub base_url: String,
+    pub protocol: Protocol,
 }
 
 #[derive(Debug)]
@@ -27,6 +58,17 @@ pub struct ConnectorBackend {
     client: GatewayClient,
     credentials: Arc<dyn CredentialStore>,
     profiles: Arc<dyn ProfileStore>,
+    distribution: &'static Distribution,
+    browser: Arc<dyn Browser>,
+    connection_lock: Mutex<()>,
+    pending_credential: Mutex<Option<PendingCredential>>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCredential {
+    token: ApiKey,
+    profile: ConnectionProfile,
+    manifest: ConnectionManifest,
 }
 
 impl ConnectorBackend {
@@ -34,57 +76,367 @@ impl ConnectorBackend {
         credentials: Arc<dyn CredentialStore>,
         profiles: Arc<dyn ProfileStore>,
     ) -> Result<Self, BackendError> {
+        Self::with_dependencies(
+            credentials,
+            profiles,
+            &GENERIC_DISTRIBUTION,
+            Arc::new(SystemBrowser),
+        )
+    }
+
+    pub fn with_dependencies(
+        credentials: Arc<dyn CredentialStore>,
+        profiles: Arc<dyn ProfileStore>,
+        distribution: &'static Distribution,
+        browser: Arc<dyn Browser>,
+    ) -> Result<Self, BackendError> {
+        distribution.validate()?;
         Ok(Self {
             client: GatewayClient::new()?,
             credentials,
             profiles,
+            distribution,
+            browser,
+            connection_lock: Mutex::new(()),
+            pending_credential: Mutex::new(None),
+        })
+    }
+
+    pub fn probe(&self, base_url: &str) -> Result<ProbeResult, BackendError> {
+        let base_url = CanonicalBaseUrl::parse(base_url)?;
+        if !self.distribution.allow_custom_urls {
+            let configured = self
+                .distribution
+                .default_gateway_url
+                .ok_or(BackendError::DistributionGatewayRequired)
+                .and_then(|value| CanonicalBaseUrl::parse(value).map_err(BackendError::Profile))?;
+            if base_url != configured {
+                return Err(BackendError::CustomGatewayUrlNotAllowed);
+            }
+        }
+        let explicit_manifest = self
+            .distribution
+            .manifest_url
+            .map(url::Url::parse)
+            .transpose()
+            .map_err(|_| BackendError::InvalidDistributionManifest)?;
+        let location = match explicit_manifest.clone() {
+            Some(value) => ManifestLocation::Explicit(value),
+            None => ManifestLocation::WellKnown,
+        };
+        let Some(found) = self.client.discover_manifest(&base_url, location)? else {
+            return Ok(ProbeResult::Direct { base_url });
+        };
+        if let Some(expected) = self.distribution.expected_platform_id
+            && found.document.platform.id != expected
+        {
+            return Err(BackendError::PlatformMismatch {
+                expected: expected.into(),
+                actual: found.document.platform.id,
+            });
+        }
+        Ok(ProbeResult::Provisioned {
+            base_url,
+            manifest_url: explicit_manifest.unwrap_or(found.url),
+            manifest: Box::new(found.document),
         })
     }
 
     pub fn connect(&self, request: ConnectRequest) -> Result<ConnectionResult, BackendError> {
-        let base_url = CanonicalBaseUrl::parse(&request.base_url)?;
-        let previous = self.single_profile()?;
-        let profile = match previous.clone() {
-            Some(existing) => ConnectionProfile::reconfigured(
-                existing,
-                request.display_name,
+        let _connection_guard = self
+            .connection_lock
+            .lock()
+            .map_err(|_| BackendError::ConnectionLock)?;
+        if self.single_profile()?.is_some() {
+            return Err(BackendError::AlreadyConnected);
+        }
+        let probe = self.probe(&request.base_url)?;
+        let (base_url, mode, platform, manifest_url, manifest, provisioning, models) = match probe {
+            ProbeResult::Direct { base_url } => {
+                let models = self.client.discover_models(&base_url, &request.api_key)?;
+                (
+                    base_url,
+                    ConnectionMode::Direct,
+                    self.distribution.product_id.into(),
+                    None,
+                    None,
+                    None,
+                    models,
+                )
+            }
+            ProbeResult::Provisioned {
                 base_url,
-                request.protocol,
-            )?,
-            None => ConnectionProfile::new(request.display_name, base_url, request.protocol)?,
+                manifest_url,
+                manifest,
+            } => {
+                let manifest = *manifest;
+                if manifest.authentication.is_some() {
+                    return Err(BackendError::BrowserLoginRequired(Box::new(
+                        BrowserLoginOffer {
+                            request: ConnectRequestWithoutCredential {
+                                display_name: request.display_name,
+                                base_url: request.base_url,
+                                protocol: request.protocol,
+                            },
+                            manifest_url,
+                            manifest,
+                        },
+                    )));
+                }
+                let provisioning = self
+                    .client
+                    .fetch_provisioning(&manifest, &request.api_key)?;
+                let models = models_from_provisioning(&provisioning);
+                let platform = manifest.platform.id.clone();
+                (
+                    base_url,
+                    ConnectionMode::Provisioned,
+                    platform,
+                    Some(manifest_url),
+                    Some(manifest),
+                    Some(provisioning),
+                    models,
+                )
+            }
         };
-        let models = self
-            .client
-            .discover_models(&profile.base_url, &request.api_key)?;
+        let profile = ConnectionProfile::new_connection(
+            request.display_name,
+            base_url,
+            request.protocol,
+            mode,
+            CredentialKind::ApiKey,
+            platform,
+            manifest_url,
+        )?;
 
-        self.profiles.save(&profile)?;
-        if let Err(source) = self.credentials.set(&profile.credential, &request.api_key) {
-            let rollback = match previous {
-                Some(previous) => self.profiles.save(&previous),
-                None => self.profiles.delete(profile.id),
-            };
+        if let Err(source) = self.profiles.create(&profile) {
+            if matches!(source, StoreError::ActiveProfileExists) {
+                return Err(BackendError::AlreadyConnected);
+            }
+            return Err(source.into());
+        }
+        if let Err(source) = self.credentials.set(&profile, &request.api_key) {
+            let cleanup = self.credentials.delete(&profile.credential);
+            if let Err(cleanup) = cleanup {
+                return Err(BackendError::CredentialCleanup { source, cleanup });
+            }
+            let rollback = self.profiles.delete(profile.id);
             return match rollback {
                 Ok(()) => Err(source.into()),
                 Err(rollback) => Err(BackendError::CredentialCommit { source, rollback }),
             };
         }
-        Ok(ConnectionResult { profile, models })
+        Ok(ConnectionResult {
+            profile,
+            models,
+            manifest,
+            provisioning,
+        })
+    }
+
+    pub fn browser_login(
+        &self,
+        offer: BrowserLoginOffer,
+    ) -> Result<ConnectionResult, BackendError> {
+        let _connection_guard = self
+            .connection_lock
+            .lock()
+            .map_err(|_| BackendError::ConnectionLock)?;
+        let mut pending_guard = self
+            .pending_credential
+            .lock()
+            .map_err(|_| BackendError::PendingLock)?;
+        if pending_guard.is_some() || self.single_profile()?.is_some() {
+            return Err(BackendError::AlreadyConnected);
+        }
+        offer
+            .manifest
+            .validate()
+            .map_err(|error| BackendError::ManifestValidation(error.to_string()))?;
+        if let Some(expected) = self.distribution.expected_platform_id
+            && offer.manifest.platform.id != expected
+        {
+            return Err(BackendError::PlatformMismatch {
+                expected: expected.to_owned(),
+                actual: offer.manifest.platform.id,
+            });
+        }
+        let authentication = offer
+            .manifest
+            .authentication
+            .as_ref()
+            .ok_or(BackendError::ManifestHasNoBrowserAuth)?;
+        let base = CanonicalBaseUrl::parse(&offer.request.base_url)?;
+        let profile = ConnectionProfile::new_connection(
+            offer.request.display_name,
+            base,
+            offer.request.protocol,
+            ConnectionMode::Provisioned,
+            CredentialKind::AccessToken,
+            offer.manifest.platform.id.clone(),
+            Some(offer.manifest_url),
+        )?;
+        self.validate_distribution_profile(&profile)?;
+        let token = crate::PkceFlow::random().login(
+            &authentication.authorize_url,
+            &authentication.token_url,
+            self.distribution.pkce_client_id,
+            self.distribution.device_name,
+            self.browser.as_ref(),
+        )?;
+        let pending = PendingCredential {
+            token,
+            profile: profile.clone(),
+            manifest: offer.manifest.clone(),
+        };
+        *pending_guard = Some(pending.clone());
+        if let Err(source) = self.profiles.create(&profile) {
+            if matches!(source, StoreError::ActiveProfileExists) {
+                return Err(BackendError::AlreadyConnected);
+            }
+            return Err(source.into());
+        }
+        if let Err(source) = self.credentials.set(&profile, &pending.token) {
+            // `set` failures are ambiguous: the vault may have committed and
+            // then failed to acknowledge. Keep both the durable profile and
+            // in-memory pending token reachable for retry or revocation.
+            return Err(source.into());
+        }
+        *pending_guard = None;
+        drop(pending_guard);
+        // Persistence is complete before the bearer is used for provisioning. A
+        // transient outage leaves the saved connection available to resume.
+        let provisioning = self
+            .client
+            .fetch_provisioning(&offer.manifest, &pending.token)?;
+        let models = models_from_provisioning(&provisioning);
+        Ok(ConnectionResult {
+            profile,
+            models,
+            manifest: Some(offer.manifest),
+            provisioning: Some(provisioning),
+        })
     }
 
     pub fn resume(&self, profile: ConnectionProfile) -> Result<ConnectionResult, BackendError> {
         profile.validate()?;
+        self.validate_distribution_profile(&profile)?;
         let api_key = self
             .credentials
-            .get(&profile.credential)?
+            .get(&profile)?
             .ok_or(BackendError::MissingCredential)?;
-        let models = self.client.discover_models(&profile.base_url, &api_key)?;
-        Ok(ConnectionResult { profile, models })
+        match profile.mode {
+            ConnectionMode::Direct => {
+                let models = self.client.discover_models(&profile.base_url, &api_key)?;
+                Ok(ConnectionResult {
+                    profile,
+                    models,
+                    manifest: None,
+                    provisioning: None,
+                })
+            }
+            ConnectionMode::Provisioned => {
+                let found = self
+                    .client
+                    .discover_manifest(
+                        &profile.base_url,
+                        profile
+                            .manifest_url
+                            .clone()
+                            .map_or(ManifestLocation::WellKnown, ManifestLocation::Explicit),
+                    )?
+                    .ok_or(BackendError::ManifestDisappeared)?;
+                self.validate_platform(&profile, &found.document)?;
+                let provisioning = self.client.fetch_provisioning(&found.document, &api_key)?;
+                let models = models_from_provisioning(&provisioning);
+                Ok(ConnectionResult {
+                    profile,
+                    models,
+                    manifest: Some(found.document),
+                    provisioning: Some(provisioning),
+                })
+            }
+        }
     }
 
     pub fn resume_saved(&self) -> Result<Option<ConnectionResult>, BackendError> {
         self.single_profile()?
             .map(|profile| self.resume(profile))
             .transpose()
+    }
+
+    pub fn refresh(&self, profile: ConnectionProfile) -> Result<ConnectionResult, BackendError> {
+        self.resume(profile)
+    }
+
+    pub fn has_pending_credential(&self) -> Result<bool, BackendError> {
+        Ok(self
+            .pending_credential
+            .lock()
+            .map_err(|_| BackendError::PendingLock)?
+            .is_some())
+    }
+
+    pub fn retry_pending_credential(&self) -> Result<ConnectionResult, BackendError> {
+        let _connection_guard = self
+            .connection_lock
+            .lock()
+            .map_err(|_| BackendError::ConnectionLock)?;
+        let pending = self
+            .pending_credential
+            .lock()
+            .map_err(|_| BackendError::PendingLock)?
+            .clone()
+            .ok_or(BackendError::NoPendingCredential)?;
+        if self
+            .single_profile()?
+            .is_some_and(|active| active.id != pending.profile.id)
+        {
+            return Err(BackendError::AlreadyConnected);
+        }
+        self.profiles.save(&pending.profile)?;
+        if let Err(source) = self.credentials.set(&pending.profile, &pending.token) {
+            return Err(source.into());
+        }
+        *self
+            .pending_credential
+            .lock()
+            .map_err(|_| BackendError::PendingLock)? = None;
+        let provisioning = self
+            .client
+            .fetch_provisioning(&pending.manifest, &pending.token)?;
+        let models = models_from_provisioning(&provisioning);
+        Ok(ConnectionResult {
+            profile: pending.profile,
+            models,
+            manifest: Some(pending.manifest),
+            provisioning: Some(provisioning),
+        })
+    }
+
+    pub fn revoke_pending_credential(&self) -> Result<(), BackendError> {
+        let _connection_guard = self
+            .connection_lock
+            .lock()
+            .map_err(|_| BackendError::ConnectionLock)?;
+        let mut guard = self
+            .pending_credential
+            .lock()
+            .map_err(|_| BackendError::PendingLock)?;
+        let pending = guard.as_ref().ok_or(BackendError::NoPendingCredential)?;
+        if !self
+            .client
+            .revoke_credential(&pending.manifest, &pending.token)?
+        {
+            return Err(BackendError::RevocationInconclusive);
+        }
+        // A vault implementation may commit and still report an error. Keep a
+        // durable profile reference until local cleanup is confirmed.
+        self.profiles.save(&pending.profile)?;
+        self.credentials.delete(&pending.profile.credential)?;
+        self.profiles.delete(pending.profile.id)?;
+        *guard = None;
+        Ok(())
     }
 
     pub fn save_profile(&self, profile: &ConnectionProfile) -> Result<(), BackendError> {
@@ -113,10 +465,80 @@ impl ConnectorBackend {
         }
         Ok(profiles.pop())
     }
+
+    fn validate_platform(
+        &self,
+        profile: &ConnectionProfile,
+        manifest: &ConnectionManifest,
+    ) -> Result<(), BackendError> {
+        let expected = self.distribution.expected_platform_id;
+        if manifest.platform.id != profile.platform_id
+            || expected.is_some_and(|value| value != manifest.platform.id)
+        {
+            return Err(BackendError::PlatformMismatch {
+                expected: expected.unwrap_or(&profile.platform_id).to_owned(),
+                actual: manifest.platform.id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_distribution_profile(
+        &self,
+        profile: &ConnectionProfile,
+    ) -> Result<(), BackendError> {
+        if !self.distribution.allow_custom_urls {
+            let configured = self
+                .distribution
+                .default_gateway_url
+                .ok_or(BackendError::DistributionGatewayRequired)
+                .and_then(|value| CanonicalBaseUrl::parse(value).map_err(BackendError::Profile))?;
+            if profile.base_url != configured {
+                return Err(BackendError::CustomGatewayUrlNotAllowed);
+            }
+        }
+        if profile.mode == ConnectionMode::Provisioned {
+            if let Some(expected) = self.distribution.expected_platform_id
+                && profile.platform_id != expected
+            {
+                return Err(BackendError::PlatformMismatch {
+                    expected: expected.to_owned(),
+                    actual: profile.platform_id.clone(),
+                });
+            }
+            if let Some(configured) = self.distribution.manifest_url {
+                let configured = url::Url::parse(configured)
+                    .map_err(|_| BackendError::InvalidDistributionManifest)?;
+                if profile.manifest_url.as_ref() != Some(&configured) {
+                    return Err(BackendError::DistributionManifestMismatch);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn models_from_provisioning(value: &Provisioning) -> Vec<ModelDescriptor> {
+    let mut models: Vec<_> = value
+        .models
+        .iter()
+        .filter(|m| m.chat_capable)
+        .map(|m| ModelDescriptor {
+            id: m.id.clone(),
+            owned_by: m.vendor.as_ref().map(|v| v.name.clone()),
+            created: None,
+            object: Some("model".into()),
+            metadata: Default::default(),
+        })
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models
 }
 
 #[derive(Debug, Error)]
 pub enum BackendError {
+    #[error(transparent)]
+    Distribution(#[from] DistributionError),
     #[error(transparent)]
     Profile(#[from] ProfileError),
     #[error(transparent)]
@@ -126,7 +548,7 @@ pub enum BackendError {
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(
-        "the saved profile has no credential in the operating-system vault; enter the API key again"
+        "the saved profile has no credential in the operating-system vault; enter the credential again"
     )]
     MissingCredential,
     #[error("phase 1 supports one connection profile, but multiple profiles were found")]
@@ -136,4 +558,39 @@ pub enum BackendError {
         source: VaultError,
         rollback: StoreError,
     },
+    #[error("credential storage failed ({source}) and local vault cleanup failed ({cleanup})")]
+    CredentialCleanup {
+        source: VaultError,
+        cleanup: VaultError,
+    },
+    #[error("distribution manifest URL is invalid")]
+    InvalidDistributionManifest,
+    #[error("a distribution that disables custom URLs must configure a default Gateway URL")]
+    DistributionGatewayRequired,
+    #[error("this distribution accepts only its configured Gateway URL")]
+    CustomGatewayUrlNotAllowed,
+    #[error("the saved profile does not use this distribution's configured manifest")]
+    DistributionManifestMismatch,
+    #[error("manifest platform `{actual}` does not match required platform `{expected}`")]
+    PlatformMismatch { expected: String, actual: String },
+    #[error("browser login is required")]
+    BrowserLoginRequired(Box<BrowserLoginOffer>),
+    #[error("the saved provisioned manifest is no longer available")]
+    ManifestDisappeared,
+    #[error("manifest does not offer browser authentication")]
+    ManifestHasNoBrowserAuth,
+    #[error("manifest is invalid: {0}")]
+    ManifestValidation(String),
+    #[error(transparent)]
+    Pkce(#[from] crate::PkceError),
+    #[error("a connection is already active; disconnect it before starting another browser login")]
+    AlreadyConnected,
+    #[error("pending credential state is unavailable")]
+    PendingLock,
+    #[error("connection operation lock is unavailable")]
+    ConnectionLock,
+    #[error("there is no pending credential to recover")]
+    NoPendingCredential,
+    #[error("credential revocation was inconclusive; retry before discarding it")]
+    RevocationInconclusive,
 }

@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 gateway-connector-core.workspace = true
+fs2.workspace = true
 keyring.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -16,6 +17,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 url.workspace = true
 zeroize.workspace = true
+base64.workspace = true
+rand.workspace = true
+sha2.workspace = true
+webbrowser.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile.workspace = true

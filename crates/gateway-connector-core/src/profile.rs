@@ -286,11 +286,32 @@ pub struct ConnectionProfile {
     pub display_name: String,
     pub base_url: CanonicalBaseUrl,
     pub credential: CredentialRef,
+    pub mode: ConnectionMode,
+    pub credential_kind: CredentialKind,
+    pub platform_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_url: Option<Url>,
     pub agents: BTreeMap<AgentId, AgentSelection>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionMode {
+    #[default]
+    Direct,
+    Provisioned,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialKind {
+    #[default]
+    ApiKey,
+    AccessToken,
+}
+
 impl ConnectionProfile {
-    pub const SCHEMA_VERSION: u32 = 1;
+    pub const SCHEMA_VERSION: u32 = 2;
 
     pub fn new(
         display_name: impl Into<String>,
@@ -316,8 +337,30 @@ impl ConnectionProfile {
             display_name,
             base_url,
             credential,
+            mode: ConnectionMode::Direct,
+            credential_kind: CredentialKind::ApiKey,
+            platform_id: "gateway-connector".into(),
+            manifest_url: None,
             agents,
         })
+    }
+
+    pub fn new_connection(
+        display_name: impl Into<String>,
+        base_url: CanonicalBaseUrl,
+        protocol: Protocol,
+        mode: ConnectionMode,
+        credential_kind: CredentialKind,
+        platform_id: impl Into<String>,
+        manifest_url: Option<Url>,
+    ) -> Result<Self, ProfileError> {
+        let mut value = Self::new(display_name, base_url, protocol)?;
+        value.mode = mode;
+        value.credential_kind = credential_kind;
+        value.platform_id = platform_id.into();
+        value.manifest_url = manifest_url;
+        value.validate()?;
+        Ok(value)
     }
 
     pub fn reconfigured(
@@ -338,6 +381,26 @@ impl ConnectionProfile {
         Ok(existing)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconfigured_connection(
+        mut existing: Self,
+        display_name: impl Into<String>,
+        base_url: CanonicalBaseUrl,
+        protocol: Protocol,
+        mode: ConnectionMode,
+        credential_kind: CredentialKind,
+        platform_id: impl Into<String>,
+        manifest_url: Option<Url>,
+    ) -> Result<Self, ProfileError> {
+        existing = Self::reconfigured(existing, display_name, base_url, protocol)?;
+        existing.mode = mode;
+        existing.credential_kind = credential_kind;
+        existing.platform_id = platform_id.into();
+        existing.manifest_url = manifest_url;
+        existing.validate()?;
+        Ok(existing)
+    }
+
     pub fn validate(&self) -> Result<(), ProfileError> {
         if self.schema_version != Self::SCHEMA_VERSION {
             return Err(ProfileError::UnsupportedSchemaVersion(self.schema_version));
@@ -346,6 +409,22 @@ impl ConnectionProfile {
         CredentialRef::parse(self.credential.0.clone())?;
         if self.credential != CredentialRef::for_profile(self.id) {
             return Err(ProfileError::CredentialReferenceMismatch);
+        }
+        if !portable_id(&self.platform_id) {
+            return Err(ProfileError::InvalidPlatformId);
+        }
+        if self.mode == ConnectionMode::Direct
+            && (self.credential_kind != CredentialKind::ApiKey || self.manifest_url.is_some())
+        {
+            return Err(ProfileError::InvalidConnectionRelationship);
+        }
+        if self.credential_kind == CredentialKind::AccessToken
+            && self.mode != ConnectionMode::Provisioned
+        {
+            return Err(ProfileError::InvalidConnectionRelationship);
+        }
+        if let Some(url) = &self.manifest_url {
+            validate_manifest_url(url, &self.base_url)?;
         }
         if self.agents.len() != AgentId::ALL.len()
             || AgentId::ALL
@@ -374,6 +453,14 @@ struct UncheckedConnectionProfile {
     display_name: String,
     base_url: CanonicalBaseUrl,
     credential: CredentialRef,
+    #[serde(default)]
+    mode: Option<ConnectionMode>,
+    #[serde(default)]
+    credential_kind: Option<CredentialKind>,
+    #[serde(default)]
+    platform_id: Option<String>,
+    #[serde(default)]
+    manifest_url: Option<Url>,
     agents: BTreeMap<AgentId, AgentSelection>,
 }
 
@@ -381,17 +468,84 @@ impl TryFrom<UncheckedConnectionProfile> for ConnectionProfile {
     type Error = ProfileError;
 
     fn try_from(unchecked: UncheckedConnectionProfile) -> Result<Self, Self::Error> {
+        if !matches!(unchecked.schema_version, 1 | Self::SCHEMA_VERSION) {
+            return Err(ProfileError::UnsupportedSchemaVersion(
+                unchecked.schema_version,
+            ));
+        }
+        let legacy = unchecked.schema_version == 1;
         let profile = Self {
-            schema_version: unchecked.schema_version,
+            schema_version: Self::SCHEMA_VERSION,
             id: unchecked.id,
             display_name: unchecked.display_name,
             base_url: unchecked.base_url,
             credential: unchecked.credential,
+            mode: if legacy {
+                ConnectionMode::Direct
+            } else {
+                unchecked
+                    .mode
+                    .ok_or(ProfileError::MissingSchemaTwoField("mode"))?
+            },
+            credential_kind: if legacy {
+                CredentialKind::ApiKey
+            } else {
+                unchecked
+                    .credential_kind
+                    .ok_or(ProfileError::MissingSchemaTwoField("credential_kind"))?
+            },
+            platform_id: if legacy {
+                generic_platform()
+            } else {
+                unchecked
+                    .platform_id
+                    .ok_or(ProfileError::MissingSchemaTwoField("platform_id"))?
+            },
+            manifest_url: if legacy { None } else { unchecked.manifest_url },
             agents: unchecked.agents,
         };
         profile.validate()?;
         Ok(profile)
     }
+}
+
+fn generic_platform() -> String {
+    "gateway-connector".into()
+}
+fn portable_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|b| !b.is_ascii_uppercase())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        && !matches!(
+            value.split('.').next(),
+            Some("con" | "prn" | "aux" | "nul" | "clock$")
+        )
+        && !value.split('.').next().is_some_and(|stem| {
+            stem.len() == 4
+                && (stem.starts_with("com") || stem.starts_with("lpt"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9')
+        })
+}
+fn validate_manifest_url(url: &Url, base: &CanonicalBaseUrl) -> Result<(), ProfileError> {
+    if url.origin() != base.origin()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !(url.scheme() == "https" || (url.scheme() == "http" && loopback_host(url.host())))
+    {
+        return Err(ProfileError::InvalidManifestUrl);
+    }
+    Ok(())
+}
+
+fn loopback_host(host: Option<Host<&str>>) -> bool {
+    matches!(host, Some(Host::Domain("localhost")))
+        || matches!(host, Some(Host::Ipv4(v)) if v.is_loopback())
+        || matches!(host, Some(Host::Ipv6(v)) if v.is_loopback())
 }
 
 fn validated_display_name(value: String) -> Result<String, ProfileError> {
@@ -428,6 +582,8 @@ pub enum ProfileError {
     InvalidDisplayName,
     #[error("profile schema version {0} is unsupported")]
     UnsupportedSchemaVersion(u32),
+    #[error("schema-2 profile is missing required field `{0}`")]
+    MissingSchemaTwoField(&'static str),
     #[error("a profile must contain exactly one selection for each supported Agent")]
     InvalidAgentSelections,
     #[error("the selected model ID is empty, overlong, or contains control characters")]
@@ -436,6 +592,12 @@ pub enum ProfileError {
     InvalidCredentialReference,
     #[error("the credential reference must belong to the profile ID")]
     CredentialReferenceMismatch,
+    #[error("the platform ID is not portable")]
+    InvalidPlatformId,
+    #[error("connection mode, credential kind, and manifest URL are inconsistent")]
+    InvalidConnectionRelationship,
+    #[error("the manifest URL must be secure and use the exact gateway origin")]
+    InvalidManifestUrl,
     #[error("unknown protocol `{0}`")]
     UnknownProtocol(String),
 }
@@ -518,11 +680,55 @@ mod tests {
         .expect("valid profile");
         let json = serde_json::to_string_pretty(&profile).expect("serialize profile");
         assert!(json.contains("profile:"));
-        assert!(!json.contains("api_key"));
+        assert!(json.contains("credential_kind"));
         assert_eq!(profile.agents.len(), 5);
 
         let decoded: ConnectionProfile = serde_json::from_str(&json).expect("deserialize profile");
         assert_eq!(decoded, profile);
+    }
+
+    #[test]
+    fn migrates_schema_one_profile_without_serializing_a_secret() {
+        let id = ProfileId::new();
+        let mut agents = BTreeMap::new();
+        for agent in AgentId::ALL {
+            agents.insert(agent, AgentSelection::new(Protocol::Auto));
+        }
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "id": id,
+            "display_name": "Legacy",
+            "base_url": "https://gateway.example/",
+            "credential": CredentialRef::for_profile(id),
+            "agents": agents,
+        });
+        let profile: ConnectionProfile =
+            serde_json::from_value(legacy).expect("schema-1 profile migrates");
+        assert_eq!(profile.id, id);
+        assert_eq!(profile.credential, CredentialRef::for_profile(id));
+        assert_eq!(profile.schema_version, ConnectionProfile::SCHEMA_VERSION);
+        assert_eq!(profile.mode, ConnectionMode::Direct);
+        assert_eq!(profile.credential_kind, CredentialKind::ApiKey);
+        let current = serde_json::to_string(&profile).expect("serialize current profile");
+        assert!(current.contains("\"schema_version\":2"));
+        assert!(!current.contains("secret"));
+    }
+
+    #[test]
+    fn schema_two_requires_all_connection_security_fields() {
+        let profile = ConnectionProfile::new(
+            "Current",
+            CanonicalBaseUrl::parse("https://gateway.example").expect("valid URL"),
+            Protocol::Auto,
+        )
+        .expect("valid profile");
+        for field in ["mode", "credential_kind", "platform_id"] {
+            let mut json = serde_json::to_value(&profile).expect("serialize profile");
+            json.as_object_mut().expect("profile object").remove(field);
+            let error = serde_json::from_value::<ConnectionProfile>(json)
+                .expect_err("schema-2 field is required");
+            assert!(error.to_string().contains(field), "{error}");
+        }
     }
 
     #[test]

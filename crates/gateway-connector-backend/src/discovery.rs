@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, io::Read, time::Duration};
 
-use gateway_connector_core::CanonicalBaseUrl;
+use gateway_connector_core::{CanonicalBaseUrl, ConnectionManifest, Provisioning};
 use reqwest::{StatusCode, blocking::Response, header};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -31,12 +31,10 @@ pub enum ManifestLocation {
     Explicit(Url),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct DiscoveredManifest {
     pub url: Url,
-    /// Deliberately opaque in phase 1. Capability schemas are versioned by
-    /// platforms and interpreted by the phase-2 manifest/provisioning layer.
-    pub document: Value,
+    pub document: ConnectionManifest,
 }
 
 #[derive(Debug, Clone)]
@@ -95,7 +93,8 @@ impl GatewayClient {
         &self,
         base_url: &CanonicalBaseUrl,
         location: ManifestLocation,
-    ) -> Result<DiscoveredManifest, DiscoveryError> {
+    ) -> Result<Option<DiscoveredManifest>, DiscoveryError> {
+        let explicit = matches!(location, ManifestLocation::Explicit(_));
         let endpoint = match location {
             ManifestLocation::WellKnown => base_url.well_known_endpoint(),
             ManifestLocation::Explicit(url) => {
@@ -109,6 +108,12 @@ impl GatewayClient {
             }
         };
         let response = self.get_following_exact_origin(endpoint, base_url, None)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            if explicit {
+                return Err(DiscoveryError::ExplicitManifestNotFound);
+            }
+            return Ok(None);
+        }
         if !response.status().is_success() {
             return Err(DiscoveryError::ManifestHttpStatus(
                 response.status().as_u16(),
@@ -116,12 +121,84 @@ impl GatewayClient {
         }
         let final_url = response.url().clone();
         let bytes = read_bounded(response)?;
-        let document = serde_json::from_slice(&bytes)
-            .map_err(|source| DiscoveryError::InvalidManifest { source })?;
-        Ok(DiscoveredManifest {
+        let document = ConnectionManifest::parse(&bytes).map_err(|source| {
+            DiscoveryError::InvalidManifest {
+                message: source.to_string(),
+            }
+        })?;
+        Ok(Some(DiscoveredManifest {
             url: final_url,
             document,
-        })
+        }))
+    }
+
+    pub fn fetch_provisioning(
+        &self,
+        manifest: &ConnectionManifest,
+        bearer: &ApiKey,
+    ) -> Result<Provisioning, DiscoveryError> {
+        let provisioning_origin = manifest.provisioning_url.origin();
+        if !manifest
+            .connection_bearer_origins
+            .iter()
+            .any(|allowed| allowed.origin() == provisioning_origin)
+        {
+            return Err(DiscoveryError::OriginBoundary(
+                manifest.provisioning_url.clone(),
+            ));
+        }
+        let base = CanonicalBaseUrl::parse(&provisioning_origin.ascii_serialization()).map_err(
+            |error| DiscoveryError::InvalidManifest {
+                message: error.to_string(),
+            },
+        )?;
+        let response = self.get_following_exact_origin(
+            manifest.provisioning_url.clone(),
+            &base,
+            Some(bearer.expose_secret()),
+        )?;
+        if !response.status().is_success() {
+            return Err(DiscoveryError::ProvisioningHttpStatus(
+                response.status().as_u16(),
+            ));
+        }
+        let bytes = read_bounded(response)?;
+        let value = Provisioning::parse(&bytes)
+            .map_err(|source| DiscoveryError::InvalidProvisioning(source.to_string()))?;
+        value
+            .validate_for(manifest)
+            .map_err(|source| DiscoveryError::InvalidProvisioning(source.to_string()))?;
+        Ok(value)
+    }
+
+    pub fn revoke_credential(
+        &self,
+        manifest: &ConnectionManifest,
+        bearer: &ApiKey,
+    ) -> Result<bool, DiscoveryError> {
+        let mut endpoint = manifest.provisioning_url.clone();
+        let path = endpoint.path().trim_end_matches('/');
+        let prefix = path
+            .strip_suffix("/provisioning")
+            .ok_or(DiscoveryError::InvalidRevokeEndpoint)?;
+        endpoint.set_path(&format!("{prefix}/revoke"));
+        endpoint.set_query(None);
+        endpoint.set_fragment(None);
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(DiscoveryError::ClientSetup)?;
+        let request_url = endpoint.clone();
+        let response = client
+            .post(endpoint)
+            .bearer_auth(bearer.expose_secret())
+            .send()
+            .map_err(|source| DiscoveryError::Network {
+                url: request_url,
+                source,
+            })?;
+        Ok(response.status().is_success() || response.status() == StatusCode::UNAUTHORIZED)
     }
 
     fn get_following_exact_origin(
@@ -307,6 +384,14 @@ pub enum DiscoveryError {
     ManifestUrlCredentials,
     #[error("the connector manifest returned HTTP {0}")]
     ManifestHttpStatus(u16),
-    #[error("the connector manifest is not valid JSON: {source}")]
-    InvalidManifest { source: serde_json::Error },
+    #[error("the explicit connector manifest was not found (HTTP 404)")]
+    ExplicitManifestNotFound,
+    #[error("the connector manifest is invalid: {message}")]
+    InvalidManifest { message: String },
+    #[error("provisioning returned HTTP {0}")]
+    ProvisioningHttpStatus(u16),
+    #[error("provisioning is invalid: {0}")]
+    InvalidProvisioning(String),
+    #[error("provisioning URL does not end in /provisioning")]
+    InvalidRevokeEndpoint,
 }

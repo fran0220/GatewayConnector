@@ -13,8 +13,8 @@ pub use model::{
     Provisioning, Secret, Skill, SkillArchive, SkillArchiveAuthorization, Subscription, Usage,
 };
 pub use profile::{
-    AgentId, AgentSelection, CanonicalBaseUrl, ConnectionProfile, CredentialRef, ProfileError,
-    ProfileId, Protocol,
+    AgentId, AgentSelection, CanonicalBaseUrl, ConnectionMode, ConnectionProfile, CredentialKind,
+    CredentialRef, ProfileError, ProfileId, Protocol,
 };
 pub use transaction::{ApplyInput, Change, ChangeKind, Connector, Plan, Verification};
 

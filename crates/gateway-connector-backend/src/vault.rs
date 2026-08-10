@@ -1,16 +1,21 @@
 use std::{collections::HashMap, fmt, sync::Mutex};
 
-use gateway_connector_core::CredentialRef;
+use gateway_connector_core::{
+    ConnectionMode, ConnectionProfile, CredentialKind, CredentialRef, ProfileId,
+};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
-/// Secret bearer with redacted diagnostics and zeroized storage on drop.
+const ENVELOPE_PREFIX: &str = "gateway-connector-credential-v1:";
+
+/// Credential secret with redacted diagnostics and zeroized storage on drop.
 pub struct ApiKey(String);
 
 impl ApiKey {
     pub fn new(value: impl Into<String>) -> Result<Self, VaultError> {
         let value = value.into();
-        if value.trim().is_empty() {
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
             return Err(VaultError::EmptyCredential);
         }
         Ok(Self(value))
@@ -40,9 +45,56 @@ impl Drop for ApiKey {
 }
 
 pub trait CredentialStore: Send + Sync + fmt::Debug {
-    fn get(&self, credential: &CredentialRef) -> Result<Option<ApiKey>, VaultError>;
-    fn set(&self, credential: &CredentialRef, api_key: &ApiKey) -> Result<(), VaultError>;
+    fn get(&self, profile: &ConnectionProfile) -> Result<Option<ApiKey>, VaultError>;
+    fn set(&self, profile: &ConnectionProfile, api_key: &ApiKey) -> Result<(), VaultError>;
     fn delete(&self, credential: &CredentialRef) -> Result<(), VaultError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CredentialBinding {
+    schema_version: u32,
+    profile_id: ProfileId,
+    base_url: String,
+    mode: ConnectionMode,
+    credential_kind: CredentialKind,
+    platform_id: String,
+    manifest_url: Option<String>,
+}
+
+impl CredentialBinding {
+    fn for_profile(profile: &ConnectionProfile) -> Self {
+        Self {
+            schema_version: 1,
+            profile_id: profile.id,
+            base_url: profile.base_url.to_string(),
+            mode: profile.mode,
+            credential_kind: profile.credential_kind,
+            platform_id: profile.platform_id.clone(),
+            manifest_url: profile.manifest_url.as_ref().map(ToString::to_string),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct CredentialEnvelope {
+    binding: CredentialBinding,
+    secret: String,
+}
+
+#[derive(Serialize)]
+struct CredentialEnvelopeRef<'a> {
+    binding: CredentialBinding,
+    secret: &'a str,
+}
+
+fn encode(profile: &ConnectionProfile, api_key: &ApiKey) -> Result<Zeroizing<String>, VaultError> {
+    let value = CredentialEnvelopeRef {
+        binding: CredentialBinding::for_profile(profile),
+        secret: api_key.expose_secret(),
+    };
+    serde_json::to_string(&value)
+        .map(|json| Zeroizing::new(format!("{ENVELOPE_PREFIX}{json}")))
+        .map_err(|error| VaultError::InvalidEnvelope(error.to_string()))
 }
 
 #[derive(Debug)]
@@ -64,17 +116,35 @@ impl OsCredentialStore {
 }
 
 impl CredentialStore for OsCredentialStore {
-    fn get(&self, credential: &CredentialRef) -> Result<Option<ApiKey>, VaultError> {
-        match self.entry(credential)?.get_password() {
-            Ok(value) => ApiKey::new(value).map(Some),
+    fn get(&self, profile: &ConnectionProfile) -> Result<Option<ApiKey>, VaultError> {
+        match self.entry(&profile.credential)?.get_password() {
+            Ok(value) => {
+                let value = Zeroizing::new(value);
+                if let Some(json) = value.strip_prefix(ENVELOPE_PREFIX) {
+                    let envelope: CredentialEnvelope = serde_json::from_str(json)
+                        .map_err(|error| VaultError::InvalidEnvelope(error.to_string()))?;
+                    if envelope.binding != CredentialBinding::for_profile(profile) {
+                        return Err(VaultError::BindingMismatch);
+                    }
+                    ApiKey::new(envelope.secret).map(Some)
+                } else {
+                    // Phase-1 credentials predate origin binding. Trust the
+                    // already loaded profile once, then atomically replace the
+                    // raw vault value with the bound envelope.
+                    let api_key = ApiKey::new(value.to_string())?;
+                    self.set(profile, &api_key)?;
+                    Ok(Some(api_key))
+                }
+            }
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(error) => Err(VaultError::Unavailable(error.to_string())),
         }
     }
 
-    fn set(&self, credential: &CredentialRef, api_key: &ApiKey) -> Result<(), VaultError> {
-        self.entry(credential)?
-            .set_password(api_key.expose_secret())
+    fn set(&self, profile: &ConnectionProfile, api_key: &ApiKey) -> Result<(), VaultError> {
+        let encoded = encode(profile, api_key)?;
+        self.entry(&profile.credential)?
+            .set_password(&encoded)
             .map_err(|error| VaultError::Unavailable(error.to_string()))
     }
 
@@ -88,22 +158,29 @@ impl CredentialStore for OsCredentialStore {
 
 #[derive(Debug, Default)]
 pub struct InMemoryCredentialStore {
-    entries: Mutex<HashMap<CredentialRef, ApiKey>>,
+    entries: Mutex<HashMap<CredentialRef, (ApiKey, CredentialBinding)>>,
 }
 
 impl CredentialStore for InMemoryCredentialStore {
-    fn get(&self, credential: &CredentialRef) -> Result<Option<ApiKey>, VaultError> {
-        self.entries
-            .lock()
-            .map_err(|_| VaultError::Poisoned)
-            .map(|entries| entries.get(credential).cloned())
+    fn get(&self, profile: &ConnectionProfile) -> Result<Option<ApiKey>, VaultError> {
+        let entries = self.entries.lock().map_err(|_| VaultError::Poisoned)?;
+        let Some((api_key, binding)) = entries.get(&profile.credential) else {
+            return Ok(None);
+        };
+        if binding != &CredentialBinding::for_profile(profile) {
+            return Err(VaultError::BindingMismatch);
+        }
+        Ok(Some(api_key.clone()))
     }
 
-    fn set(&self, credential: &CredentialRef, api_key: &ApiKey) -> Result<(), VaultError> {
+    fn set(&self, profile: &ConnectionProfile, api_key: &ApiKey) -> Result<(), VaultError> {
         self.entries
             .lock()
             .map_err(|_| VaultError::Poisoned)?
-            .insert(credential.clone(), api_key.clone());
+            .insert(
+                profile.credential.clone(),
+                (api_key.clone(), CredentialBinding::for_profile(profile)),
+            );
         Ok(())
     }
 
@@ -118,10 +195,14 @@ impl CredentialStore for InMemoryCredentialStore {
 
 #[derive(Debug, Error)]
 pub enum VaultError {
-    #[error("the API key is empty")]
+    #[error("the credential is empty")]
     EmptyCredential,
     #[error("the operating-system credential store is unavailable: {0}")]
     Unavailable(String),
+    #[error("the vault credential is bound to different connection security settings")]
+    BindingMismatch,
+    #[error("the vault credential envelope is invalid: {0}")]
+    InvalidEnvelope(String),
     #[error("the in-memory credential store lock is poisoned")]
     Poisoned,
 }
@@ -129,24 +210,31 @@ pub enum VaultError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gateway_connector_core::ProfileId;
+    use gateway_connector_core::{CanonicalBaseUrl, Protocol};
 
     #[test]
     fn in_memory_store_round_trips_without_exposing_debug_value() {
         let store = InMemoryCredentialStore::default();
-        let reference = CredentialRef::for_profile(ProfileId::new());
+        let profile = ConnectionProfile::new(
+            "Test",
+            CanonicalBaseUrl::parse("https://gateway.example").expect("base URL"),
+            Protocol::Auto,
+        )
+        .expect("profile");
         let key = ApiKey::new("very-secret").expect("valid key");
         assert_eq!(format!("{key:?}"), "ApiKey([REDACTED])");
-        store.set(&reference, &key).expect("store key");
+        store.set(&profile, &key).expect("store key");
         assert_eq!(
             store
-                .get(&reference)
+                .get(&profile)
                 .expect("read key")
                 .expect("key exists")
                 .expose_secret(),
             "very-secret"
         );
-        store.delete(&reference).expect("delete key");
-        assert!(store.get(&reference).expect("read key").is_none());
+        store
+            .delete(&profile.credential)
+            .expect("delete credential");
+        assert!(store.get(&profile).expect("read key").is_none());
     }
 }

@@ -113,11 +113,6 @@ impl ConnectionManifest {
         }
         secure(&self.gateway.base_url)?;
         secure(&self.provisioning_url)?;
-        if self.gateway.base_url.origin() != self.provisioning_url.origin() {
-            return Err(Error::Validation(
-                "provisioning and gateway origins do not match".into(),
-            ));
-        }
         if self.connection_bearer_origins.is_empty() {
             return Err(Error::Validation(
                 "connection_bearer_origins is empty".into(),
@@ -147,6 +142,11 @@ impl ConnectionManifest {
         if !bearer_origins.contains(&self.gateway.base_url.origin().ascii_serialization()) {
             return Err(Error::Validation(
                 "gateway origin is not allowed for connection bearer".into(),
+            ));
+        }
+        if !bearer_origins.contains(&self.provisioning_url.origin().ascii_serialization()) {
+            return Err(Error::Validation(
+                "provisioning origin is not allowed for connection bearer".into(),
             ));
         }
         if self.supported_agents.is_empty() {
@@ -600,9 +600,14 @@ fn model_id(value: &str) -> Result<()> {
     }
 }
 fn secure(url: &Url) -> Result<()> {
-    if url.scheme() == "https"
+    let secure_transport = url.scheme() == "https"
         || (url.scheme() == "http"
-            && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1")))
+            && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1")));
+    if secure_transport
+        && url.host().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
     {
         Ok(())
     } else {

@@ -5,11 +5,12 @@ connection and Agent projection. Branded distributions inject their own
 identity, assets, platform manifest, OAuth/account integration, packaging, and
 release process; none of those concerns belong in this repository.
 
-Phase 1 intentionally implements one complete, useful path: enter an HTTPS
-Gateway base URL and API key, test the connection with authenticated
-`GET` model discovery, select a protocol and model for each of five supported
-Agents, and preview the intended neutral projection. It does **not** write
-Agent configuration yet.
+The generic path requires only an HTTPS Gateway base URL and API key. It tests
+the connection with authenticated `GET` model discovery, then lets the user
+select a protocol and model for each of five supported Agents. An enhanced
+Gateway may optionally advertise schema-v2 browser PKCE and provisioning from
+the exact-origin `/.well-known/gateway-connector` document. A missing
+well-known document is normal and falls back to the generic path.
 
 The Gateway URL may be an origin, a nested prefix, an API base ending in
 `/v1`, or the full `/v1/models` endpoint. Resolution is deterministic and does
@@ -27,15 +28,17 @@ not scan other endpoints:
 
 ```text
 gateway-connector-core
-  Canonical URL + persisted profile model
-  Five Agent IDs and per-Agent protocol/model selections
-  Secret-free projection/coordinator interfaces
+  Canonical URL + versioned, secret-free persisted profile model
+  Five-Agent native projection and discovery engine
+  Plan/preview/apply/verify/disconnect, coordinator leases, encrypted receipts,
+  and crash-safe staging/rollback
 
 gateway-connector-backend
   Exact-origin HTTP and OpenAI-compatible model discovery
-  Optional /.well-known/gateway-connector or explicit-manifest fetch seam
+  Optional schema-v2 well-known/explicit manifest and provisioning flow
+  Standard browser PKCE with access-token-only persistence
   OS credential-store abstraction + in-memory test vault
-  JSON profile store containing credential references, never API keys
+  Thin compile-time Distribution boundary for neutral/downstream identity
 
 gateway-connector-app
   Pure application state
@@ -43,20 +46,27 @@ gateway-connector-app
   connected summary, and preview flow
 ```
 
-The projection contract deliberately retains the proven five adapters—Claude
-Code, Codex CLI, Gemini CLI, Grok Build, and OpenCode—and a secret-free shared
-coordinator lease. A future implementation must use plan → preview → apply →
-verify → disconnect, preserve unrelated configuration, reject symlink/ownership
-collisions, and coordinate singleton Agent files across distributions.
+The projection engine retains the proven five adapters—Claude Code, Codex CLI,
+Gemini CLI, Grok Build, and OpenCode. It uses plan → preview → apply → verify →
+disconnect, preserves unrelated JSON/JSONC/TOML/env configuration, rejects
+symlink and ownership collisions, requires a fresh preview before apply, and
+coordinates singleton Agent files across distributions through the shared
+`ProjectDirs("dev", "GatewayConnector", "ProjectionCoordinator")` contract.
 
 ## Security boundary
 
-- Profiles persist a stable UUID, canonical URL, display name, per-Agent
-  choices, and an opaque credential reference. They never contain a plaintext
-  API key.
-- API keys are stored through `CredentialStore`; the desktop binary uses the OS
-  credential store and tests use `InMemoryCredentialStore`. On restart, the
-  single phase-1 profile is resumed with the same ID and vault reference.
+- Profiles persist a stable UUID, canonical URL, connection mode/platform,
+  display name, per-Agent choices, and an opaque credential reference. They
+  never contain a plaintext API key or access token. Legacy schema-1 direct
+  profiles migrate to schema 2 on load, and every credential reference is
+  bound to its profile UUID. The vault envelope also binds the credential to
+  the canonical Gateway, mode, platform, credential kind, and manifest
+  location, so editing profile JSON cannot redirect an existing bearer.
+- API keys and PKCE access tokens are stored through `CredentialStore`; the
+  desktop binary uses the OS credential store and tests use
+  `InMemoryCredentialStore`. Refresh tokens and provider account blobs are not
+  retained. Failed vault commits keep a newly minted credential reachable for
+  explicit retry or confirmed remote revocation.
 - Remote gateways require HTTPS. Plain HTTP is allowed only for literal
   loopback development hosts, and loopback HTTP always bypasses ambient proxy
   configuration so a local bearer cannot be exposed to a forward proxy.
@@ -67,9 +77,21 @@ collisions, and coordinate singleton Agent files across distributions.
   bearer cannot leak.
 - Model and manifest responses are limited to 2 MiB.
 - Manifest discovery is optional and unauthenticated. Generic gateways need
-  only the OpenAI-compatible `/v1/models` endpoint. The phase-1 seam preserves
-  the manifest as versioned JSON rather than inventing platform capability
-  fields prematurely.
+  only the OpenAI-compatible `/v1/models` endpoint. Well-known 404 is direct
+  mode; an injected explicit manifest is required and does not silently fall
+  back on 404. Provisioning receives a bearer only when its exact origin is in
+  the manifest allowlist, and its top-level chat model catalog—not Model
+  Plaza—is the Agent selector source.
+- Browser authentication is standard S256 PKCE over a loopback callback. The
+  authorization code exchange does not follow redirects and accepts only a
+  Bearer `access_token` response.
+- Official downstream builds can disable custom Gateway URLs and pin both the
+  platform identity and manifest endpoint through `Distribution`; generic
+  builds remain user-configurable. Neutral defaults contain no branded URLs,
+  OAuth IDs, assets, account assumptions, or updater metadata.
+- Profile creation is singleton and guarded by both an in-process connection
+  lock and an inter-process profile-file lock. Profile writes use private
+  temporary files and replace atomically on Linux, macOS, and Windows.
 - There is no local relay, embedded Agent runtime, custom cryptography, or
   hard-coded MCP/Skill catalog.
 
@@ -108,16 +130,20 @@ cargo run -p gateway-connector-app --features gpui-app --bin gateway-connector
    refreshes `/v1/models` while preserving the stable profile ID and valid
    Agent selections.
 
-## Phase 2 extraction
+## Next extraction steps
 
-The next coherent change is the shared projection implementation behind
-`ProjectionBackend`: side-effect-free Agent discovery; native-format merges;
-secret-free coordinator locking and leases; immutable file snapshots; encrypted
-ownership receipts using established cryptographic libraries; preview/apply
-credential binding; rollback, verification, and ownership-aware disconnect.
-After that, versioned manifest interpretation can add browser PKCE,
-provisioning, advertised MCP, and verified Skill synchronization. Each remains
-optional for a generic `/v1/models` Gateway.
+The next coherent backend change is online catalog synchronization: consume
+only provisioned schema-v2 MCP/Skill records, enforce archive origin/hash/size
+and portable-path limits, safely extract ZIPs through staging and rollback, and
+feed synchronized services into the existing neutral projection engine. Direct
+mode will continue to expose no invented MCP or Skills.
+
+The GPUI shell then needs to surface the implemented browser-login gate,
+connection edit/disconnect, model refresh/search and unavailable selections,
+five Agent pages with real discovery/ownership status, and preview/apply/verify.
+English and Simplified Chinese plus system/light/dark theme remain the neutral
+upstream locales. Provisioning-only account or catalog pages must stay hidden
+when those records are absent.
 
 Packaging, OAuth client IDs, account/billing schemas, brand assets, product
 URLs, signing, update feeds, and release infrastructure remain downstream.
