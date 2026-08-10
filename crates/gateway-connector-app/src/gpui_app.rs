@@ -12,9 +12,9 @@ use gateway_connector_backend::{
 };
 use gateway_connector_core::{AgentId, CanonicalBaseUrl, ChangeKind, ConnectionProfile, Protocol};
 use gpui::{
-    App, Bounds, Context, Entity, FontWeight, IntoElement, ParentElement, Render, Styled,
-    TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowOptions, div, prelude::*, px,
-    size,
+    App, AssetSource, Bounds, Context, Entity, FontWeight, IntoElement, ParentElement, Render,
+    Styled, TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowOptions, div,
+    prelude::*, px, size,
 };
 use gpui_kit::{assets::Icon, prelude::*};
 
@@ -1873,6 +1873,12 @@ fn change_kind(kind: &ChangeKind) -> &'static str {
 ///
 /// The distribution is validated before any state, vault, or network access.
 pub fn run(distribution: &'static Distribution) {
+    run_with_assets(distribution, gpui_kit::assets::Assets);
+}
+
+/// Runs a distribution with a wrapper-owned asset source. Downstream sources
+/// should delegate unknown neutral icon/font paths to `gpui_kit::assets::Assets`.
+pub fn run_with_assets(distribution: &'static Distribution, assets: impl AssetSource) {
     distribution
         .validate()
         .expect("validate GatewayConnector distribution");
@@ -1919,7 +1925,7 @@ pub fn run(distribution: &'static Distribution) {
             .find_map(|value| Locale::from_id(value))
             .unwrap_or_default();
     }
-    let application = gpui_platform::application().with_assets(gpui_kit::assets::Assets);
+    let application = gpui_platform::application().with_assets(assets);
     application.run(move |cx: &mut App| {
         gpui_kit::install(cx);
         apply_theme(preferences.theme, cx);

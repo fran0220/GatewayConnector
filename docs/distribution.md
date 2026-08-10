@@ -44,6 +44,11 @@ before vault, profile, or network access and uses it for:
 - browser-PKCE client/device values;
 - optional compile-time asset and release metadata for the wrapper/packager.
 
+Wrappers that embed branded assets can call
+`gateway_connector_app::gpui_app::run_with_assets(&DISTRIBUTION, assets)`.
+Their `AssetSource` should delegate unknown neutral icon and font paths to
+`gpui_kit::assets::Assets`; the generic `run` function does this automatically.
+
 `expected_platform_id` pins a manifest's platform. Setting
 `allow_custom_urls=false` requires `default_gateway_url`; saved profiles and
 new probes must continue to match the configured Gateway and manifest. An
