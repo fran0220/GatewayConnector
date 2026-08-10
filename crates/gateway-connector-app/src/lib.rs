@@ -7,6 +7,9 @@ use gateway_connector_core::{AgentId, AgentInstall, Plan, Protocol, Provisioning
 
 pub mod preferences;
 
+#[cfg(feature = "gpui-app")]
+pub mod gpui_app;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Page {
     #[default]
