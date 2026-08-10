@@ -19,6 +19,9 @@ gpui = { workspace = true, optional = true }
 gpui-kit = { workspace = true, optional = true }
 gpui_platform = { workspace = true, optional = true }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [[bin]]
 name = "gateway-connector"
 path = "src/main.rs"

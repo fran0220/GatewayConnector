@@ -5,7 +5,7 @@ use gateway_connector_app::AppState;
 use gateway_connector_backend::{
     ApiKey, ConnectRequest, ConnectionResult, ConnectorBackend, JsonProfileStore, OsCredentialStore,
 };
-use gateway_connector_core::{AgentId, CanonicalBaseUrl, ConnectionProfile, Protocol};
+use gateway_connector_core::{AgentId, CanonicalBaseUrl, ChangeKind, ConnectionProfile, Protocol};
 use gpui::{
     App, Bounds, Context, Entity, IntoElement, ParentElement, Render, Styled, Window, WindowBounds,
     WindowOptions, div, prelude::*, px, size,
@@ -23,6 +23,8 @@ struct ConnectorView {
     save_in_flight: bool,
     pending_save: Option<ConnectionProfile>,
     save_error: Option<String>,
+    projection_busy: bool,
+    action_error: Option<String>,
 }
 
 impl ConnectorView {
@@ -96,6 +98,8 @@ impl ConnectorView {
             save_in_flight: false,
             pending_save: None,
             save_error: None,
+            projection_busy: false,
+            action_error: None,
         };
         view.begin_resume(cx);
         view
@@ -199,7 +203,9 @@ impl ConnectorView {
         }
         self.api_key.update(cx, |input, cx| input.set_value("", cx));
         self.save_error = None;
+        self.action_error = None;
         self.state = AppState::connected(result);
+        self.begin_projection_status(cx);
     }
 
     fn commit_selection(&mut self, agent: AgentId, cx: &mut Context<Self>) {
@@ -220,11 +226,222 @@ impl ConnectorView {
         if let Some(model) = model {
             self.state.update_model(agent, model);
         }
-        if let AppState::Connected { profile, .. } = &self.state {
-            self.pending_save = Some(profile.as_ref().clone());
+        if let AppState::Connected { connection, .. } = &self.state {
+            self.pending_save = Some(connection.profile.clone());
             self.start_profile_save(cx);
         }
         cx.notify();
+    }
+
+    fn begin_projection_status(&mut self, cx: &mut Context<Self>) {
+        let AppState::Connected { connection, .. } = &self.state else {
+            return;
+        };
+        let profile = connection.profile.clone();
+        let backend = Arc::clone(&self.backend);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let installs = backend.discover_agents()?;
+                    let managed = backend.managed_agents(&profile)?;
+                    Ok::<_, gateway_connector_backend::BackendError>((profile, installs, managed))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok((profile, installs, managed)) => {
+                        if matches!(
+                            &this.state,
+                            AppState::Connected { connection, .. }
+                                if connection.profile.id == profile.id
+                        ) {
+                            this.state.set_projection_status(installs, managed);
+                        }
+                    }
+                    Err(error) => this.action_error = Some(error.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_projection_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
+        self.projection_busy = busy;
+        for (_, select) in self.model_selects.iter().chain(&self.protocol_selects) {
+            select.update(cx, |select, cx| select.set_disabled(busy, cx));
+        }
+    }
+
+    fn begin_preview(&mut self, cx: &mut Context<Self>) {
+        if self.projection_busy {
+            return;
+        }
+        let AppState::Connected { connection, .. } = &self.state else {
+            return;
+        };
+        let connection = connection.as_ref().clone();
+        let expected_profile = connection.profile.clone();
+        let backend = Arc::clone(&self.backend);
+        self.action_error = None;
+        self.set_projection_busy(true, cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { backend.plan_projection(&connection) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.set_projection_busy(false, cx);
+                match result {
+                    Ok(plan)
+                        if matches!(
+                            &this.state,
+                            AppState::Connected { connection, .. }
+                                if connection.profile == expected_profile
+                        ) =>
+                    {
+                        this.state.set_preview(plan);
+                    }
+                    Ok(_) => {
+                        this.action_error =
+                            Some("Agent choices changed while previewing; preview again.".into());
+                    }
+                    Err(error) => this.action_error = Some(error.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn begin_apply(&mut self, cx: &mut Context<Self>) {
+        if self.projection_busy {
+            return;
+        }
+        let AppState::Connected {
+            connection,
+            preview: Some(plan),
+            verification: None,
+            ..
+        } = &self.state
+        else {
+            return;
+        };
+        let profile = connection.profile.clone();
+        let plan = plan.as_ref().clone();
+        let backend = Arc::clone(&self.backend);
+        self.action_error = None;
+        self.set_projection_busy(true, cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    backend.apply_projection(&profile, &plan)?;
+                    let verification = backend.verify_projection(&plan)?;
+                    let managed = backend.managed_agents(&profile)?;
+                    Ok::<_, gateway_connector_backend::BackendError>((
+                        profile,
+                        verification,
+                        managed,
+                    ))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.set_projection_busy(false, cx);
+                match result {
+                    Ok((profile, verification, managed)) => {
+                        if let AppState::Connected {
+                            connection,
+                            managed_agents,
+                            ..
+                        } = &mut this.state
+                            && connection.profile.id == profile.id
+                        {
+                            *managed_agents = managed;
+                            this.state.set_verification(verification);
+                        }
+                    }
+                    Err(error) => {
+                        this.state.clear_preview();
+                        this.action_error = Some(error.to_string());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn begin_verify(&mut self, cx: &mut Context<Self>) {
+        if self.projection_busy {
+            return;
+        }
+        let AppState::Connected {
+            preview: Some(plan),
+            verification: Some(_),
+            ..
+        } = &self.state
+        else {
+            return;
+        };
+        let plan = plan.as_ref().clone();
+        let backend = Arc::clone(&self.backend);
+        self.action_error = None;
+        self.set_projection_busy(true, cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { backend.verify_projection(&plan) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.set_projection_busy(false, cx);
+                match result {
+                    Ok(verification) => this.state.set_verification(verification),
+                    Err(error) => this.action_error = Some(error.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn begin_disconnect(&mut self, cx: &mut Context<Self>) {
+        if self.projection_busy || self.save_in_flight {
+            return;
+        }
+        let AppState::Connected { connection, .. } = &self.state else {
+            return;
+        };
+        let profile = connection.profile.clone();
+        let backend = Arc::clone(&self.backend);
+        self.action_error = None;
+        self.set_projection_busy(true, cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { backend.disconnect(&profile) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.set_projection_busy(false, cx);
+                match result {
+                    Ok(()) => {
+                        this.pending_save = None;
+                        this.save_error = None;
+                        this.action_error = None;
+                        this.state = AppState::FirstRun;
+                    }
+                    Err(error) => this.action_error = Some(error.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn start_profile_save(&mut self, cx: &mut Context<Self>) {
@@ -317,13 +534,28 @@ impl ConnectorView {
 
     fn render_connected(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let AppState::Connected {
-            profile,
-            models,
+            connection,
+            installs,
+            managed_agents,
             preview,
+            verification,
         } = &self.state
         else {
             unreachable!("connected renderer requires connected state")
         };
+        let profile = &connection.profile;
+        let models = &connection.models;
+        let detected = installs.iter().filter(|install| install.detected).count();
+        let supported_detected = installs
+            .iter()
+            .filter(|install| {
+                install.detected
+                    && connection
+                        .manifest
+                        .as_ref()
+                        .is_none_or(|manifest| manifest.supported_agents.contains(&install.agent))
+            })
+            .count();
         let mut content = div()
             .flex()
             .flex_col()
@@ -335,6 +567,9 @@ impl ConnectorView {
                     Tone::Warning,
                 )
                 .id("connector.save-error")
+            }))
+            .children(self.action_error.as_ref().map(|error| {
+                Callout::new(error.clone(), Tone::Danger).id("connector.action-error")
             }))
             .child(
                 DescriptionList::new("connector.summary")
@@ -352,11 +587,35 @@ impl ConnectorView {
                         "connector.summary.profile",
                         "Profile",
                         profile.display_name.clone(),
+                    ))
+                    .item(DescriptionItem::new(
+                        "connector.summary.agents",
+                        "Detected Agents",
+                        format!("{detected} / {}", AgentId::ALL.len()),
                     )),
             )
             .child(div().text_size(px(20.0)).child("Agent defaults"));
 
         for agent in AgentId::ALL {
+            let install = installs.iter().find(|install| install.agent == agent);
+            let detected = install.is_some_and(|install| install.detected);
+            let supported = connection
+                .manifest
+                .as_ref()
+                .is_none_or(|manifest| manifest.supported_agents.contains(&agent));
+            let ownership = if managed_agents.contains(&agent) {
+                "Managed by this connection"
+            } else {
+                "Not managed"
+            };
+            let location = install
+                .map(|install| install.root.display().to_string())
+                .unwrap_or_else(|| "Checking standard root…".into());
+            let availability = match (detected, supported) {
+                (true, true) => "Detected",
+                (false, true) => "Not detected",
+                (_, false) => "Not advertised by this platform",
+            };
             let protocol = self
                 .protocol_selects
                 .iter()
@@ -380,38 +639,144 @@ impl ConnectorView {
                             .flex()
                             .flex_col()
                             .gap(px(10.0))
-                            .child(div().child(agent.display_name()))
+                            .child(div().text_size(px(18.0)).child(agent.display_name()))
+                            .child(
+                                div()
+                                    .text_color(cx.theme().colors.text_muted)
+                                    .child(format!("{availability} · {ownership}\n{location}")),
+                            )
                             .child(protocol)
                             .child(model),
                     ),
             );
         }
 
-        let this = cx.entity().downgrade();
-        content = content.child(
-            Button::new("connector.preview")
-                .label("Preview projection")
-                .secondary()
-                .full_width(true)
-                .on_click(move |_window, cx| {
-                    let _ = this.update(cx, |this, cx| {
-                        this.state.preview();
-                        cx.notify();
-                    });
-                }),
-        );
-        if let Some(lines) = preview {
+        let preview_view = cx.entity().downgrade();
+        let apply_view = cx.entity().downgrade();
+        let verify_view = cx.entity().downgrade();
+        content = content
+            .child(
+                div()
+                    .flex()
+                    .gap(px(10.0))
+                    .child(
+                        Button::new("connector.preview")
+                            .label(if self.projection_busy {
+                                "Working…"
+                            } else {
+                                "Preview changes"
+                            })
+                            .secondary()
+                            .disabled(
+                                self.projection_busy
+                                    || supported_detected == 0
+                                    || models.is_empty(),
+                            )
+                            .on_click(move |_window, cx| {
+                                let _ = preview_view.update(cx, |this, cx| this.begin_preview(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("connector.apply")
+                            .label("Apply")
+                            .primary()
+                            .disabled(
+                                self.projection_busy || preview.is_none() || verification.is_some(),
+                            )
+                            .on_click(move |_window, cx| {
+                                let _ = apply_view.update(cx, |this, cx| this.begin_apply(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("connector.verify")
+                            .label("Verify")
+                            .secondary()
+                            .disabled(self.projection_busy || verification.is_none())
+                            .on_click(move |_window, cx| {
+                                let _ = verify_view.update(cx, |this, cx| this.begin_verify(cx));
+                            }),
+                    ),
+            )
+            .children((supported_detected == 0).then(|| {
+                Callout::new(
+                    "Install a supported Agent before previewing configuration changes.",
+                    Tone::Info,
+                )
+                .id("connector.no-agents")
+            }))
+            .children(models.is_empty().then(|| {
+                Callout::new(
+                    "The Gateway currently offers no chat-capable models.",
+                    Tone::Warning,
+                )
+                .id("connector.no-models")
+            }));
+
+        if let Some(plan) = preview {
+            let mut changes = Card::new().id("connector.preview-changes");
+            for (index, change) in plan.changes.iter().enumerate() {
+                changes = changes.child(
+                    ListRow::new()
+                        .id(format!("connector.preview.{index}"))
+                        .child(Badge::new(change_kind(&change.kind)).neutral())
+                        .child(div().min_w_0().child(change.path.display().to_string())),
+                );
+            }
+            if plan.changes.is_empty() {
+                changes = changes.child(
+                    ListRow::new()
+                        .id("connector.preview.empty")
+                        .child("No Agent file changes are needed."),
+                );
+            }
             content = content.child(
                 Callout::new(
-                    format!(
-                        "Preview only — no Agent files were changed.\n{}\nApply arrives with the shared projection engine in phase 2.",
-                        lines.join("\n")
-                    ),
+                    "Fresh preview ready. No Agent files have been changed yet.",
                     Tone::Info,
                 )
                 .id("connector.preview-summary"),
             );
+            content = content.child(changes);
         }
+
+        if let Some(verification) = verification {
+            let message = if verification.ok {
+                "Applied configuration matches the preview.".to_owned()
+            } else {
+                format!(
+                    "Verification found drift:\n{}",
+                    verification
+                        .mismatches
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            };
+            content = content.child(
+                Callout::new(
+                    message,
+                    if verification.ok {
+                        Tone::Success
+                    } else {
+                        Tone::Danger
+                    },
+                )
+                .id("connector.verification"),
+            );
+        }
+
+        let disconnect_view = cx.entity().downgrade();
+        content = content.child(
+            Button::new("connector.disconnect")
+                .label("Disconnect Gateway and remove managed configuration")
+                .danger()
+                .full_width(true)
+                .disabled(self.projection_busy || self.save_in_flight)
+                .on_click(move |_window, cx| {
+                    let _ = disconnect_view.update(cx, |this, cx| this.begin_disconnect(cx));
+                }),
+        );
         Card::new()
             .id("connector.connected")
             .padded(true)
@@ -470,6 +835,15 @@ fn display_name(base_url: &str) -> String {
     CanonicalBaseUrl::parse(base_url)
         .map(|url| url.suggested_display_name())
         .unwrap_or_else(|_| "Gateway".to_owned())
+}
+
+fn change_kind(kind: &ChangeKind) -> &'static str {
+    match kind {
+        ChangeKind::Create => "Create",
+        ChangeKind::Update => "Update",
+        ChangeKind::Remove => "Remove",
+        ChangeKind::ProjectSkill => "Skill",
+    }
 }
 
 fn main() {
