@@ -1,6 +1,7 @@
 //! Network, credential-vault, and profile persistence boundary.
 
 mod backend;
+mod catalog;
 mod discovery;
 mod distribution;
 mod pkce;

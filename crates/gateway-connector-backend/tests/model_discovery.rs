@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
-    io::{Read, Write},
+    fs,
+    io::{Cursor, Read, Write},
     net::{Ipv4Addr, TcpStream},
     sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, Mutex},
@@ -17,8 +18,10 @@ use gateway_connector_core::{
     CanonicalBaseUrl, ConnectionManifest, ConnectionMode, ConnectionProfile, CredentialKind,
     CredentialRef, ProfileId, Protocol,
 };
+use sha2::{Digest, Sha256};
 use tiny_http::{Header, Response, Server, StatusCode};
 use url::Url;
+use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 #[derive(Debug, Default)]
 struct RequestCapture {
@@ -113,6 +116,36 @@ fn provisioning_body() -> String {
         }
     })
     .to_string()
+}
+
+fn skill_zip(contents: &[u8]) -> Vec<u8> {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer
+        .start_file(
+            "SKILL.md",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+        )
+        .expect("Skill entry");
+    writer.write_all(contents).expect("Skill body");
+    writer.finish().expect("finish ZIP").into_inner()
+}
+
+fn provisioning_with_skill_body(origin: &str, archive: &[u8]) -> String {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&provisioning_body()).expect("provisioning JSON");
+    value["data"]["skills"] = serde_json::json!([{
+        "id":"online-skill",
+        "name":"Online Skill",
+        "version":"1.0.0",
+        "archive":{
+            "url":format!("{origin}/skill.zip"),
+            "sha256":format!("{:x}", Sha256::digest(archive)),
+            "size_bytes":archive.len(),
+            "format":"zip",
+            "authorization":"connection_bearer"
+        }
+    }]);
+    value.to_string()
 }
 
 fn browser_manifest_body(platform: &str, origin: &str) -> String {
@@ -446,12 +479,15 @@ fn provisioned_connection_uses_manifest_catalog_and_bearer_boundary() {
         &format!("{origin}/api/connector/provisioning"),
         &[&origin],
     );
-    let provisioning = provisioning_body();
+    let archive = skill_zip(b"online Skill");
+    let provisioning = provisioning_with_skill_body(&origin, &archive);
+    let archive_response = archive.clone();
     let handle = thread::spawn(move || {
         let mut captures = Vec::new();
         for expected_path in [
             "/.well-known/gateway-connector",
             "/api/connector/provisioning",
+            "/skill.zip",
         ] {
             let request = server.recv().expect("enhanced request");
             let authorization = request
@@ -460,21 +496,24 @@ fn provisioned_connection_uses_manifest_catalog_and_bearer_boundary() {
                 .find(|header| header.field.equiv("authorization"))
                 .map(|header| header.value.as_str().to_owned());
             assert_eq!(request.url(), expected_path);
-            let body = if expected_path.ends_with("provisioning") {
-                provisioning.clone()
+            let response = if expected_path == "/skill.zip" {
+                Response::from_data(archive_response.clone()).with_status_code(StatusCode(200))
+            } else if expected_path.ends_with("provisioning") {
+                Response::from_string(provisioning.clone()).with_status_code(StatusCode(200))
             } else {
-                manifest.clone()
+                Response::from_string(manifest.clone()).with_status_code(StatusCode(200))
             };
             captures.push(authorization);
-            request
-                .respond(Response::from_string(body).with_status_code(StatusCode(200)))
-                .expect("enhanced response");
+            request.respond(response).expect("enhanced response");
         }
         captures
     });
     let credentials = Arc::new(InMemoryCredentialStore::default());
     let profiles = Arc::new(InMemoryProfileStore::default());
-    let backend = ConnectorBackend::new(credentials, profiles).expect("backend");
+    let state = tempfile::tempdir().expect("catalog state");
+    let backend = ConnectorBackend::new(credentials, profiles)
+        .and_then(|backend| backend.with_state_directory(state.path()))
+        .expect("backend");
     let connected = backend
         .connect(ConnectRequest {
             display_name: "Enhanced".to_owned(),
@@ -485,7 +524,14 @@ fn provisioned_connection_uses_manifest_catalog_and_bearer_boundary() {
         .expect("provisioned connection");
     let captures = handle.join().expect("enhanced server");
 
-    assert_eq!(captures, [None, Some("Bearer enhanced-key".to_owned())]);
+    assert_eq!(
+        captures,
+        [
+            None,
+            Some("Bearer enhanced-key".to_owned()),
+            Some("Bearer enhanced-key".to_owned())
+        ]
+    );
     assert_eq!(connected.profile.mode, ConnectionMode::Provisioned);
     assert_eq!(connected.profile.platform_id, "test-platform");
     assert_eq!(
@@ -498,6 +544,11 @@ fn provisioned_connection_uses_manifest_catalog_and_bearer_boundary() {
     );
     assert!(connected.provisioning.is_some());
     assert!(connected.manifest.is_some());
+    assert_eq!(
+        fs::read(connected.synchronized_skills["online-skill"].join("SKILL.md"))
+            .expect("synchronized Skill"),
+        b"online Skill"
+    );
 }
 
 #[test]
@@ -979,6 +1030,7 @@ fn backend_uses_in_memory_vault_and_persists_reference_only() {
         .expect("connect");
     handle.join().expect("mock server");
     assert_eq!(connected.models[0].id, "model-a");
+    assert!(connected.synchronized_skills.is_empty());
     let json = serde_json::to_string(&backend.profiles().expect("profiles")).expect("profile JSON");
     assert!(!json.contains("not-persisted"));
     assert!(json.contains("profile:"));

@@ -482,6 +482,7 @@ fn main() {
                 directories.data_local_dir().join("profiles.json"),
             )),
         )
+        .and_then(|backend| backend.with_state_directory(directories.data_local_dir()))
         .expect("initialize GatewayConnector backend"),
     );
     let application = gpui_platform::application().with_assets(gpui_kit::assets::Assets);

@@ -1,4 +1,8 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use gateway_connector_core::{
     CanonicalBaseUrl, ConnectionManifest, ConnectionMode, ConnectionProfile, CredentialKind,
@@ -26,6 +30,7 @@ pub struct ConnectionResult {
     pub models: Vec<ModelDescriptor>,
     pub manifest: Option<ConnectionManifest>,
     pub provisioning: Option<Provisioning>,
+    pub synchronized_skills: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +67,7 @@ pub struct ConnectorBackend {
     browser: Arc<dyn Browser>,
     connection_lock: Mutex<()>,
     pending_credential: Mutex<Option<PendingCredential>>,
+    catalog: Option<crate::catalog::SkillCatalog>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,7 +105,37 @@ impl ConnectorBackend {
             browser,
             connection_lock: Mutex::new(()),
             pending_credential: Mutex::new(None),
+            catalog: None,
         })
+    }
+
+    /// Configures the explicit state directory used for transactional Skill catalogs.
+    /// Without this configuration no catalog is downloaded or written.
+    pub fn with_state_directory(
+        mut self,
+        state_dir: impl Into<PathBuf>,
+    ) -> Result<Self, BackendError> {
+        self.catalog = Some(
+            crate::catalog::SkillCatalog::new(state_dir.into())
+                .map_err(|error| BackendError::Catalog(error.to_string()))?,
+        );
+        Ok(self)
+    }
+
+    fn synchronize_skills(
+        &self,
+        manifest: &ConnectionManifest,
+        provisioning: &Provisioning,
+        token: &ApiKey,
+    ) -> Result<BTreeMap<String, PathBuf>, BackendError> {
+        self.catalog.as_ref().map_or_else(
+            || Ok(BTreeMap::new()),
+            |catalog| {
+                catalog
+                    .synchronize(manifest, provisioning, token)
+                    .map_err(|error| BackendError::Catalog(error.to_string()))
+            },
+        )
     }
 
     pub fn probe(&self, base_url: &str) -> Result<ProbeResult, BackendError> {
@@ -151,7 +187,16 @@ impl ConnectorBackend {
             return Err(BackendError::AlreadyConnected);
         }
         let probe = self.probe(&request.base_url)?;
-        let (base_url, mode, platform, manifest_url, manifest, provisioning, models) = match probe {
+        let (
+            base_url,
+            mode,
+            platform,
+            manifest_url,
+            manifest,
+            provisioning,
+            models,
+            synchronized_skills,
+        ) = match probe {
             ProbeResult::Direct { base_url } => {
                 let models = self.client.discover_models(&base_url, &request.api_key)?;
                 (
@@ -162,6 +207,7 @@ impl ConnectorBackend {
                     None,
                     None,
                     models,
+                    BTreeMap::new(),
                 )
             }
             ProbeResult::Provisioned {
@@ -187,6 +233,8 @@ impl ConnectorBackend {
                     .client
                     .fetch_provisioning(&manifest, &request.api_key)?;
                 let models = models_from_provisioning(&provisioning);
+                let synchronized_skills =
+                    self.synchronize_skills(&manifest, &provisioning, &request.api_key)?;
                 let platform = manifest.platform.id.clone();
                 (
                     base_url,
@@ -196,6 +244,7 @@ impl ConnectorBackend {
                     Some(manifest),
                     Some(provisioning),
                     models,
+                    synchronized_skills,
                 )
             }
         };
@@ -231,6 +280,7 @@ impl ConnectorBackend {
             models,
             manifest,
             provisioning,
+            synchronized_skills,
         })
     }
 
@@ -310,11 +360,14 @@ impl ConnectorBackend {
             .client
             .fetch_provisioning(&offer.manifest, &pending.token)?;
         let models = models_from_provisioning(&provisioning);
+        let synchronized_skills =
+            self.synchronize_skills(&offer.manifest, &provisioning, &pending.token)?;
         Ok(ConnectionResult {
             profile,
             models,
             manifest: Some(offer.manifest),
             provisioning: Some(provisioning),
+            synchronized_skills,
         })
     }
 
@@ -333,6 +386,7 @@ impl ConnectorBackend {
                     models,
                     manifest: None,
                     provisioning: None,
+                    synchronized_skills: BTreeMap::new(),
                 })
             }
             ConnectionMode::Provisioned => {
@@ -349,11 +403,14 @@ impl ConnectorBackend {
                 self.validate_platform(&profile, &found.document)?;
                 let provisioning = self.client.fetch_provisioning(&found.document, &api_key)?;
                 let models = models_from_provisioning(&provisioning);
+                let synchronized_skills =
+                    self.synchronize_skills(&found.document, &provisioning, &api_key)?;
                 Ok(ConnectionResult {
                     profile,
                     models,
                     manifest: Some(found.document),
                     provisioning: Some(provisioning),
+                    synchronized_skills,
                 })
             }
         }
@@ -406,11 +463,14 @@ impl ConnectorBackend {
             .client
             .fetch_provisioning(&pending.manifest, &pending.token)?;
         let models = models_from_provisioning(&provisioning);
+        let synchronized_skills =
+            self.synchronize_skills(&pending.manifest, &provisioning, &pending.token)?;
         Ok(ConnectionResult {
             profile: pending.profile,
             models,
             manifest: Some(pending.manifest),
             provisioning: Some(provisioning),
+            synchronized_skills,
         })
     }
 
@@ -537,6 +597,8 @@ fn models_from_provisioning(value: &Provisioning) -> Vec<ModelDescriptor> {
 
 #[derive(Debug, Error)]
 pub enum BackendError {
+    #[error("Skill catalog synchronization failed: {0}")]
+    Catalog(String),
     #[error(transparent)]
     Distribution(#[from] DistributionError),
     #[error(transparent)]

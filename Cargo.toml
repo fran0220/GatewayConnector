@@ -36,6 +36,7 @@ zeroize = "1"
 base64 = "0.22"
 rand = "0.9"
 webbrowser = "1"
+zip = { version = "4", default-features = false, features = ["deflate"] }
 
 # gpui-kit and every directly used GPUI crate must resolve to one exact Zed
 # revision. These pins are intentionally optional in the app crate so Linux

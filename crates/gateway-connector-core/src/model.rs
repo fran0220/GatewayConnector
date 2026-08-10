@@ -5,6 +5,7 @@ use url::Url;
 
 pub const SCHEMA_VERSION: u32 = 2;
 pub const MAX_SKILL_ARCHIVE_SIZE: u64 = 64 * 1024 * 1024;
+pub const MAX_SKILL_CATALOG_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_CATALOG_ENTRIES: usize = 256;
 pub const MAX_MODEL_CATALOG_ENTRIES: usize = 4096;
 pub const MAX_MCP_DESCRIPTION_BYTES: usize = 1024;
@@ -347,6 +348,18 @@ impl Provisioning {
                 "Skill catalog exceeds {MAX_CATALOG_ENTRIES} entries"
             )));
         }
+        if self
+            .skills
+            .iter()
+            .try_fold(0u64, |total, skill| {
+                total.checked_add(skill.archive.size_bytes)
+            })
+            .is_none_or(|total| total > MAX_SKILL_CATALOG_ARCHIVE_BYTES)
+        {
+            return Err(Error::Validation(
+                "Skill catalog archive size exceeds 256 MiB".into(),
+            ));
+        }
         let ids = validate_models(&self.models, true)?;
         if let Some(model_plaza) = &self.model_plaza {
             let plaza_ids = validate_models(&model_plaza.models, false)?;
@@ -612,5 +625,40 @@ fn secure(url: &Url) -> Result<()> {
         Ok(())
     } else {
         Err(Error::Validation(format!("insecure endpoint {url}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provisioning_rejects_excessive_aggregate_skill_downloads() {
+        let skills: Vec<_> = (0..5)
+            .map(|index| {
+                serde_json::json!({
+                    "id":format!("skill-{index}"),
+                    "name":format!("Skill {index}"),
+                    "version":"1.0.0",
+                    "archive":{
+                        "url":format!("https://gateway.example/skill-{index}.zip"),
+                        "sha256":"0000000000000000000000000000000000000000000000000000000000000000",
+                        "size_bytes":MAX_SKILL_ARCHIVE_SIZE,
+                        "format":"zip",
+                        "authorization":"none"
+                    }
+                })
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&serde_json::json!({"success":true,"data":{
+            "schema_version":2,
+            "models":[{"id":"model-a","chat_capable":true}],
+            "default_model":"model-a",
+            "mcp_servers":[],
+            "skills":skills
+        }}))
+        .expect("provisioning JSON");
+        let error = Provisioning::parse(&bytes).expect_err("aggregate budget must be enforced");
+        assert!(error.to_string().contains("256 MiB"));
     }
 }

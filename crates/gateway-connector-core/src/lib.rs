@@ -9,8 +9,9 @@ pub use discovery::{AgentInstall, Discovery};
 pub use model::{
     Account, AuthType, Authentication, Billing, ConnectionManifest, Gateway, MAX_CATALOG_ENTRIES,
     MAX_MCP_DESCRIPTION_BYTES, MAX_MODEL_CATALOG_ENTRIES, MAX_MODEL_TAGS, MAX_MODEL_TEXT_BYTES,
-    MAX_SKILL_ARCHIVE_SIZE, McpAuthorization, McpServer, Model, ModelPlaza, ModelVendor, Platform,
-    Provisioning, Secret, Skill, SkillArchive, SkillArchiveAuthorization, Subscription, Usage,
+    MAX_SKILL_ARCHIVE_SIZE, MAX_SKILL_CATALOG_ARCHIVE_BYTES, McpAuthorization, McpServer, Model,
+    ModelPlaza, ModelVendor, Platform, Provisioning, Secret, Skill, SkillArchive,
+    SkillArchiveAuthorization, Subscription, Usage,
 };
 pub use profile::{
     AgentId, AgentSelection, CanonicalBaseUrl, ConnectionMode, ConnectionProfile, CredentialKind,
