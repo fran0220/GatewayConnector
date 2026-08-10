@@ -289,6 +289,7 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
