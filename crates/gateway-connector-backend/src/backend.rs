@@ -159,6 +159,20 @@ impl ConnectorBackend {
         Ok(self)
     }
 
+    /// Pins Agent roots for an embedded distribution or deterministic test.
+    /// Unspecified Agents continue to use environment and canonical roots.
+    pub fn with_agent_root_overrides(
+        mut self,
+        overrides: BTreeMap<AgentId, PathBuf>,
+    ) -> Result<Self, BackendError> {
+        let runtime = self
+            .projection
+            .as_mut()
+            .ok_or(BackendError::ProjectionNotConfigured)?;
+        runtime.discovery.overrides = overrides;
+        Ok(self)
+    }
+
     fn synchronize_skills(
         &self,
         manifest: &ConnectionManifest,

@@ -530,6 +530,19 @@ fn provisioned_connection_uses_manifest_catalog_and_bearer_boundary() {
                 home.path(),
             )
         })
+        .and_then(|backend| {
+            backend.with_agent_root_overrides(
+                [
+                    (AgentId::Claude, home.path().join(".claude")),
+                    (AgentId::Codex, home.path().join(".codex")),
+                    (AgentId::Gemini, home.path().join(".gemini")),
+                    (AgentId::Grokbuild, home.path().join(".grok")),
+                    (AgentId::Opencode, home.path().join(".config/opencode")),
+                ]
+                .into_iter()
+                .collect(),
+            )
+        })
         .expect("backend");
     let connected = backend
         .connect(ConnectRequest {
