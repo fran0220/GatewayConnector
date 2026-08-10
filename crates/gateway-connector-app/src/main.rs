@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use directories::ProjectDirs;
+use directories::{ProjectDirs, UserDirs};
 use gateway_connector_app::AppState;
 use gateway_connector_backend::{
     ApiKey, ConnectRequest, ConnectionResult, ConnectorBackend, JsonProfileStore, OsCredentialStore,
@@ -475,6 +475,12 @@ fn display_name(base_url: &str) -> String {
 fn main() {
     let directories = ProjectDirs::from("dev", "GatewayConnector", "GatewayConnector")
         .expect("the operating system provides a user data directory");
+    let coordinator = ProjectDirs::from("dev", "GatewayConnector", "ProjectionCoordinator")
+        .expect("the operating system provides a shared projection coordinator directory");
+    let home = UserDirs::new()
+        .expect("the operating system provides a home directory")
+        .home_dir()
+        .to_owned();
     let backend = Arc::new(
         ConnectorBackend::new(
             Arc::new(OsCredentialStore::new("dev.gatewayconnector.app")),
@@ -482,7 +488,13 @@ fn main() {
                 directories.data_local_dir().join("profiles.json"),
             )),
         )
-        .and_then(|backend| backend.with_state_directory(directories.data_local_dir()))
+        .and_then(|backend| {
+            backend.with_runtime_directories(
+                directories.data_local_dir(),
+                coordinator.data_local_dir(),
+                home,
+            )
+        })
         .expect("initialize GatewayConnector backend"),
     );
     let application = gpui_platform::application().with_assets(gpui_kit::assets::Assets);

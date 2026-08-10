@@ -1,12 +1,13 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
 
 use gateway_connector_core::{
-    CanonicalBaseUrl, ConnectionManifest, ConnectionMode, ConnectionProfile, CredentialKind,
-    ProfileError, Protocol, Provisioning,
+    AgentId, AgentInstall, ApplyInput, CanonicalBaseUrl, ConnectionManifest, ConnectionMode,
+    ConnectionProfile, Connector, CredentialKind, Discovery, Gateway, Model, Plan, Platform,
+    ProfileError, Protocol, Provisioning, Secret, Verification,
 };
 use thiserror::Error;
 
@@ -68,6 +69,8 @@ pub struct ConnectorBackend {
     connection_lock: Mutex<()>,
     pending_credential: Mutex<Option<PendingCredential>>,
     catalog: Option<crate::catalog::SkillCatalog>,
+    projection: Option<ProjectionRuntime>,
+    projection_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +78,13 @@ struct PendingCredential {
     token: ApiKey,
     profile: ConnectionProfile,
     manifest: ConnectionManifest,
+}
+
+#[derive(Debug)]
+struct ProjectionRuntime {
+    connector: Connector,
+    discovery: Discovery,
+    home: PathBuf,
 }
 
 impl ConnectorBackend {
@@ -106,6 +116,8 @@ impl ConnectorBackend {
             connection_lock: Mutex::new(()),
             pending_credential: Mutex::new(None),
             catalog: None,
+            projection: None,
+            projection_lock: Mutex::new(()),
         })
     }
 
@@ -119,6 +131,31 @@ impl ConnectorBackend {
             crate::catalog::SkillCatalog::new(state_dir.into())
                 .map_err(|error| BackendError::Catalog(error.to_string()))?,
         );
+        Ok(self)
+    }
+
+    /// Configures provisioned Skill state and the neutral five-Agent runtime.
+    /// Tests and downstream distributions inject these paths explicitly; the
+    /// generic app uses the shared ProjectionCoordinator directory.
+    pub fn with_runtime_directories(
+        mut self,
+        state_dir: impl Into<PathBuf>,
+        coordinator_dir: impl Into<PathBuf>,
+        home: impl Into<PathBuf>,
+    ) -> Result<Self, BackendError> {
+        let state_dir = state_dir.into();
+        self.catalog = Some(
+            crate::catalog::SkillCatalog::new(state_dir.clone())
+                .map_err(|error| BackendError::Catalog(error.to_string()))?,
+        );
+        self.projection = Some(ProjectionRuntime {
+            connector: Connector::with_coordinator(
+                state_dir.join("connector"),
+                coordinator_dir.into(),
+            ),
+            discovery: Discovery::default(),
+            home: home.into(),
+        });
         Ok(self)
     }
 
@@ -136,6 +173,133 @@ impl ConnectorBackend {
                     .map_err(|error| BackendError::Catalog(error.to_string()))
             },
         )
+    }
+
+    pub fn discover_agents(&self) -> Result<Vec<AgentInstall>, BackendError> {
+        let runtime = self
+            .projection
+            .as_ref()
+            .ok_or(BackendError::ProjectionNotConfigured)?;
+        Ok(runtime.discovery.discover(&runtime.home))
+    }
+
+    pub fn managed_agents(
+        &self,
+        profile: &ConnectionProfile,
+    ) -> Result<BTreeSet<AgentId>, BackendError> {
+        let _guard = self
+            .projection_lock
+            .lock()
+            .map_err(|_| BackendError::ProjectionLock)?;
+        profile.validate()?;
+        let runtime = self
+            .projection
+            .as_ref()
+            .ok_or(BackendError::ProjectionNotConfigured)?;
+        if !runtime.connector.has_receipt(&profile.platform_id) {
+            return Ok(BTreeSet::new());
+        }
+        let bearer = self
+            .credentials
+            .get(profile)?
+            .ok_or(BackendError::MissingCredential)?;
+        let secret = core_secret(&bearer)?;
+        runtime
+            .connector
+            .managed_agents(&profile.platform_id, &secret)
+            .map_err(Into::into)
+    }
+
+    pub fn plan_projection(&self, connection: &ConnectionResult) -> Result<Plan, BackendError> {
+        let _guard = self
+            .projection_lock
+            .lock()
+            .map_err(|_| BackendError::ProjectionLock)?;
+        connection.profile.validate()?;
+        self.validate_distribution_profile(&connection.profile)?;
+        let runtime = self
+            .projection
+            .as_ref()
+            .ok_or(BackendError::ProjectionNotConfigured)?;
+        let bearer = self
+            .credentials
+            .get(&connection.profile)?
+            .ok_or(BackendError::MissingCredential)?;
+        let secret = core_secret(&bearer)?;
+        let (manifest, provisioning) = self.projection_contracts(connection)?;
+        let selected_models = connection
+            .profile
+            .agents
+            .iter()
+            .filter_map(|(agent, selection)| {
+                selection
+                    .default_model
+                    .as_ref()
+                    .map(|model| (*agent, model.clone()))
+            })
+            .collect();
+        runtime
+            .connector
+            .plan(ApplyInput {
+                manifest: &manifest,
+                provisioning: &provisioning,
+                bearer: &secret,
+                selected_models,
+                installs: runtime.discovery.discover(&runtime.home),
+                synchronized_skills: connection.synchronized_skills.clone(),
+            })
+            .map_err(Into::into)
+    }
+
+    pub fn apply_projection(
+        &self,
+        profile: &ConnectionProfile,
+        plan: &Plan,
+    ) -> Result<(), BackendError> {
+        let _guard = self
+            .projection_lock
+            .lock()
+            .map_err(|_| BackendError::ProjectionLock)?;
+        if plan.platform_id != profile.platform_id {
+            return Err(BackendError::ProjectionContext(
+                "preview belongs to another platform".into(),
+            ));
+        }
+        let runtime = self
+            .projection
+            .as_ref()
+            .ok_or(BackendError::ProjectionNotConfigured)?;
+        let bearer = self
+            .credentials
+            .get(profile)?
+            .ok_or(BackendError::MissingCredential)?;
+        if !plan.credential_matches(&core_secret(&bearer)?)? {
+            return Err(BackendError::ProjectionContext(
+                "the Gateway credential changed after preview; preview again".into(),
+            ));
+        }
+        runtime.connector.apply(plan).map_err(Into::into)
+    }
+
+    pub fn verify_projection(&self, plan: &Plan) -> Result<Verification, BackendError> {
+        let _guard = self
+            .projection_lock
+            .lock()
+            .map_err(|_| BackendError::ProjectionLock)?;
+        self.projection
+            .as_ref()
+            .ok_or(BackendError::ProjectionNotConfigured)?
+            .connector
+            .verify(plan)
+            .map_err(Into::into)
+    }
+
+    pub fn disconnect_projection(&self, profile: &ConnectionProfile) -> Result<(), BackendError> {
+        let _guard = self
+            .projection_lock
+            .lock()
+            .map_err(|_| BackendError::ProjectionLock)?;
+        self.disconnect_projection_locked(profile)
     }
 
     pub fn probe(&self, base_url: &str) -> Result<ProbeResult, BackendError> {
@@ -513,9 +677,111 @@ impl ConnectorBackend {
     }
 
     pub fn disconnect(&self, profile: &ConnectionProfile) -> Result<(), BackendError> {
+        let _connection_guard = self
+            .connection_lock
+            .lock()
+            .map_err(|_| BackendError::ConnectionLock)?;
+        if self.projection.is_some() {
+            self.disconnect_projection(profile)?;
+        }
         self.credentials.delete(&profile.credential)?;
         self.profiles.delete(profile.id)?;
         Ok(())
+    }
+
+    fn disconnect_projection_locked(
+        &self,
+        profile: &ConnectionProfile,
+    ) -> Result<(), BackendError> {
+        profile.validate()?;
+        self.validate_distribution_profile(profile)?;
+        let runtime = self
+            .projection
+            .as_ref()
+            .ok_or(BackendError::ProjectionNotConfigured)?;
+        if !runtime.connector.has_receipt(&profile.platform_id) {
+            return Ok(());
+        }
+        let bearer = self
+            .credentials
+            .get(profile)?
+            .ok_or(BackendError::MissingCredential)?;
+        runtime
+            .connector
+            .disconnect(&profile.platform_id, &core_secret(&bearer)?)
+            .map_err(Into::into)
+    }
+
+    fn projection_contracts(
+        &self,
+        connection: &ConnectionResult,
+    ) -> Result<(ConnectionManifest, Provisioning), BackendError> {
+        match connection.profile.mode {
+            ConnectionMode::Direct => {
+                if connection.manifest.is_some()
+                    || connection.provisioning.is_some()
+                    || !connection.synchronized_skills.is_empty()
+                {
+                    return Err(BackendError::ProjectionContext(
+                        "direct connection contains platform-only data".into(),
+                    ));
+                }
+                let protocols = connection
+                    .profile
+                    .agents
+                    .values()
+                    .map(|selection| selection.protocol.as_str().to_owned())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                let manifest = ConnectionManifest::direct(
+                    Platform {
+                        id: connection.profile.platform_id.clone(),
+                        name: self.distribution.product_name.to_owned(),
+                    },
+                    Gateway {
+                        base_url: connection.profile.base_url.as_url().clone(),
+                        protocols,
+                    },
+                    connection.profile.base_url.as_url().clone(),
+                    AgentId::ALL.to_vec(),
+                )?;
+                let models = connection
+                    .models
+                    .iter()
+                    .map(|model| Model {
+                        id: model.id.clone(),
+                        chat_capable: true,
+                        description: None,
+                        icon: None,
+                        tags: Vec::new(),
+                        vendor: None,
+                    })
+                    .collect::<Vec<_>>();
+                let default_model = models
+                    .first()
+                    .map(|model| model.id.clone())
+                    .unwrap_or_default();
+                Ok((manifest, Provisioning::direct(models, default_model)?))
+            }
+            ConnectionMode::Provisioned => {
+                let manifest = connection.manifest.clone().ok_or_else(|| {
+                    BackendError::ProjectionContext("provisioned connection has no manifest".into())
+                })?;
+                let provisioning = connection.provisioning.clone().ok_or_else(|| {
+                    BackendError::ProjectionContext(
+                        "provisioned connection has no provisioning catalog".into(),
+                    )
+                })?;
+                if manifest.platform.id != connection.profile.platform_id {
+                    return Err(BackendError::ProjectionContext(
+                        "manifest platform does not match the active profile".into(),
+                    ));
+                }
+                provisioning.validate_for(&manifest)?;
+                Ok((manifest, provisioning))
+            }
+        }
     }
 
     fn single_profile(&self) -> Result<Option<ConnectionProfile>, BackendError> {
@@ -578,6 +844,10 @@ impl ConnectorBackend {
     }
 }
 
+fn core_secret(value: &ApiKey) -> Result<Secret, gateway_connector_core::Error> {
+    Secret::new(value.expose_secret().to_owned())
+}
+
 fn models_from_provisioning(value: &Provisioning) -> Vec<ModelDescriptor> {
     let mut models: Vec<_> = value
         .models
@@ -599,6 +869,14 @@ fn models_from_provisioning(value: &Provisioning) -> Vec<ModelDescriptor> {
 pub enum BackendError {
     #[error("Skill catalog synchronization failed: {0}")]
     Catalog(String),
+    #[error(transparent)]
+    Projection(#[from] gateway_connector_core::Error),
+    #[error("projection context is invalid: {0}")]
+    ProjectionContext(String),
+    #[error("Agent projection runtime is not configured")]
+    ProjectionNotConfigured,
+    #[error("Agent projection operation lock is unavailable")]
+    ProjectionLock,
     #[error(transparent)]
     Distribution(#[from] DistributionError),
     #[error(transparent)]

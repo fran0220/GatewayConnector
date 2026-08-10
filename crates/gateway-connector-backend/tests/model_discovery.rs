@@ -10,13 +10,14 @@ use std::{
 };
 
 use gateway_connector_backend::{
-    ApiKey, BackendError, Browser, ConnectRequest, ConnectorBackend, CredentialStore,
-    DiscoveryError, Distribution, GatewayClient, InMemoryCredentialStore, InMemoryProfileStore,
-    ManifestLocation, PkceError, ProfileStore, StoreError, SystemBrowser, VaultError,
+    ApiKey, BackendError, Browser, ConnectRequest, ConnectionResult, ConnectorBackend,
+    CredentialStore, DiscoveryError, Distribution, GatewayClient, InMemoryCredentialStore,
+    InMemoryProfileStore, ManifestLocation, ModelDescriptor, PkceError, ProfileStore, StoreError,
+    SystemBrowser, VaultError,
 };
 use gateway_connector_core::{
-    CanonicalBaseUrl, ConnectionManifest, ConnectionMode, ConnectionProfile, CredentialKind,
-    CredentialRef, ProfileId, Protocol,
+    AgentId, CanonicalBaseUrl, ConnectionManifest, ConnectionMode, ConnectionProfile,
+    CredentialKind, CredentialRef, ProfileId, Protocol,
 };
 use sha2::{Digest, Sha256};
 use tiny_http::{Header, Response, Server, StatusCode};
@@ -133,6 +134,12 @@ fn skill_zip(contents: &[u8]) -> Vec<u8> {
 fn provisioning_with_skill_body(origin: &str, archive: &[u8]) -> String {
     let mut value: serde_json::Value =
         serde_json::from_str(&provisioning_body()).expect("provisioning JSON");
+    value["data"]["mcp_servers"] = serde_json::json!([{
+        "id":"docs",
+        "name":"Documentation",
+        "url":"https://services.example/mcp/docs",
+        "authorization":"connection_bearer"
+    }]);
     value["data"]["skills"] = serde_json::json!([{
         "id":"online-skill",
         "name":"Online Skill",
@@ -477,7 +484,7 @@ fn provisioned_connection_uses_manifest_catalog_and_bearer_boundary() {
         "test-platform",
         &origin,
         &format!("{origin}/api/connector/provisioning"),
-        &[&origin],
+        &[&origin, "https://services.example"],
     );
     let archive = skill_zip(b"online Skill");
     let provisioning = provisioning_with_skill_body(&origin, &archive);
@@ -511,8 +518,18 @@ fn provisioned_connection_uses_manifest_catalog_and_bearer_boundary() {
     let credentials = Arc::new(InMemoryCredentialStore::default());
     let profiles = Arc::new(InMemoryProfileStore::default());
     let state = tempfile::tempdir().expect("catalog state");
-    let backend = ConnectorBackend::new(credentials, profiles)
-        .and_then(|backend| backend.with_state_directory(state.path()))
+    let home = tempfile::tempdir().expect("Agent home");
+    for root in [".claude", ".codex", ".gemini", ".grok", ".config/opencode"] {
+        fs::create_dir_all(home.path().join(root)).expect("Agent root");
+    }
+    let backend = ConnectorBackend::new(credentials.clone(), profiles)
+        .and_then(|backend| {
+            backend.with_runtime_directories(
+                state.path(),
+                state.path().join("shared-coordinator"),
+                home.path(),
+            )
+        })
         .expect("backend");
     let connected = backend
         .connect(ConnectRequest {
@@ -549,6 +566,134 @@ fn provisioned_connection_uses_manifest_catalog_and_bearer_boundary() {
             .expect("synchronized Skill"),
         b"online Skill"
     );
+
+    let installs = backend.discover_agents().expect("Agent discovery");
+    assert!(installs.iter().all(|install| install.detected));
+    let stale_plan = backend
+        .plan_projection(&connected)
+        .expect("projection preview");
+    assert!(!format!("{stale_plan:?}").contains("enhanced-key"));
+    credentials
+        .set(
+            &connected.profile,
+            &ApiKey::new("rotated-key").expect("rotated key"),
+        )
+        .expect("rotate credential");
+    let error = backend
+        .apply_projection(&connected.profile, &stale_plan)
+        .expect_err("credential rotation invalidates preview");
+    assert!(error.to_string().contains("preview again"));
+
+    let plan = backend
+        .plan_projection(&connected)
+        .expect("fresh projection preview");
+    assert!(
+        plan.changes
+            .iter()
+            .any(|change| change.path.ends_with("skills/online-skill"))
+    );
+    backend
+        .apply_projection(&connected.profile, &plan)
+        .expect("apply projection");
+    assert!(
+        backend
+            .verify_projection(&plan)
+            .expect("verify projection")
+            .ok
+    );
+    assert_eq!(
+        backend
+            .managed_agents(&connected.profile)
+            .expect("managed Agents"),
+        AgentId::ALL.into_iter().collect()
+    );
+    let codex =
+        fs::read_to_string(home.path().join(".codex/config.toml")).expect("projected Codex config");
+    assert!(codex.contains("https://services.example/mcp/docs"));
+    assert_eq!(
+        fs::read(home.path().join(".codex/skills/online-skill/SKILL.md")).expect("projected Skill"),
+        b"online Skill"
+    );
+
+    backend
+        .disconnect(&connected.profile)
+        .expect("disconnect projections and profile");
+    assert!(
+        backend
+            .profiles()
+            .expect("profiles after disconnect")
+            .is_empty()
+    );
+    assert!(!home.path().join(".codex/config.toml").exists());
+    assert!(!home.path().join(".codex/skills/online-skill").exists());
+}
+
+#[test]
+fn direct_projection_uses_discovered_models_without_inventing_services() {
+    let credentials = Arc::new(InMemoryCredentialStore::default());
+    let state = tempfile::tempdir().expect("projection state");
+    let home = tempfile::tempdir().expect("Agent home");
+    fs::create_dir(home.path().join(".codex")).expect("Codex root");
+    let backend = ConnectorBackend::new(
+        credentials.clone(),
+        Arc::new(InMemoryProfileStore::default()),
+    )
+    .and_then(|backend| {
+        backend.with_runtime_directories(
+            state.path(),
+            state.path().join("shared-coordinator"),
+            home.path(),
+        )
+    })
+    .expect("backend");
+    let profile = ConnectionProfile::new(
+        "Direct Gateway",
+        CanonicalBaseUrl::parse("https://gateway.example/proxy/v1/models").expect("URL"),
+        Protocol::OpenaiResponses,
+    )
+    .expect("profile");
+    credentials
+        .set(&profile, &ApiKey::new("direct-secret").expect("direct key"))
+        .expect("credential");
+    let connection = ConnectionResult {
+        profile: profile.clone(),
+        models: vec![ModelDescriptor {
+            id: "model-a".into(),
+            owned_by: Some("vendor".into()),
+            created: None,
+            object: Some("model".into()),
+            metadata: BTreeMap::new(),
+        }],
+        manifest: None,
+        provisioning: None,
+        synchronized_skills: BTreeMap::new(),
+    };
+
+    let plan = backend
+        .plan_projection(&connection)
+        .expect("direct preview");
+    assert!(
+        plan.changes
+            .iter()
+            .all(|change| !change.path.to_string_lossy().contains("skills"))
+    );
+    assert!(!format!("{plan:?}").contains("direct-secret"));
+    backend
+        .apply_projection(&profile, &plan)
+        .expect("apply direct projection");
+    assert!(
+        backend
+            .verify_projection(&plan)
+            .expect("verify direct projection")
+            .ok
+    );
+    let config = fs::read_to_string(home.path().join(".codex/config.toml")).expect("Codex config");
+    assert!(config.contains("https://gateway.example/proxy/v1"));
+    assert!(!config.contains("connector-mcp"));
+    backend
+        .disconnect_projection(&profile)
+        .expect("disconnect direct projection");
+    assert!(!home.path().join(".codex/config.toml").exists());
 }
 
 #[test]

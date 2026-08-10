@@ -273,6 +273,24 @@ pub struct Provisioning {
     pub skills: Vec<Skill>,
 }
 impl Provisioning {
+    /// Builds a validated direct-mode catalog without platform-only services
+    /// or account data.
+    pub fn direct(models: Vec<Model>, default_model: String) -> Result<Self> {
+        let value = Self {
+            schema_version: SCHEMA_VERSION,
+            account: None,
+            usage: None,
+            billing: None,
+            model_plaza: None,
+            models,
+            default_model,
+            mcp_servers: Vec::new(),
+            skills: Vec::new(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let envelope: ResponseEnvelope<Self> =
             serde_json::from_slice(bytes).map_err(|e| Error::Validation(e.to_string()))?;
