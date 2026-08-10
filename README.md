@@ -24,6 +24,9 @@ not scan other endpoints:
 | `/proxy` | `/proxy/v1/models` |
 | `/proxy/v1` | `/proxy/v1/models` |
 
+The enhanced wire contract is documented in
+[`docs/protocol-v2.md`](docs/protocol-v2.md).
+
 ## Architecture
 
 ```text
@@ -159,10 +162,11 @@ cargo run -p gateway-connector-app --features gpui-app --bin gateway-connector
 
 ## Next extraction steps
 
-Release readiness still needs CI for the Linux gate and Windows/macOS GPUI
-compile, protocol/distribution documentation, and a migration guide for
-exact-revision downstream wrappers. Native Windows visual acceptance remains
-required before calling the desktop client complete.
+CI runs the Linux behavior gate and Windows/macOS GPUI compile checks. The
+compile-time wrapper boundary and exact-revision migration are documented in
+[`docs/distribution.md`](docs/distribution.md) and
+[`docs/downstream-migration.md`](docs/downstream-migration.md). Native Windows
+visual acceptance remains required before calling the desktop client complete.
 
 Packaging, OAuth client IDs, account/billing schemas, brand assets, product
 URLs, signing, update feeds, and release infrastructure remain downstream.
