@@ -7,9 +7,21 @@ release process; none of those concerns belong in this repository.
 
 Phase 1 intentionally implements one complete, useful path: enter an HTTPS
 Gateway base URL and API key, test the connection with authenticated
-`GET <base>/v1/models`, select a protocol and model for each of five supported
-Agents, and preview the intended neutral projection. It does **not** write Agent
-configuration yet.
+`GET` model discovery, select a protocol and model for each of five supported
+Agents, and preview the intended neutral projection. It does **not** write
+Agent configuration yet.
+
+The Gateway URL may be an origin, a nested prefix, an API base ending in
+`/v1`, or the full `/v1/models` endpoint. Resolution is deterministic and does
+not scan other endpoints:
+
+| Gateway URL path | Requested model path |
+| --- | --- |
+| `/` | `/v1/models` |
+| `/v1` | `/v1/models` |
+| `/v1/models` | `/v1/models` |
+| `/proxy` | `/proxy/v1/models` |
+| `/proxy/v1` | `/proxy/v1/models` |
 
 ## Architecture
 
@@ -83,7 +95,8 @@ cargo run -p gateway-connector-app --features gpui-app --bin gateway-connector
 ## Demonstrated phase-1 flow
 
 1. Enter a Gateway base URL, API key, and initial protocol.
-2. **Connect / Test** canonicalizes the URL and requests `<base>/v1/models`.
+2. **Connect / Test** canonicalizes the URL and resolves its model endpoint as
+   shown above, without changing the configured origin.
 3. A successful OpenAI-style `{ "data": [...] }` response is normalized,
    deduplicated, sorted, and shown in one model picker per Agent.
 4. The connected summary shows the canonical Gateway and discovered model

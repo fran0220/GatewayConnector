@@ -73,7 +73,7 @@ impl GatewayClient {
         base_url: &CanonicalBaseUrl,
         api_key: &ApiKey,
     ) -> Result<Vec<ModelDescriptor>, DiscoveryError> {
-        let endpoint = base_url.endpoint("v1/models");
+        let endpoint = base_url.models_endpoint();
         let response =
             self.get_following_exact_origin(endpoint, base_url, Some(api_key.expose_secret()))?;
         match response.status() {

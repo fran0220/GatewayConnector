@@ -30,7 +30,7 @@ impl ConnectorView {
         let gateway_url = cx.new(|cx| {
             TextInput::new("connector.gateway-url", window, cx)
                 .name("Gateway base URL")
-                .placeholder("https://gateway.example.com")
+                .placeholder("https://gateway.example.com or https://gateway.example.com/v1")
                 .required(true)
         });
         let api_key = cx.new(|cx| {
@@ -275,7 +275,9 @@ impl ConnectorView {
                         FormField::new("connector.gateway-url.field", "Gateway base URL")
                             .control("connector.gateway-url")
                             .required(true)
-                            .description("HTTPS URL; loopback HTTP is allowed for development.")
+                            .description(
+                                "Root or nested prefix; /v1 and /v1/models forms are also accepted. HTTPS except loopback.",
+                            )
                             .child(self.gateway_url.clone()),
                     )
                     .child(

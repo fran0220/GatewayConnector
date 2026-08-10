@@ -82,6 +82,35 @@ fn sends_bearer_to_models_endpoint_and_normalizes_catalog() {
 }
 
 #[test]
+fn requests_exact_model_paths_for_supported_gateway_url_forms() {
+    let client = GatewayClient::new().expect("client");
+    let key = ApiKey::new("path-test-key").expect("key");
+
+    for (suffix, expected_path) in [
+        ("", "/v1/models"),
+        ("/v1", "/v1/models"),
+        ("/v1/models", "/v1/models"),
+        ("/proxy", "/proxy/v1/models"),
+        ("/proxy/v1", "/proxy/v1/models"),
+    ] {
+        let (origin, capture, handle) = spawn_response(200, r#"{"data":[]}"#);
+        let base_url = CanonicalBaseUrl::parse(&format!("{origin}{suffix}"))
+            .expect("supported Gateway URL form");
+        client
+            .discover_models(&base_url, &key)
+            .expect("discover models");
+        handle.join().expect("mock server");
+
+        let capture = capture.lock().expect("capture lock");
+        assert_eq!(capture.path, expected_path, "Gateway URL suffix {suffix:?}");
+        assert_eq!(
+            capture.authorization.as_deref(),
+            Some("Bearer path-test-key")
+        );
+    }
+}
+
+#[test]
 fn reports_unauthorized_and_malformed_responses() {
     let (base, _, handle) = spawn_response(401, r#"{"error":"invalid key"}"#);
     let client = GatewayClient::new().expect("client");

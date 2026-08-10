@@ -214,6 +214,17 @@ impl CanonicalBaseUrl {
         endpoint
     }
 
+    pub fn models_endpoint(&self) -> Url {
+        let path = self.0.path();
+        if path.ends_with("/v1/models") {
+            self.0.clone()
+        } else if path.ends_with("/v1") {
+            self.endpoint("models")
+        } else {
+            self.endpoint("v1/models")
+        }
+    }
+
     pub fn well_known_endpoint(&self) -> Url {
         let mut endpoint = self.0.clone();
         endpoint.set_path("/.well-known/gateway-connector");
@@ -333,6 +344,9 @@ impl ConnectionProfile {
         }
         validated_display_name(self.display_name.clone())?;
         CredentialRef::parse(self.credential.0.clone())?;
+        if self.credential != CredentialRef::for_profile(self.id) {
+            return Err(ProfileError::CredentialReferenceMismatch);
+        }
         if self.agents.len() != AgentId::ALL.len()
             || AgentId::ALL
                 .into_iter()
@@ -420,6 +434,8 @@ pub enum ProfileError {
     InvalidModelId,
     #[error("the credential reference is invalid")]
     InvalidCredentialReference,
+    #[error("the credential reference must belong to the profile ID")]
+    CredentialReferenceMismatch,
     #[error("unknown protocol `{0}`")]
     UnknownProtocol(String),
 }
@@ -447,6 +463,35 @@ mod tests {
             nested.well_known_endpoint().as_str(),
             "https://example.com/.well-known/gateway-connector"
         );
+    }
+
+    #[test]
+    fn resolves_supported_gateway_url_forms_to_model_endpoints() {
+        for (input, expected) in [
+            (
+                "https://example.com:8443/",
+                "https://example.com:8443/v1/models",
+            ),
+            (
+                "https://example.com:8443/v1",
+                "https://example.com:8443/v1/models",
+            ),
+            (
+                "https://example.com:8443/v1/models",
+                "https://example.com:8443/v1/models",
+            ),
+            (
+                "https://example.com:8443/proxy",
+                "https://example.com:8443/proxy/v1/models",
+            ),
+            (
+                "https://example.com:8443/proxy/v1",
+                "https://example.com:8443/proxy/v1/models",
+            ),
+        ] {
+            let base = CanonicalBaseUrl::parse(input).expect("valid URL");
+            assert_eq!(base.models_endpoint().as_str(), expected);
+        }
     }
 
     #[test]
@@ -478,6 +523,23 @@ mod tests {
 
         let decoded: ConnectionProfile = serde_json::from_str(&json).expect("deserialize profile");
         assert_eq!(decoded, profile);
+    }
+
+    #[test]
+    fn rejects_a_persisted_profile_with_another_profiles_credential_reference() {
+        let profile = ConnectionProfile::new(
+            "Example",
+            CanonicalBaseUrl::parse("https://gateway.example").expect("valid URL"),
+            Protocol::Auto,
+        )
+        .expect("valid profile");
+        let mut json = serde_json::to_value(profile).expect("serialize profile");
+        json["credential"] =
+            serde_json::json!(CredentialRef::for_profile(ProfileId::new()).as_str());
+
+        let error = serde_json::from_value::<ConnectionProfile>(json)
+            .expect_err("a profile must not redirect credential lookup");
+        assert!(error.to_string().contains("belong to the profile ID"));
     }
 
     #[test]
