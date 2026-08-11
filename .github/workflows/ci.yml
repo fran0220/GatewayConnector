@@ -51,6 +51,11 @@ jobs:
           rustup toolchain install 1.97.0 --profile minimal --component clippy
           rustup default 1.97.0
       - run: cargo test -p gateway-connector-core
+      - name: Native isolated-layout tests
+        run: cargo test -p gateway-connector-app --lib
+      - name: Native Windows catalog path tests
+        if: runner.os == 'Windows'
+        run: cargo test -p gateway-connector-backend --lib
       - name: Native Windows all-feature clippy
         if: runner.os == 'Windows'
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings

@@ -7,6 +7,7 @@ use gateway_connector_core::{
     AgentId, AgentInstall, ConnectionMode, Plan, Protocol, Provisioning, Verification,
 };
 
+pub mod isolated;
 pub mod preferences;
 
 #[cfg(feature = "gpui-app")]

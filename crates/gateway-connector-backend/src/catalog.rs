@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 
@@ -79,16 +79,12 @@ impl SkillCatalog {
         max_expanded: u64,
     ) -> Result<BTreeMap<String, PathBuf>, CatalogError> {
         let parent = self.state_dir.join("synchronized-skills");
-        fs::create_dir_all(&parent).map_err(io(&parent))?;
+        ensure_plain_directory_tree(&parent)?;
         reject_non_directory(&parent)?;
         let lock_path = parent.join(".catalog.lock");
-        let lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .map_err(io(&lock_path))?;
+        let lock = open_plain_lock(&lock_path)?;
         lock.lock_exclusive().map_err(io(&lock_path))?;
+        validate_plain_directory_tree(&parent)?;
         let root = parent.join(&manifest.platform.id);
         reconcile(&root)?;
         reject_existing_special(&root)?;
@@ -111,7 +107,12 @@ impl SkillCatalog {
                 .map(|skill| self.download(manifest, skill, token))
                 .collect::<Result<Vec<_>, _>>()?;
             preflight_catalog(&archives, max_entries, max_expanded)?;
+            validate_plain_directory_tree(&parent)?;
+            reject_existing_special(&root)?;
+            reject_existing_special(&staged)?;
+            reject_existing_special(&previous)?;
             fs::create_dir(&staged).map_err(io(&staged))?;
+            reject_non_directory(&staged)?;
             let mut actual_budget = ExtractionBudget {
                 entries: max_entries,
                 expanded: max_expanded,
@@ -119,6 +120,10 @@ impl SkillCatalog {
             for (skill, bytes) in provisioning.skills.iter().zip(&archives) {
                 extract_zip_shared(bytes, &staged.join(&skill.id), &mut actual_budget)?;
             }
+            validate_plain_directory_tree(&parent)?;
+            reject_non_directory(&staged)?;
+            reject_existing_special(&root)?;
+            reject_existing_special(&previous)?;
             if root.exists() {
                 fs::rename(&root, &previous).map_err(io(&root))?;
             }
@@ -266,7 +271,7 @@ fn preflight_catalog(
 
 fn reject_non_directory(path: &Path) -> Result<(), CatalogError> {
     let m = fs::symlink_metadata(path).map_err(io(path))?;
-    if !m.is_dir() || m.file_type().is_symlink() {
+    if !m.is_dir() || is_reparse(&m) {
         return Err(CatalogError::Invalid(
             "catalog state root is not a directory".into(),
         ));
@@ -275,9 +280,9 @@ fn reject_non_directory(path: &Path) -> Result<(), CatalogError> {
 }
 fn reject_existing_special(path: &Path) -> Result<(), CatalogError> {
     match fs::symlink_metadata(path) {
-        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => Ok(()),
+        Ok(m) if m.is_dir() && !is_reparse(&m) => Ok(()),
         Ok(_) => Err(CatalogError::Invalid(
-            "catalog path is a symlink or special file".into(),
+            "catalog path is a reparse point, symlink, or special file".into(),
         )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(io(path)(e)),
@@ -285,11 +290,103 @@ fn reject_existing_special(path: &Path) -> Result<(), CatalogError> {
 }
 fn remove_tree(path: &Path) -> std::io::Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => fs::remove_dir_all(path),
-        Ok(_) => fs::remove_file(path),
+        Ok(m) if m.is_dir() && !is_reparse(&m) => fs::remove_dir_all(path),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "refusing to remove a catalog reparse point, symlink, or special file",
+        )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+fn ensure_plain_directory_tree(path: &Path) -> Result<(), CatalogError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        if matches!(component, Component::ParentDir) {
+            return Err(CatalogError::Invalid(
+                "catalog state path contains a parent traversal".into(),
+            ));
+        }
+        current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_) | Component::CurDir) {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() && !is_reparse(&metadata) => {}
+            Ok(_) => {
+                return Err(CatalogError::Invalid(
+                    "catalog state path contains a reparse point, symlink, or special file".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current).map_err(io(&current))?;
+                reject_non_directory(&current)?;
+            }
+            Err(error) => return Err(io(&current)(error)),
+        }
+    }
+    validate_plain_directory_tree(path)
+}
+
+fn validate_plain_directory_tree(path: &Path) -> Result<(), CatalogError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        if matches!(component, Component::ParentDir) {
+            return Err(CatalogError::Invalid(
+                "catalog state path contains a parent traversal".into(),
+            ));
+        }
+        current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_) | Component::CurDir) {
+            continue;
+        }
+        reject_non_directory(&current)?;
+    }
+    Ok(())
+}
+
+fn open_plain_lock(path: &Path) -> Result<fs::File, CatalogError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| CatalogError::Invalid("catalog lock has no parent".into()))?;
+    validate_plain_directory_tree(parent)?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(io(path))?;
+    let metadata = file.metadata().map_err(io(path))?;
+    if !metadata.is_file() || is_reparse(&metadata) {
+        return Err(CatalogError::Invalid(
+            "catalog lock is a reparse point, symlink, or special file".into(),
+        ));
+    }
+    validate_plain_directory_tree(parent)?;
+    Ok(file)
+}
+
+fn is_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 fn transaction_nonce(timestamp_nanos: u128, process_id: u32) -> String {
@@ -315,11 +412,12 @@ fn reconcile(root: &Path) -> Result<(), CatalogError> {
     let parent = root
         .parent()
         .ok_or_else(|| CatalogError::Invalid("invalid catalog path".into()))?;
+    validate_plain_directory_tree(parent)?;
     let root_exists = match fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
+        Ok(metadata) if metadata.is_dir() && !is_reparse(&metadata) => true,
         Ok(_) => {
             return Err(CatalogError::Invalid(
-                "catalog path is a symlink or special file".into(),
+                "catalog path is a reparse point, symlink, or special file".into(),
             ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -333,6 +431,7 @@ fn reconcile(root: &Path) -> Result<(), CatalogError> {
         let n = entry.file_name();
         let n = n.to_string_lossy();
         if n.starts_with(&staged_prefix) {
+            reject_existing_special(&entry.path())?;
             remove_tree(&entry.path()).map_err(io(&entry.path()))?;
         } else if n.starts_with(&previous_prefix) {
             reject_existing_special(&entry.path())?;
@@ -1030,6 +1129,77 @@ mod tests {
             fs::read(previous.join("skill/SKILL.md")).expect("recovery tree preserved"),
             b"previous"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_state_symlink_fails_before_mutating_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let state = temp.path().join("state");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&state).expect("state");
+        fs::create_dir_all(&outside).expect("outside");
+        fs::write(outside.join("sentinel"), b"untouched").expect("sentinel");
+        symlink(&outside, state.join("synchronized-skills")).expect("catalog symlink");
+
+        let origin = "http://127.0.0.1:1";
+        let error = SkillCatalog::new(state)
+            .expect("catalog")
+            .synchronize(
+                &manifest(origin, &[origin]),
+                &provisioning(Vec::new()),
+                &ApiKey::new("unused-token").expect("token"),
+            )
+            .expect_err("catalog symlink must fail closed");
+
+        assert!(error.to_string().contains("reparse point"));
+        assert_eq!(
+            fs::read(outside.join("sentinel")).expect("sentinel"),
+            b"untouched"
+        );
+        assert_eq!(fs::read_dir(&outside).expect("outside").count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn catalog_state_junction_fails_before_mutating_its_target() {
+        use std::process::Command;
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let state = temp.path().join("state");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&state).expect("state");
+        fs::create_dir_all(&outside).expect("outside");
+        fs::write(outside.join("sentinel"), b"untouched").expect("sentinel");
+        let junction = state.join("synchronized-skills");
+        let status = Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&junction)
+            .arg(&outside)
+            .status()
+            .expect("create catalog junction");
+        assert!(status.success());
+
+        let origin = "http://127.0.0.1:1";
+        let error = SkillCatalog::new(state)
+            .expect("catalog")
+            .synchronize(
+                &manifest(origin, &[origin]),
+                &provisioning(Vec::new()),
+                &ApiKey::new("unused-token").expect("token"),
+            )
+            .expect_err("catalog junction must fail closed");
+
+        assert!(error.to_string().contains("reparse point"));
+        assert_eq!(
+            fs::read(outside.join("sentinel")).expect("sentinel"),
+            b"untouched"
+        );
+        assert_eq!(fs::read_dir(&outside).expect("outside").count(), 1);
     }
 
     #[test]

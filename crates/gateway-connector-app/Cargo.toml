@@ -20,13 +20,19 @@ gateway-connector-core.workspace = true
 gpui = { workspace = true, optional = true }
 gpui-kit = { workspace = true, optional = true }
 gpui_platform = { workspace = true, optional = true }
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sys-locale.workspace = true
+thiserror.workspace = true
 zeroize.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [build-dependencies]
 serde_json.workspace = true
@@ -34,6 +40,8 @@ winresource = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true
+tiny_http.workspace = true
+zip.workspace = true
 
 [[bin]]
 name = "gateway-connector"

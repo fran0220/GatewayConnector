@@ -5,7 +5,7 @@ mod model;
 mod profile;
 mod transaction;
 
-pub use discovery::{AgentInstall, Discovery};
+pub use discovery::{AgentInstall, Discovery, FixedAgentRoots};
 pub use model::{
     Account, AuthType, Authentication, Billing, ConnectionManifest, Gateway, MAX_CATALOG_ENTRIES,
     MAX_MCP_DESCRIPTION_BYTES, MAX_MODEL_CATALOG_ENTRIES, MAX_MODEL_TAGS, MAX_MODEL_TEXT_BYTES,

@@ -143,6 +143,10 @@ impl Locale {
             "Credentials stay in the OS vault. Bearers are sent only to exact allowlisted origins. Agent changes require a fresh preview." => {
                 "凭据仅存于操作系统凭据库。Bearer 仅发送到精确允许的来源。Agent 更改必须先生成最新预览。"
             }
+            "Isolated mode" => "隔离模式",
+            "Managing fixture Agents under this path; installed Agents are not being modified:" => {
+                "仅管理此路径下的测试 Agent；不会修改已安装的 Agent："
+            }
             "Disconnect Gateway and remove managed configuration" => "断开网关并移除托管配置",
             "Provider" => "提供方",
             "Chat capable" => "支持对话",
@@ -232,11 +236,19 @@ impl PreferenceStore {
     }
 
     pub fn load(&self) -> Preferences {
+        self.load_or_else(Preferences::default)
+    }
+
+    pub fn load_or(&self, fallback: Preferences) -> Preferences {
+        self.load_or_else(|| fallback)
+    }
+
+    fn load_or_else(&self, fallback: impl FnOnce() -> Preferences) -> Preferences {
         self.with_lock(|| fs::read(&self.path))
             .ok()
             .and_then(Result::ok)
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+            .unwrap_or_else(fallback)
     }
 
     pub fn save(&self, preferences: &Preferences) -> io::Result<()> {

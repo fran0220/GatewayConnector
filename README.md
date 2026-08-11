@@ -49,6 +49,7 @@ gateway-connector-app
   Optional GPUI/gpui-kit binary with first-run, discovery, Agent selection,
   conditional connected shell, and real preview/apply/verify/disconnect flow
   Credential-free locale/theme preferences replaced atomically
+  Generic-only one-root portable acceptance mode
 ```
 
 The projection engine retains the proven five adapters—Claude Code, Codex CLI,
@@ -111,6 +112,21 @@ fail closed without rewriting the file.
   platform identity and manifest endpoint through `Distribution`; generic
   builds remain user-configurable. Neutral defaults contain no branded URLs,
   OAuth IDs, assets, account assumptions, or updater metadata.
+- The generic executable alone enables `--isolated-root <absolute-path>` for
+  portable acceptance. Argument and root validation finish before any normal
+  `ProjectDirs`, shared coordinator, profile/preference store, home directory,
+  or default Agent discovery is constructed. A new/empty root receives a
+  durable schema-1 marker bound to its canonical path and physical directory
+  identity; non-empty unmarked, malformed, symlinked, junction, reparse, and
+  special-component roots fail closed. All mutable connector state and fixed
+  Claude/Codex/Gemini/Grok Build/OpenCode fixture roots are derived beneath
+  that one root. Credentials still use the native OS vault, under a stable
+  root-specific service and the existing profile-specific account, so
+  disconnect removes only that isolated profile credential. Isolated mode is
+  portable acceptance isolation against accidental real-state access, not a
+  security sandbox against another same-user process. Normal no-argument
+  startup retains the shared neutral ProjectionCoordinator and installed-Agent
+  discovery unchanged.
 - Profile creation is singleton and guarded by both an in-process connection
   lock and an inter-process profile-file lock. Profile writes use private
   unique `create_new` temporary files, no-follow/reparse checks, durable file
@@ -169,6 +185,33 @@ not need a display server:
 cargo check -p gateway-connector-app --features gpui-app
 cargo run -p gateway-connector-app --features gpui-app --bin gateway-connector
 ```
+
+For portable development or acceptance without touching normal connector state
+or installed Agent roots, pass one new or empty absolute directory:
+
+```bash
+cargo run -p gateway-connector-app --features gpui-app --bin gateway-connector -- \
+  --isolated-root /absolute/path/to/gateway-connector-acceptance
+```
+
+The window displays a persistent **Isolated mode** banner and canonical path.
+Its managed fixtures are fixed at
+`agents/{claude,codex,gemini,grokbuild,opencode}` under that root. Do not point
+this option at an existing non-empty directory; only a root carrying its valid
+GatewayConnector marker can be reopened.
+
+```text
+<isolated-root>/
+  .gateway-connector-isolated-root.json  Versioned path/directory marker
+  data/                                  Profile and UI preferences
+  state/                                 Catalog, staging/recovery, receipts, journals
+  coordinator/                           Isolated coordinator locks and leases
+  agents/{claude,codex,gemini,grokbuild,opencode}/
+```
+
+The marker and all directory components are revalidated before lifecycle
+actions. The catalog and projection layers retain their own no-follow/reparse
+guards immediately around staging, recovery, and mutation.
 
 ## Demonstrated phase-1 flow
 
@@ -230,6 +273,21 @@ and exact-revision migration are documented in
 [`docs/distribution.md`](docs/distribution.md) and
 [`docs/downstream-migration.md`](docs/downstream-migration.md). Native Windows
 visual acceptance remains required before calling the desktop client complete.
+
+Run native Windows acceptance against the exact staged production executable,
+not `cargo run`, so the GUI-subsystem and embedded-resource artifact is tested:
+
+```powershell
+$acceptanceRoot = Join-Path $env:TEMP 'GatewayConnector-Acceptance'
+# Use a new/empty path, or the same previously marked GatewayConnector root.
+& .\dist\windows-x64\gateway-connector.exe --isolated-root $acceptanceRoot
+```
+
+The banner must show the canonical `$acceptanceRoot`. Connection, model
+discovery, preview, apply, verify, resume, and disconnect then operate only on
+the five fixture Agent roots beneath it. The OS credential vault deliberately
+remains native so credential persistence and cleanup receive real acceptance
+coverage.
 
 Branded packaging, OAuth client IDs, account/billing schemas, brand assets,
 product URLs, signing, update feeds, and automated release infrastructure

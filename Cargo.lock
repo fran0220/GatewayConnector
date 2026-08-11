@@ -1945,13 +1945,19 @@ dependencies = [
  "gpui",
  "gpui-kit",
  "gpui_platform",
+ "libc",
+ "rand 0.9.5",
  "serde",
  "serde_json",
+ "sha2",
  "sys-locale",
  "tempfile",
+ "thiserror 2.0.20",
+ "tiny_http",
  "windows-sys 0.61.2",
  "winresource",
  "zeroize",
+ "zip",
 ]
 
 [[package]]

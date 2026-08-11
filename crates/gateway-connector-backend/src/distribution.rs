@@ -12,6 +12,9 @@ pub struct Distribution {
     pub default_gateway_url: Option<&'static str>,
     pub manifest_url: Option<&'static str>,
     pub allow_custom_urls: bool,
+    /// Allows the generic acceptance-only `--isolated-root` launch mode.
+    /// Downstream distributions should leave this disabled.
+    pub allow_isolated_root: bool,
     pub qualifier: &'static str,
     pub organization: &'static str,
     pub application: &'static str,
@@ -32,6 +35,7 @@ pub const GENERIC_DISTRIBUTION: Distribution = Distribution {
     default_gateway_url: None,
     manifest_url: None,
     allow_custom_urls: true,
+    allow_isolated_root: true,
     qualifier: "dev",
     organization: "gateway-connector",
     application: "gateway-connector",

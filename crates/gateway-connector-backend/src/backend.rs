@@ -6,8 +6,8 @@ use std::{
 
 use gateway_connector_core::{
     AgentId, AgentInstall, ApplyInput, CanonicalBaseUrl, ConnectionManifest, ConnectionMode,
-    ConnectionProfile, Connector, CredentialKind, Discovery, Gateway, Model, Plan, Platform,
-    ProfileError, Protocol, Provisioning, Secret, Verification,
+    ConnectionProfile, Connector, CredentialKind, Discovery, FixedAgentRoots, Gateway, Model, Plan,
+    Platform, ProfileError, Protocol, Provisioning, Secret, Verification,
 };
 use thiserror::Error;
 
@@ -83,8 +83,22 @@ struct PendingCredential {
 #[derive(Debug)]
 struct ProjectionRuntime {
     connector: Connector,
-    discovery: Discovery,
-    home: PathBuf,
+    discovery: RuntimeDiscovery,
+}
+
+#[derive(Debug)]
+enum RuntimeDiscovery {
+    System { discovery: Discovery, home: PathBuf },
+    Fixed(FixedAgentRoots),
+}
+
+impl RuntimeDiscovery {
+    fn discover(&self) -> Vec<AgentInstall> {
+        match self {
+            Self::System { discovery, home } => discovery.discover(home),
+            Self::Fixed(roots) => roots.discover(),
+        }
+    }
 }
 
 impl ConnectorBackend {
@@ -153,8 +167,33 @@ impl ConnectorBackend {
                 state_dir.join("connector"),
                 coordinator_dir.into(),
             ),
-            discovery: Discovery::default(),
-            home: home.into(),
+            discovery: RuntimeDiscovery::System {
+                discovery: Discovery::default(),
+                home: home.into(),
+            },
+        });
+        Ok(self)
+    }
+
+    /// Configures one root-derived runtime whose Agent discovery cannot read
+    /// environment variables or operating-system home directories.
+    pub fn with_isolated_runtime_directories(
+        mut self,
+        state_dir: impl Into<PathBuf>,
+        coordinator_dir: impl Into<PathBuf>,
+        agent_roots: FixedAgentRoots,
+    ) -> Result<Self, BackendError> {
+        let state_dir = state_dir.into();
+        self.catalog = Some(
+            crate::catalog::SkillCatalog::new(state_dir.clone())
+                .map_err(|error| BackendError::Catalog(error.to_string()))?,
+        );
+        self.projection = Some(ProjectionRuntime {
+            connector: Connector::with_coordinator(
+                state_dir.join("connector"),
+                coordinator_dir.into(),
+            ),
+            discovery: RuntimeDiscovery::Fixed(agent_roots),
         });
         Ok(self)
     }
@@ -169,7 +208,12 @@ impl ConnectorBackend {
             .projection
             .as_mut()
             .ok_or(BackendError::ProjectionNotConfigured)?;
-        runtime.discovery.overrides = overrides;
+        let RuntimeDiscovery::System { discovery, .. } = &mut runtime.discovery else {
+            return Err(BackendError::ProjectionContext(
+                "fixed isolated Agent roots cannot be overridden".into(),
+            ));
+        };
+        discovery.overrides = overrides;
         Ok(self)
     }
 
@@ -194,7 +238,7 @@ impl ConnectorBackend {
             .projection
             .as_ref()
             .ok_or(BackendError::ProjectionNotConfigured)?;
-        Ok(runtime.discovery.discover(&runtime.home))
+        Ok(runtime.discovery.discover())
     }
 
     pub fn managed_agents(
@@ -244,7 +288,7 @@ impl ConnectorBackend {
             .get(&connection.profile)?
             .ok_or(BackendError::MissingCredential)?;
         let secret = core_secret(&bearer)?;
-        let installs = runtime.discovery.discover(&runtime.home);
+        let installs = runtime.discovery.discover();
         let (manifest, provisioning) = self.projection_contracts(connection, &installs)?;
         let selected_models = connection
             .profile

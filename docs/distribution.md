@@ -14,6 +14,7 @@ pub static DISTRIBUTION: Distribution = Distribution {
     default_gateway_url: Some("https://gateway.example/v1"),
     manifest_url: Some("https://gateway.example/connector-manifest.json"),
     allow_custom_urls: false,
+    allow_isolated_root: false,
     qualifier: "com",
     organization: "example",
     application: "connector",
@@ -53,6 +54,15 @@ Their `AssetSource` should delegate unknown neutral icon and font paths to
 `allow_custom_urls=false` requires `default_gateway_url`; saved profiles and
 new probes must continue to match the configured Gateway and manifest. An
 explicit manifest URL must have the same origin as the configured Gateway.
+
+`allow_isolated_root` is deny-by-default policy for downstream definitions;
+only the neutral generic binary opts in. It accepts the exact production option
+`--isolated-root <absolute-path>` and derives state, an isolated coordinator,
+and all five fixture Agent roots beneath that one validated root. It is intended
+for portable acceptance, not as a security sandbox. Branded wrappers should
+keep the flag `false` unless they deliberately expose and test this generic
+acceptance facility. There are no per-Agent, coordinator, HOME, or XDG override
+arguments.
 
 The shared projection coordinator intentionally does **not** use downstream
 state identity. Every wrapper uses

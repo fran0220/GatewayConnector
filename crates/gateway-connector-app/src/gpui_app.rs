@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     AppState, Page, QueryStatus,
+    isolated::{IsolatedLayout, LaunchRequest},
     preferences::{Locale, PreferenceStore, Preferences, ThemePreference},
 };
 use directories::{ProjectDirs, UserDirs};
@@ -50,6 +51,7 @@ struct ConnectorView {
     save_error: Option<String>,
     projection_busy: bool,
     action_error: Option<String>,
+    isolated_layout: Option<IsolatedLayout>,
 }
 
 impl ConnectorView {
@@ -58,6 +60,7 @@ impl ConnectorView {
         distribution: &'static Distribution,
         preference_store: PreferenceStore,
         preferences: Preferences,
+        isolated_layout: Option<IsolatedLayout>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -192,6 +195,9 @@ impl ConnectorView {
             let Some(locale) = Locale::from_id(id) else {
                 return;
             };
+            if !this.ensure_isolated_paths(false, cx) {
+                return;
+            }
             let mut preferences = this.preferences.clone();
             preferences.locale = locale;
             if let Err(error) = this.preference_store.save(&preferences) {
@@ -216,6 +222,9 @@ impl ConnectorView {
             let Some(theme) = ThemePreference::from_id(id) else {
                 return;
             };
+            if !this.ensure_isolated_paths(false, cx) {
+                return;
+            }
             let mut preferences = this.preferences.clone();
             preferences.theme = theme;
             if let Err(error) = this.preference_store.save(&preferences) {
@@ -259,6 +268,7 @@ impl ConnectorView {
             save_error: None,
             projection_busy: false,
             action_error: None,
+            isolated_layout,
         };
         cx.observe_window_appearance(window, |this, window, cx| {
             if this.preferences.theme == ThemePreference::System {
@@ -272,6 +282,26 @@ impl ConnectorView {
 
     fn text(&self, english: &'static str) -> &'static str {
         self.preferences.locale.text(english)
+    }
+
+    fn ensure_isolated_paths(&mut self, fatal: bool, cx: &mut Context<Self>) -> bool {
+        let result = self
+            .isolated_layout
+            .as_ref()
+            .map(IsolatedLayout::revalidate)
+            .transpose();
+        if let Err(error) = result {
+            let message = format!("Isolated mode path validation failed: {error}");
+            if fatal {
+                self.state = AppState::Failed(message);
+            } else {
+                self.action_error = Some(message);
+            }
+            cx.notify();
+            false
+        } else {
+            true
+        }
     }
 
     fn sync_localized_controls(&self, cx: &mut Context<Self>) {
@@ -305,6 +335,9 @@ impl ConnectorView {
     }
 
     fn begin_resume(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_isolated_paths(true, cx) {
+            return;
+        }
         let backend = Arc::clone(&self.backend);
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -326,6 +359,9 @@ impl ConnectorView {
 
     fn begin_connect(&mut self, cx: &mut Context<Self>) {
         if matches!(self.state, AppState::Connecting) {
+            return;
+        }
+        if !self.ensure_isolated_paths(true, cx) {
             return;
         }
         let base_url = self.gateway_url.read(cx).value().to_string();
@@ -407,6 +443,9 @@ impl ConnectorView {
     }
 
     fn begin_browser_login(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_isolated_paths(false, cx) {
+            return;
+        }
         let AppState::BrowserLogin(offer) = &self.state else {
             return;
         };
@@ -607,6 +646,9 @@ impl ConnectorView {
     }
 
     fn queue_profile_save(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_isolated_paths(false, cx) {
+            return;
+        }
         if let AppState::Connected { connection, .. } = &self.state {
             self.pending_save = Some(connection.profile.clone());
             self.start_profile_save(cx);
@@ -614,6 +656,9 @@ impl ConnectorView {
     }
 
     fn begin_projection_status(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_isolated_paths(false, cx) {
+            return;
+        }
         let AppState::Connected { connection, .. } = &self.state else {
             return;
         };
@@ -664,6 +709,9 @@ impl ConnectorView {
         if self.projection_busy {
             return;
         }
+        if !self.ensure_isolated_paths(false, cx) {
+            return;
+        }
         let AppState::Connected { connection, .. } = &self.state else {
             return;
         };
@@ -691,6 +739,9 @@ impl ConnectorView {
 
     fn begin_preview(&mut self, cx: &mut Context<Self>) {
         if self.projection_busy {
+            return;
+        }
+        if !self.ensure_isolated_paths(false, cx) {
             return;
         }
         let AppState::Connected { connection, .. } = &self.state else {
@@ -733,6 +784,9 @@ impl ConnectorView {
 
     fn begin_apply(&mut self, cx: &mut Context<Self>) {
         if self.projection_busy {
+            return;
+        }
+        if !self.ensure_isolated_paths(false, cx) {
             return;
         }
         let AppState::Connected {
@@ -794,6 +848,9 @@ impl ConnectorView {
         if self.projection_busy {
             return;
         }
+        if !self.ensure_isolated_paths(false, cx) {
+            return;
+        }
         let AppState::Connected {
             preview: Some(plan),
             verification: Some(_),
@@ -826,6 +883,9 @@ impl ConnectorView {
 
     fn begin_disconnect(&mut self, cx: &mut Context<Self>) {
         if self.projection_busy || self.save_in_flight {
+            return;
+        }
+        if !self.ensure_isolated_paths(false, cx) {
             return;
         }
         let AppState::Connected { connection, .. } = &self.state else {
@@ -871,6 +931,9 @@ impl ConnectorView {
 
     fn start_profile_save(&mut self, cx: &mut Context<Self>) {
         if self.save_in_flight {
+            return;
+        }
+        if !self.ensure_isolated_paths(false, cx) {
             return;
         }
         let Some(profile) = self.pending_save.take() else {
@@ -1427,6 +1490,22 @@ impl ConnectorView {
             .into_any_element()
     }
 
+    fn isolation_banner(&self) -> Option<gpui::AnyElement> {
+        self.isolated_layout.as_ref().map(|layout| {
+            Callout::new(
+                format!(
+                    "{}\n{} {}",
+                    self.text("Isolated mode"),
+                    self.text("Managing fixture Agents under this path; installed Agents are not being modified:"),
+                    layout.root().display()
+                ),
+                Tone::Warning,
+            )
+            .id("connector.isolated-mode")
+            .into_any_element()
+        })
+    }
+
     fn render_connected(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let AppState::Connected {
             connection,
@@ -1814,6 +1893,17 @@ impl Render for ConnectorView {
             AppState::Failed(error) => self.render_first_run(false, Some(error), cx),
             AppState::Connected { .. } => self.render_connected(cx),
         };
+        let content = if let Some(banner) = self.isolation_banner() {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(16.0))
+                .child(banner)
+                .child(content)
+                .into_any_element()
+        } else {
+            content
+        };
         let root = div()
             .id("connector.root")
             .size_full()
@@ -1926,48 +2016,105 @@ fn change_kind(kind: &ChangeKind) -> &'static str {
 ///
 /// The distribution is validated before any state, vault, or network access.
 pub fn run(distribution: &'static Distribution) {
-    run_with_assets(distribution, gpui_kit::assets::Assets);
+    run_launch(distribution, LaunchRequest::Normal);
+}
+
+/// Runs a pre-parsed launch request. The generic binary parses arguments
+/// before calling this function; downstream wrappers normally call [`run`].
+pub fn run_launch(distribution: &'static Distribution, request: LaunchRequest) {
+    run_launch_with_assets(distribution, request, gpui_kit::assets::Assets);
 }
 
 /// Runs a distribution with a wrapper-owned asset source. Downstream sources
 /// should delegate unknown neutral icon/font paths to `gpui_kit::assets::Assets`.
 pub fn run_with_assets(distribution: &'static Distribution, assets: impl AssetSource) {
+    run_launch_with_assets(distribution, LaunchRequest::Normal, assets);
+}
+
+fn run_launch_with_assets(
+    distribution: &'static Distribution,
+    request: LaunchRequest,
+    assets: impl AssetSource,
+) {
     distribution
         .validate()
         .expect("validate GatewayConnector distribution");
-    let directories = ProjectDirs::from(
-        distribution.qualifier,
-        distribution.organization,
-        distribution.application,
-    )
-    .expect("the operating system provides a user data directory");
-    let coordinator = ProjectDirs::from("dev", "GatewayConnector", "ProjectionCoordinator")
-        .expect("the operating system provides a shared projection coordinator directory");
-    let home = UserDirs::new()
-        .expect("the operating system provides a home directory")
-        .home_dir()
-        .to_owned();
-    let backend = Arc::new(
-        ConnectorBackend::with_dependencies(
-            Arc::new(OsCredentialStore::new(distribution.keyring_service)),
-            Arc::new(JsonProfileStore::new(
-                directories.data_local_dir().join("profiles.json"),
-            )),
-            distribution,
-            Arc::new(SystemBrowser),
-        )
-        .and_then(|backend| {
-            backend.with_runtime_directories(
-                directories.data_local_dir(),
-                coordinator.data_local_dir(),
-                home,
-            )
-        })
-        .expect("initialize GatewayConnector backend"),
+    assert!(
+        !matches!(&request, LaunchRequest::Isolated(_)) || distribution.allow_isolated_root,
+        "this GatewayConnector distribution disables isolated-root mode"
     );
-    let preference_store =
-        PreferenceStore::new(directories.data_local_dir().join("ui-preferences.json"));
-    let mut preferences = preference_store.load();
+    let (backend, preference_store, mut preferences, isolated_layout) = match request {
+        LaunchRequest::Normal => {
+            let directories = ProjectDirs::from(
+                distribution.qualifier,
+                distribution.organization,
+                distribution.application,
+            )
+            .expect("the operating system provides a user data directory");
+            let coordinator = ProjectDirs::from("dev", "GatewayConnector", "ProjectionCoordinator")
+                .expect("the operating system provides a shared projection coordinator directory");
+            let home = UserDirs::new()
+                .expect("the operating system provides a home directory")
+                .home_dir()
+                .to_owned();
+            let backend = Arc::new(
+                ConnectorBackend::with_dependencies(
+                    Arc::new(OsCredentialStore::new(distribution.keyring_service)),
+                    Arc::new(JsonProfileStore::new(
+                        directories.data_local_dir().join("profiles.json"),
+                    )),
+                    distribution,
+                    Arc::new(SystemBrowser),
+                )
+                .and_then(|backend| {
+                    backend.with_runtime_directories(
+                        directories.data_local_dir(),
+                        coordinator.data_local_dir(),
+                        home,
+                    )
+                })
+                .expect("initialize GatewayConnector backend"),
+            );
+            let preference_store =
+                PreferenceStore::new(directories.data_local_dir().join("ui-preferences.json"));
+            let preferences = preference_store.load();
+            (backend, preference_store, preferences, None)
+        }
+        LaunchRequest::Isolated(layout) => {
+            let layout = *layout;
+            layout
+                .revalidate()
+                .expect("revalidate isolated GatewayConnector root");
+            eprintln!(
+                "GatewayConnector Isolated mode: {}",
+                layout.root().display()
+            );
+            let backend = Arc::new(
+                ConnectorBackend::with_dependencies(
+                    Arc::new(OsCredentialStore::new(
+                        layout.keyring_service(distribution.keyring_service),
+                    )),
+                    Arc::new(JsonProfileStore::new(layout.profiles_file())),
+                    distribution,
+                    Arc::new(SystemBrowser),
+                )
+                .and_then(|backend| {
+                    backend.with_isolated_runtime_directories(
+                        layout.state_dir(),
+                        layout.coordinator_dir(),
+                        layout.agent_roots(),
+                    )
+                })
+                .expect("initialize isolated GatewayConnector backend"),
+            );
+            let preference_store = PreferenceStore::new(layout.preferences_file());
+            let preferences = preference_store.load_or(Preferences {
+                locale: Locale::En,
+                theme: ThemePreference::System,
+            });
+            (backend, preference_store, preferences, Some(layout))
+        }
+    };
     if !distribution
         .supported_locales
         .contains(&preferences.locale.id())
@@ -1979,6 +2126,11 @@ pub fn run_with_assets(distribution: &'static Distribution, assets: impl AssetSo
             .unwrap_or_default();
     }
     let application = gpui_platform::application().with_assets(assets);
+    let window_title = if isolated_layout.is_some() {
+        format!("{} — Isolated mode", distribution.product_name)
+    } else {
+        distribution.product_name.to_owned()
+    };
     application.run(move |cx: &mut App| {
         gpui_kit::install(cx);
         apply_theme(preferences.theme, cx);
@@ -1986,11 +2138,13 @@ pub fn run_with_assets(distribution: &'static Distribution, assets: impl AssetSo
         let backend = Arc::clone(&backend);
         let preference_store = preference_store.clone();
         let preferences = preferences.clone();
+        let isolated_layout = isolated_layout.clone();
+        let window_title = window_title.clone();
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some(distribution.product_name.into()),
+                    title: Some(window_title.into()),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2003,6 +2157,7 @@ pub fn run_with_assets(distribution: &'static Distribution, assets: impl AssetSo
                         distribution,
                         preference_store,
                         preferences,
+                        isolated_layout,
                         window,
                         cx,
                     )
