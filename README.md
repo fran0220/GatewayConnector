@@ -116,6 +116,13 @@ fail closed without rewriting the file.
   transactional publication. The same checked budget is decremented during
   extraction rather than reset per archive. Direct mode downloads and
   projects no MCP or Skills.
+- Provisioned MCP entries are platform descriptors, not transport health
+  checks. The Services page reports them as `Available from platform` until a
+  current-session projection succeeds, then `Configured for Agents`.
+  GatewayConnector does not report MCP servers as online, healthy, or
+  connected because it does not perform an MCP protocol handshake. Skill
+  downloaded/verified/installed evidence remains based on the actual archive
+  synchronization work.
 - Official downstream builds can disable custom Gateway URLs and pin both the
   platform identity and manifest endpoint through `Distribution`; generic
   builds remain user-configurable. Neutral defaults contain no branded URLs,

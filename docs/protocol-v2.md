@@ -175,8 +175,14 @@ contain non-chat models and is display-only—it never enters Agent selectors.
 
 Optional `account`, `usage`, `billing`, and `model_plaza` records control
 whether their UI pages exist. Their absence is not replaced by zeros or fake
-metrics. `mcp_servers` and `skills` are likewise online provisioning records;
-direct mode has no inferred catalog.
+metrics. `mcp_servers` and `skills` are platform provisioning records; direct
+mode has no inferred catalog. An MCP descriptor is reported as `Available from
+platform`, or `Configured for Agents` after a current-session projection
+succeeds for the current catalog.
+GatewayConnector does not perform an MCP transport handshake, so descriptor or
+projection evidence must never be presented as online, healthy, or connected.
+Skill archives may separately report downloaded, integrity-verified, and
+installed states because the connector performs those operations.
 
 Authenticated MCP and Skill origins must be present in
 `connection_bearer_origins`. Skill archives declare exact lowercase SHA-256,

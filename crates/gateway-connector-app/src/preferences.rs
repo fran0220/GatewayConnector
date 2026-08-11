@@ -120,18 +120,40 @@ impl Locale {
                 "请先安装受支持的 Agent，再预览配置更改。"
             }
             "The Gateway currently offers no chat-capable models." => "网关目前未提供可对话模型。",
-            "Preview again after changing any Agent protocol or model." => {
-                "更改任一 Agent 的协议或模型后需重新预览。"
-            }
             "Fresh preview ready. No Agent files have been changed yet." => {
                 "最新预览已就绪，尚未更改任何 Agent 文件。"
             }
+            "Preview is required before Apply." => "应用前必须先预览。",
+            "Managed files exist. Preview changes or disconnect this connection." => {
+                "已存在托管文件。请预览更改或断开此连接。"
+            }
+            "Applying managed files…" => "正在应用托管文件…",
+            "Changes applied. Verify the managed files before continuing." => {
+                "更改已应用。请先验证托管文件再继续。"
+            }
+            "Verifying managed files…" => "正在验证托管文件…",
+            "Managed files verified against the applied changes." => {
+                "托管文件已通过已应用更改的验证。"
+            }
+            "Verification found drift. Preview again before applying." => {
+                "验证发现漂移。再次应用前请重新预览。"
+            }
+            "Apply failed. Preview again before applying." => "应用失败。再次应用前请重新预览。",
+            "Verification failed. Preview again before applying." => {
+                "验证失败。再次应用前请重新预览。"
+            }
+            "Disconnecting managed files…" => "正在断开托管文件…",
+            "Disconnect failed. Managed files may still be present." => {
+                "断开失败。托管文件可能仍然存在。"
+            }
             "No Agent file changes are needed." => "无需更改 Agent 文件。",
-            "Applied configuration matches the preview." => "已应用的配置与预览一致。",
+            "Verification found drift:" => "验证发现漂移：",
             "Direct connections do not invent MCP servers or Skills." => {
                 "直连模式不会虚构 MCP 服务器或 Skills。"
             }
             "MCP servers" => "MCP 服务器",
+            "Available from platform" => "平台提供",
+            "Configured for Agents" => "已为 Agent 配置",
             "Skills" => "Skills",
             "No online services were provisioned." => "未配置在线服务。",
             "Language" => "语言",

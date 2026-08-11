@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    AppState, Page, QueryStatus,
+    AppState, Page, ProjectionSemantic, QueryStatus,
     isolated::{IsolatedLayout, LaunchRequest},
     preferences::{Locale, PreferenceStore, Preferences, ThemePreference},
 };
@@ -24,6 +24,24 @@ enum ConnectOutcome {
     Connected(Box<ConnectionResult>),
     Browser(Box<BrowserLoginOffer>),
     Failed(String),
+}
+
+#[derive(Default)]
+struct ProjectionStatusGeneration(u64);
+
+impl ProjectionStatusGeneration {
+    fn begin(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(1);
+        self.0
+    }
+
+    fn invalidate(&mut self) {
+        self.0 = self.0.wrapping_add(1);
+    }
+
+    const fn accepts(&self, generation: u64) -> bool {
+        self.0 == generation
+    }
 }
 
 struct ConnectorView {
@@ -50,6 +68,7 @@ struct ConnectorView {
     pending_save: Option<ConnectionProfile>,
     save_error: Option<String>,
     projection_busy: bool,
+    projection_status_generation: ProjectionStatusGeneration,
     action_error: Option<String>,
     isolated_layout: Option<IsolatedLayout>,
 }
@@ -267,6 +286,7 @@ impl ConnectorView {
             pending_save: None,
             save_error: None,
             projection_busy: false,
+            projection_status_generation: ProjectionStatusGeneration::default(),
             action_error: None,
             isolated_layout,
         };
@@ -663,6 +683,7 @@ impl ConnectorView {
             return;
         };
         let profile = connection.profile.clone();
+        let generation = self.projection_status_generation.begin();
         let backend = Arc::clone(&self.backend);
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -681,11 +702,13 @@ impl ConnectorView {
                 .await;
             this.update(cx, |this, cx| {
                 let (profile, installs, managed) = result;
-                if matches!(
-                    &this.state,
-                    AppState::Connected { connection, .. }
-                        if connection.profile.id == profile.id
-                ) {
+                if this.projection_status_generation.accepts(generation)
+                    && matches!(
+                        &this.state,
+                        AppState::Connected { connection, .. }
+                            if connection.profile.id == profile.id
+                    )
+                {
                     this.state.set_projection_status(installs, managed);
                 }
                 cx.notify();
@@ -789,17 +812,14 @@ impl ConnectorView {
         if !self.ensure_isolated_paths(false, cx) {
             return;
         }
-        let AppState::Connected {
-            connection,
-            preview: Some(plan),
-            verification: None,
-            ..
-        } = &self.state
-        else {
+        let AppState::Connected { connection, .. } = &self.state else {
             return;
         };
         let profile = connection.profile.clone();
-        let plan = plan.as_ref().clone();
+        let Some(plan) = self.state.start_apply() else {
+            return;
+        };
+        self.projection_status_generation.invalidate();
         let backend = Arc::clone(&self.backend);
         self.action_error = None;
         self.set_projection_busy(true, cx);
@@ -808,32 +828,30 @@ impl ConnectorView {
                 .background_executor()
                 .spawn(async move {
                     backend.apply_projection(&profile, &plan)?;
-                    let verification = backend.verify_projection(&plan)?;
-                    let managed = backend.managed_agents(&profile)?;
-                    Ok::<_, gateway_connector_backend::BackendError>((
-                        profile,
-                        verification,
-                        managed,
-                    ))
+                    let managed = backend.managed_agents(&profile);
+                    Ok::<_, gateway_connector_backend::BackendError>((profile, plan, managed))
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.set_projection_busy(false, cx);
                 match result {
-                    Ok((profile, verification, managed)) => {
-                        if let AppState::Connected {
-                            connection,
-                            managed_agents,
-                            ..
-                        } = &mut this.state
-                            && connection.profile.id == profile.id
-                        {
-                            *managed_agents = QueryStatus::Known(managed);
-                            this.state.set_verification(verification);
+                    Ok((profile, plan, managed)) => {
+                        let profile_matches = matches!(
+                            &this.state,
+                            AppState::Connected { connection, .. }
+                                if connection.profile.id == profile.id
+                        );
+                        if profile_matches {
+                            this.state.finish_apply(plan);
+                            if let AppState::Connected { managed_agents, .. } = &mut this.state {
+                                *managed_agents = managed
+                                    .map(QueryStatus::Known)
+                                    .unwrap_or_else(|error| QueryStatus::Error(error.to_string()));
+                            }
                         }
                     }
                     Err(error) => {
-                        this.state.clear_preview();
+                        this.state.fail_apply();
                         this.action_error = Some(error.to_string());
                     }
                 }
@@ -851,15 +869,9 @@ impl ConnectorView {
         if !self.ensure_isolated_paths(false, cx) {
             return;
         }
-        let AppState::Connected {
-            preview: Some(plan),
-            verification: Some(_),
-            ..
-        } = &self.state
-        else {
+        let Some(plan) = self.state.start_verify() else {
             return;
         };
-        let plan = plan.as_ref().clone();
         let backend = Arc::clone(&self.backend);
         self.action_error = None;
         self.set_projection_busy(true, cx);
@@ -871,8 +883,11 @@ impl ConnectorView {
             this.update(cx, |this, cx| {
                 this.set_projection_busy(false, cx);
                 match result {
-                    Ok(verification) => this.state.set_verification(verification),
-                    Err(error) => this.action_error = Some(error.to_string()),
+                    Ok(verification) => this.state.finish_verify(verification),
+                    Err(error) => {
+                        this.state.fail_verify();
+                        this.action_error = Some(error.to_string());
+                    }
                 }
                 cx.notify();
             })
@@ -894,6 +909,8 @@ impl ConnectorView {
         let profile = connection.profile.clone();
         let backend = Arc::clone(&self.backend);
         self.action_error = None;
+        self.projection_status_generation.invalidate();
+        self.state.start_disconnect();
         self.set_projection_busy(true, cx);
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -920,7 +937,10 @@ impl ConnectorView {
                         this.page = Page::Overview;
                         this.state = AppState::FirstRun;
                     }
-                    Err(error) => this.action_error = Some(error.to_string()),
+                    Err(error) => {
+                        this.state.fail_disconnect();
+                        this.action_error = Some(error.to_string());
+                    }
                 }
                 cx.notify();
             })
@@ -1216,6 +1236,7 @@ impl ConnectorView {
                     .child(locale.text("Direct connections do not invent MCP servers or Skills.")),
             );
         if !provisioning.mcp_servers.is_empty() {
+            let mcp_status = locale.text(self.state.mcp_evidence().label());
             let mut servers = Card::new()
                 .id("connector.services.mcp")
                 .padded(true)
@@ -1225,7 +1246,7 @@ impl ConnectorView {
                     ListRow::new()
                         .id(format!("connector.service.mcp.{}", server.id))
                         .child(div().flex_1().child(server.name.clone()))
-                        .child(Badge::new("online").success()),
+                        .child(Badge::new(mcp_status).neutral()),
                 );
             }
             content = content.child(servers);
@@ -1453,11 +1474,36 @@ impl ConnectorView {
     fn render_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let locale = self.preferences.locale;
         let disconnect_view = cx.entity().downgrade();
+        let disconnect_semantic = match &self.state {
+            AppState::Connected { projection, .. }
+                if matches!(
+                    projection.semantic(),
+                    ProjectionSemantic::Disconnecting | ProjectionSemantic::DisconnectFailed
+                ) =>
+            {
+                Some(projection.semantic())
+            }
+            _ => None,
+        };
         div()
             .flex()
             .flex_col()
             .gap(px(16.0))
             .child(page_title(locale.text("Settings")))
+            .children(self.action_error.as_ref().map(|error| {
+                Callout::new(error.clone(), Tone::Danger).id("connector.settings.action-error")
+            }))
+            .children(disconnect_semantic.map(|semantic| {
+                Callout::new(
+                    locale.text(semantic.message()),
+                    if semantic == ProjectionSemantic::DisconnectFailed {
+                        Tone::Danger
+                    } else {
+                        Tone::Info
+                    },
+                )
+                .id("connector.settings.disconnect-status")
+            }))
             .child(
                 SettingsSection::new("connector.settings.preferences", locale.text("Settings"))
                     .row(
@@ -1479,7 +1525,13 @@ impl ConnectorView {
             )
             .child(
                 Button::new("connector.disconnect")
-                    .label(locale.text("Disconnect Gateway and remove managed configuration"))
+                    .label(locale.text(if disconnect_semantic
+                        == Some(ProjectionSemantic::Disconnecting)
+                    {
+                        "Disconnecting managed files…"
+                    } else {
+                        "Disconnect Gateway and remove managed configuration"
+                    }))
                     .danger()
                     .full_width(true)
                     .disabled(self.projection_busy || self.save_in_flight)
@@ -1511,8 +1563,7 @@ impl ConnectorView {
             connection,
             installs,
             managed_agents,
-            preview,
-            verification,
+            projection,
         } = &self.state
         else {
             unreachable!("connected renderer requires connected state")
@@ -1528,6 +1579,9 @@ impl ConnectorView {
         }
         let profile = &connection.profile;
         let models = &connection.models;
+        let preview = projection.preview_plan();
+        let verification = projection.verification();
+        let projection_semantic = projection.semantic();
         let known_installs = match installs {
             QueryStatus::Known(value) => Some(value),
             _ => None,
@@ -1769,9 +1823,7 @@ impl ConnectorView {
                         Button::new("connector.apply")
                             .label(locale.text("Apply"))
                             .primary()
-                            .disabled(
-                                self.projection_busy || preview.is_none() || verification.is_some(),
-                            )
+                            .disabled(self.projection_busy || !projection.can_apply())
                             .on_click(move |_window, cx| {
                                 let _ = apply_view.update(cx, |this, cx| this.begin_apply(cx));
                             }),
@@ -1780,7 +1832,7 @@ impl ConnectorView {
                         Button::new("connector.verify")
                             .label(locale.text("Verify"))
                             .secondary()
-                            .disabled(self.projection_busy || verification.is_none())
+                            .disabled(self.projection_busy || !projection.can_verify())
                             .on_click(move |_window, cx| {
                                 let _ = verify_view.update(cx, |this, cx| this.begin_verify(cx));
                             }),
@@ -1800,16 +1852,7 @@ impl ConnectorView {
                     Tone::Warning,
                 )
                 .id("connector.no-models")
-            }))
-            .children(
-                (supported_detected > 0 && !models.is_empty() && preview.is_none()).then(|| {
-                    Callout::new(
-                        locale.text("Preview again after changing any Agent protocol or model."),
-                        Tone::Info,
-                    )
-                    .id("connector.preview-required")
-                }),
-            );
+            }));
 
         if let Some(plan) = preview {
             let mut changes = Card::new().id("connector.preview-changes");
@@ -1838,33 +1881,40 @@ impl ConnectorView {
             content = content.child(changes);
         }
 
-        if let Some(verification) = verification {
-            let message = if verification.ok {
-                locale
-                    .text("Applied configuration matches the preview.")
-                    .to_owned()
-            } else {
-                format!(
-                    "Verification found drift:\n{}",
-                    verification
-                        .mismatches
-                        .iter()
-                        .map(|path| path.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                )
+        if !matches!(projection_semantic, ProjectionSemantic::PreviewReady) {
+            let tone = match projection_semantic {
+                ProjectionSemantic::AppliedAwaitingVerification => Tone::Warning,
+                ProjectionSemantic::Verified => Tone::Success,
+                ProjectionSemantic::VerificationFailed
+                | ProjectionSemantic::ApplyFailed
+                | ProjectionSemantic::VerificationError
+                | ProjectionSemantic::DisconnectFailed => Tone::Danger,
+                ProjectionSemantic::PreviewRequired
+                | ProjectionSemantic::ManagedExisting
+                | ProjectionSemantic::Applying
+                | ProjectionSemantic::Verifying
+                | ProjectionSemantic::Disconnecting => Tone::Info,
+                ProjectionSemantic::PreviewReady => unreachable!(),
             };
             content = content.child(
-                Callout::new(
-                    message,
-                    if verification.ok {
-                        Tone::Success
-                    } else {
-                        Tone::Danger
-                    },
-                )
-                .id("connector.verification"),
+                Callout::new(locale.text(projection_semantic.message()), tone)
+                    .id("connector.projection-lifecycle-summary"),
             );
+        }
+
+        if let Some(verification) = verification.filter(|verification| !verification.ok) {
+            let message = format!(
+                "{}\n{}",
+                locale.text("Verification found drift:"),
+                verification
+                    .mismatches
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            content =
+                content.child(Callout::new(message, Tone::Danger).id("connector.verification"));
         }
         Card::new()
             .id("connector.connected")
@@ -2175,4 +2225,21 @@ fn locale_options(distribution: &Distribution) -> Vec<SelectOption> {
         .filter(|locale| distribution.supported_locales.contains(&locale.id()))
         .map(|locale| SelectOption::new(locale.id(), locale.display_name()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProjectionStatusGeneration;
+
+    #[test]
+    fn older_projection_status_results_cannot_replace_newer_evidence() {
+        let mut generation = ProjectionStatusGeneration::default();
+        let older = generation.begin();
+        let newer = generation.begin();
+        assert!(!generation.accepts(older));
+        assert!(generation.accepts(newer));
+
+        generation.invalidate();
+        assert!(!generation.accepts(newer));
+    }
 }

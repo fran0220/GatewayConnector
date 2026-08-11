@@ -804,6 +804,7 @@ mod tests {
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
     use super::*;
+    use crate::{AppState, ProjectionLifecycle, ProjectionSemantic, QueryStatus};
 
     fn test_path(parent: &tempfile::TempDir, name: &str) -> PathBuf {
         fs::canonicalize(parent.path())
@@ -1110,6 +1111,18 @@ mod tests {
                 .iter()
                 .all(|install| install.detected && install.root.starts_with(layout.root()))
         );
+        let mut app_state = AppState::connected(connection.clone());
+        app_state.set_projection_status(
+            QueryStatus::Known(installs),
+            QueryStatus::Known(Default::default()),
+        );
+        let claude_root = layout.agent_roots().root(AgentId::Claude).to_path_buf();
+        let claude_settings = claude_root.join("settings.json");
+        let claude_account = claude_root.join(".claude.json");
+        let original_settings = br#"{"theme":"fixture"}"#;
+        let original_account = br#"{"hasCompletedOnboarding":false}"#;
+        fs::write(&claude_settings, original_settings).expect("initial Claude settings");
+        fs::write(&claude_account, original_account).expect("initial Claude account");
 
         let plan = backend.plan_projection(&connection).expect("preview");
         assert!(!plan.changes.is_empty());
@@ -1118,10 +1131,126 @@ mod tests {
                 .iter()
                 .all(|change| change.path.starts_with(layout.root()))
         );
+        app_state.set_preview(plan);
+        assert_eq!(
+            app_projection_semantic(&app_state),
+            ProjectionSemantic::PreviewReady
+        );
+        assert!(
+            !layout
+                .agent_roots()
+                .root(AgentId::Codex)
+                .join("config.toml")
+                .is_file()
+        );
+
+        fs::remove_file(&claude_account).expect("replace later destination");
+        fs::create_dir(&claude_account).expect("blocking later destination");
+        let rejected_plan = app_state.start_apply().expect("consume failed preview");
+        assert_eq!(
+            app_projection_semantic(&app_state),
+            ProjectionSemantic::Applying
+        );
+        let apply_error = backend
+            .apply_projection(&connection.profile, &rejected_plan)
+            .expect_err("fixture must force an apply error")
+            .to_string();
+        assert!(
+            !apply_error.contains("changed after this plan was created"),
+            "fixture must reach transactional mutation and rollback: {apply_error}"
+        );
+        app_state.fail_apply();
+        assert_eq!(
+            app_projection_semantic(&app_state),
+            ProjectionSemantic::ApplyFailed
+        );
+        assert!(
+            app_state.start_apply().is_none(),
+            "failed preview is consumed"
+        );
+        assert_eq!(
+            fs::read(&claude_settings).expect("rolled-back Claude settings"),
+            original_settings
+        );
+        fs::remove_dir(&claude_account).expect("remove blocking destination");
+        fs::write(&claude_account, original_account).expect("restore Claude account");
+
+        let plan = backend
+            .plan_projection(&connection)
+            .expect("fresh preview after rollback");
+        app_state.set_preview(plan);
+        let plan = app_state.start_apply().expect("consume preview for apply");
+        let applied_plan = plan.clone();
         backend
             .apply_projection(&connection.profile, &plan)
             .expect("apply");
-        assert!(backend.verify_projection(&plan).expect("verify").ok);
+        app_state.finish_apply(plan);
+        assert_eq!(
+            app_projection_semantic(&app_state),
+            ProjectionSemantic::AppliedAwaitingVerification
+        );
+        assert!(matches!(
+            &app_state,
+            AppState::Connected {
+                projection: ProjectionLifecycle::AppliedAwaitingVerification(_),
+                ..
+            }
+        ));
+        assert!(app_state.start_apply().is_none(), "preview is consumed");
+        assert!(
+            layout
+                .agent_roots()
+                .root(AgentId::Codex)
+                .join("config.toml")
+                .is_file()
+        );
+        assert!(
+            !backend
+                .managed_agents(&connection.profile)
+                .expect("ownership after apply")
+                .is_empty()
+        );
+        assert_eq!(
+            app_state.mcp_evidence(),
+            crate::McpEvidence::ConfiguredForAgents
+        );
+
+        let plan = app_state.start_verify().expect("current applied plan");
+        let verification = backend.verify_projection(&plan).expect("verify");
+        assert!(verification.ok);
+        app_state.finish_verify(verification);
+        assert_eq!(
+            app_projection_semantic(&app_state),
+            ProjectionSemantic::Verified
+        );
+        assert!(
+            app_state.start_verify().is_none(),
+            "verification consumes the applied plan"
+        );
+
+        let mut drift_state = AppState::connected(connection.clone());
+        drift_state.set_preview(applied_plan);
+        let drift_plan = drift_state.start_apply().expect("applied plan fixture");
+        drift_state.finish_apply(drift_plan);
+        let codex_config = layout
+            .agent_roots()
+            .root(AgentId::Codex)
+            .join("config.toml");
+        let expected_config = fs::read(&codex_config).expect("managed config");
+        fs::write(&codex_config, b"changed outside GatewayConnector\n").expect("introduce drift");
+        let drift_plan = drift_state.start_verify().expect("verify applied state");
+        let drift = backend
+            .verify_projection(&drift_plan)
+            .expect("drift report");
+        assert!(!drift.ok);
+        assert!(drift.mismatches.contains(&codex_config));
+        drift_state.finish_verify(drift);
+        assert_eq!(
+            app_projection_semantic(&drift_state),
+            ProjectionSemantic::VerificationFailed
+        );
+        assert!(drift_state.start_verify().is_none());
+        fs::write(&codex_config, expected_config).expect("restore managed config after drift test");
         drop(backend);
 
         let resumed_backend = isolated_backend(&layout, Arc::clone(&credentials));
@@ -1130,9 +1259,40 @@ mod tests {
             .expect("resume")
             .expect("saved connection");
         assert_eq!(resumed.profile.id, connection.profile.id);
+        let mut resumed_state = AppState::connected(resumed.clone());
+        resumed_state.set_projection_status(
+            QueryStatus::Known(resumed_backend.discover_agents().expect("resumed installs")),
+            QueryStatus::Known(
+                resumed_backend
+                    .managed_agents(&resumed.profile)
+                    .expect("resumed ownership"),
+            ),
+        );
+        assert_eq!(
+            app_projection_semantic(&resumed_state),
+            ProjectionSemantic::ManagedExisting
+        );
+        assert_ne!(
+            app_projection_semantic(&resumed_state),
+            ProjectionSemantic::PreviewReady
+        );
+        resumed_state.start_disconnect();
+        assert_eq!(
+            app_projection_semantic(&resumed_state),
+            ProjectionSemantic::Disconnecting
+        );
         resumed_backend
             .disconnect(&resumed.profile)
             .expect("disconnect");
+        resumed_state = AppState::FirstRun;
+        assert!(matches!(resumed_state, AppState::FirstRun));
+        assert!(
+            !layout
+                .agent_roots()
+                .root(AgentId::Codex)
+                .join("config.toml")
+                .exists()
+        );
         assert!(
             credentials
                 .get(&resumed.profile)
@@ -1155,6 +1315,13 @@ mod tests {
                 .join("transactions")
                 .starts_with(layout.root())
         );
+    }
+
+    fn app_projection_semantic(state: &AppState) -> ProjectionSemantic {
+        let AppState::Connected { projection, .. } = state else {
+            panic!("expected connected app state")
+        };
+        projection.semantic()
     }
 
     #[test]
@@ -1183,6 +1350,33 @@ mod tests {
                 .synchronized_skills
                 .values()
                 .all(|path| path.starts_with(layout.root()))
+        );
+        assert_eq!(
+            connected
+                .provisioning
+                .as_ref()
+                .expect("provisioning")
+                .mcp_servers
+                .len(),
+            1
+        );
+        let mut app_state = AppState::connected(connected.clone());
+        assert_eq!(
+            app_state.mcp_evidence(),
+            crate::McpEvidence::AvailableFromPlatform
+        );
+        let plan = backend
+            .plan_projection(&connected)
+            .expect("provisioned preview");
+        app_state.set_preview(plan);
+        let plan = app_state.start_apply().expect("provisioned apply state");
+        backend
+            .apply_projection(&connected.profile, &plan)
+            .expect("provisioned apply");
+        app_state.finish_apply(plan);
+        assert_eq!(
+            app_state.mcp_evidence(),
+            crate::McpEvidence::ConfiguredForAgents
         );
         drop(backend);
 
@@ -1280,7 +1474,7 @@ mod tests {
                 "platform": {"id": "isolated-test", "name": "Isolated Test"},
                 "gateway": {"base_url": base_url, "protocols": ["openai_chat"]},
                 "provisioning_url": format!("{base_url}/provisioning"),
-                "connection_bearer_origins": [base_url],
+                "connection_bearer_origins": [base_url, "https://services.example"],
                 "supported_agents": ["claude", "codex", "gemini", "grokbuild", "opencode"]
             }
         })
@@ -1291,7 +1485,12 @@ mod tests {
                 "schema_version": 2,
                 "models": [{"id": "catalog-model", "chat_capable": true}],
                 "default_model": "catalog-model",
-                "mcp_servers": [],
+                "mcp_servers": [{
+                    "id": "fixture-docs",
+                    "name": "Fixture Docs MCP",
+                    "url": "https://services.example/mcp/docs",
+                    "authorization": "connection_bearer"
+                }],
                 "skills": [{
                     "id": "isolated-skill",
                     "name": "Isolated Skill",
