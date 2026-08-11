@@ -357,7 +357,8 @@ mod tests {
                 Provisioning, Secret,
             };
             let temp = tempfile::tempdir().expect("temp");
-            let root = temp.path().join("codex");
+            let temp_root = std::fs::canonicalize(temp.path()).expect("canonical temp root");
+            let root = temp_root.join("codex");
             std::fs::create_dir(&root).expect("Agent root");
             let manifest = ConnectionManifest::direct(
                 Platform {
@@ -384,7 +385,7 @@ mod tests {
                 "model-a".into(),
             )
             .expect("provisioning");
-            Connector::new(temp.path().join("state"))
+            Connector::new(temp_root.join("state"))
                 .plan(ApplyInput {
                     manifest: &manifest,
                     provisioning: &provisioning,
