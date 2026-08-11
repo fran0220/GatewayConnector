@@ -206,11 +206,16 @@ fn create_temporary(path: &Path) -> Result<(PathBuf, fs::File), StoreError> {
     )))
 }
 
+#[cfg(unix)]
 fn sync_parent(parent: &Path) -> Result<(), StoreError> {
-    #[cfg(unix)]
     fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(StoreError::Io)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_parent: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
