@@ -21,6 +21,7 @@ pub struct Distribution {
     pub keyring_service: &'static str,
     pub bundle_id: &'static str,
     pub supported_locales: &'static [&'static str],
+    /// Optional wrapper-owned icon rendered by the shared connected shell.
     pub asset_identity: Option<AssetIdentity>,
     pub release_metadata: Option<ReleaseMetadata>,
     /// Schema-v2 `client` value. This is the only product identifier sent to auth.
@@ -85,6 +86,14 @@ impl Distribution {
         {
             return Err(DistributionError::InvalidId("supported_locales"));
         }
+        if let Some(identity) = self.asset_identity {
+            if !portable_id(identity.icon_key) {
+                return Err(DistributionError::InvalidId("asset_identity.icon_key"));
+            }
+            if !embedded_svg_path(identity.icon_path) {
+                return Err(DistributionError::InvalidAssetPath);
+            }
+        }
         Ok(())
     }
 }
@@ -115,9 +124,25 @@ fn locale_tag(value: &str) -> bool {
         })
 }
 
-#[derive(Debug, Clone, Copy)]
+fn embedded_svg_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.ends_with(".svg")
+        && value.split('/').all(|component| {
+            !component.is_empty()
+                && component.len() <= 128
+                && !matches!(component, "." | "..")
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AssetIdentity {
+    /// Stable GPUI element identity for the distribution-owned shell icon.
     pub icon_key: &'static str,
+    /// Relative virtual SVG path served by the active GPUI `AssetSource`.
     pub icon_path: &'static str,
 }
 
@@ -149,6 +174,68 @@ pub enum DistributionError {
     InvalidText,
     #[error("distribution field {0} is not a secure URL")]
     InvalidUrl(&'static str),
+    #[error("distribution asset icon path must be a safe relative virtual .svg path")]
+    InvalidAssetPath,
     #[error("a distribution that disables custom URLs must configure a default Gateway URL")]
     MissingDefaultGateway,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn branded_distribution() -> Distribution {
+        Distribution {
+            product_id: "example-connector",
+            product_name: "Example Connector",
+            allow_isolated_root: false,
+            asset_identity: Some(AssetIdentity {
+                icon_key: "example-connector-shell-icon",
+                icon_path: "brand/example-connector.svg",
+            }),
+            ..GENERIC_DISTRIBUTION
+        }
+    }
+
+    #[test]
+    fn validates_embedded_distribution_asset_identity() {
+        let branded = branded_distribution();
+        branded.validate().expect("valid branded distribution");
+        assert!(!branded.allow_isolated_root);
+
+        let invalid_key = Distribution {
+            asset_identity: Some(AssetIdentity {
+                icon_key: "Example Connector",
+                icon_path: "brand/example.svg",
+            }),
+            ..branded
+        };
+        assert!(matches!(
+            invalid_key.validate(),
+            Err(DistributionError::InvalidId("asset_identity.icon_key"))
+        ));
+
+        for icon_path in [
+            "",
+            "/brand/example.svg",
+            "../brand/example.svg",
+            "brand/../example.svg",
+            "brand\\example.svg",
+            "brand//example.svg",
+            "brand/example.png",
+            "https://example.com/icon.svg",
+        ] {
+            let invalid_path = Distribution {
+                asset_identity: Some(AssetIdentity {
+                    icon_key: "example-connector-shell-icon",
+                    icon_path,
+                }),
+                ..branded
+            };
+            assert!(matches!(
+                invalid_path.validate(),
+                Err(DistributionError::InvalidAssetPath)
+            ));
+        }
+    }
 }

@@ -25,7 +25,7 @@ jobs:
           rustup default 1.97.0
       - run: cargo fmt --all -- --check
       - name: Full native workspace tests
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo check -p gateway-connector-app --features gpui-app
       - name: Stage unsigned macOS release package
@@ -45,7 +45,7 @@ jobs:
           rustup default 1.97.0
       - run: cargo test -p gateway-connector-core
       - name: Native isolated-layout tests
-        run: cargo test -p gateway-connector-app --lib
+        run: cargo test -p gateway-connector-app --lib --features gpui-app
       - name: Native Windows catalog path tests
         run: cargo test -p gateway-connector-backend --lib
       - name: Native Windows all-feature clippy

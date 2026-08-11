@@ -5,7 +5,7 @@ GatewayConnector separates shared behavior from compile-time product identity.
 accepted by the shared backend and GPUI runner.
 
 ```rust
-use gateway_connector_backend::{Distribution, ReleaseMetadata};
+use gateway_connector_backend::{AssetIdentity, Distribution, ReleaseMetadata};
 
 pub static DISTRIBUTION: Distribution = Distribution {
     product_id: "example-connector",
@@ -21,7 +21,10 @@ pub static DISTRIBUTION: Distribution = Distribution {
     keyring_service: "com.example.connector",
     bundle_id: "com.example.connector",
     supported_locales: &["en", "zh-CN"],
-    asset_identity: None,
+    asset_identity: Some(AssetIdentity {
+        icon_key: "example-connector-shell-icon",
+        icon_path: "brand/example-connector.svg",
+    }),
     release_metadata: Some(ReleaseMetadata {
         repository: "example/connector",
         download_url: None,
@@ -31,7 +34,7 @@ pub static DISTRIBUTION: Distribution = Distribution {
 };
 
 fn main() {
-    gateway_connector_app::gpui_app::run(&DISTRIBUTION);
+    gateway_connector_app::gpui_app::run_with_assets(&DISTRIBUTION, ExampleAssets);
 }
 ```
 
@@ -43,12 +46,25 @@ before vault, profile, or network access and uses it for:
 - `ProjectDirs` state identity and OS keyring service;
 - window title and supported neutral locales;
 - browser-PKCE client/device values;
-- optional compile-time asset and release metadata for the wrapper/packager.
+- optional compile-time shell-icon and release metadata for the wrapper/packager.
 
-Wrappers that embed branded assets can call
-`gateway_connector_app::gpui_app::run_with_assets(&DISTRIBUTION, assets)`.
-Their `AssetSource` should delegate unknown neutral icon and font paths to
-`gpui_kit::assets::Assets`; the generic `run` function does this automatically.
+`asset_identity` configures the icon beside `product_name` in the shared
+connected-shell header. `icon_key` is a stable lowercase portable GPUI element
+identity. `icon_path` is a relative virtual `.svg` path made from alphanumeric,
+`.`, `_`, and `-` path components, for example `brand/example-connector.svg`;
+filesystem paths, URLs, backslashes, empty components, and `.`/`..` are
+rejected. This identity does not parameterize native package resources.
+
+Wrappers with an asset identity must call
+`gateway_connector_app::gpui_app::run_with_assets(&DISTRIBUTION, assets)` and
+serve non-empty SVG bytes for `icon_path`. The runner checks that lookup before
+constructing stores or opening the application. GPUI then resolves the same
+virtual path through that active `AssetSource` when it renders the shared
+header. The wrapper source must delegate every unknown path, including neutral
+icons and fonts, to `gpui_kit::assets::Assets`, and should include its branded
+path in `list` results for matching prefixes. The generic distribution keeps
+`asset_identity: None`; `run` supplies gpui-kit's neutral assets and the shared
+header retains its neutral globe fallback.
 
 `expected_platform_id` pins a manifest's platform. Setting
 `allow_custom_urls=false` requires `default_gateway_url`; saved profiles and

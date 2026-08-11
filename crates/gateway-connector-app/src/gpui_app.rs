@@ -15,10 +15,25 @@ use gateway_connector_core::{AgentId, CanonicalBaseUrl, ChangeKind, ConnectionPr
 use gpui::{
     App, AssetSource, Bounds, Context, Entity, FontWeight, IntoElement, ParentElement, Render,
     Styled, TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowOptions, div,
-    prelude::*, px, size,
+    prelude::*, px, size, svg,
 };
 use gpui_kit::{assets::Icon, prelude::*};
 use zeroize::Zeroize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellIconIdentity {
+    Neutral,
+    Distribution(gateway_connector_backend::AssetIdentity),
+}
+
+impl ShellIconIdentity {
+    const fn for_distribution(distribution: &Distribution) -> Self {
+        match distribution.asset_identity {
+            Some(identity) => Self::Distribution(identity),
+            None => Self::Neutral,
+        }
+    }
+}
 
 enum ConnectOutcome {
     Connected(Box<ConnectionResult>),
@@ -1173,7 +1188,7 @@ impl ConnectorView {
                     .items_center()
                     .gap(px(10.0))
                     .p(px(8.0))
-                    .child(gpui_kit::assets::icon(Icon::Global).size(px(18.0)))
+                    .child(shell_icon(self.distribution, cx))
                     .child(
                         div()
                             .font_weight(FontWeight::SEMIBOLD)
@@ -2007,6 +2022,25 @@ fn agent_icon(agent: AgentId) -> Icon {
     }
 }
 
+fn shell_icon(distribution: &Distribution, cx: &mut Context<ConnectorView>) -> gpui::AnyElement {
+    match ShellIconIdentity::for_distribution(distribution) {
+        ShellIconIdentity::Neutral => gpui_kit::assets::icon(Icon::Global)
+            .size(px(18.0))
+            .into_any_element(),
+        ShellIconIdentity::Distribution(identity) => div()
+            .id(identity.icon_key)
+            .size(px(18.0))
+            .flex_none()
+            .child(
+                svg()
+                    .path(identity.icon_path)
+                    .size_full()
+                    .text_color(cx.theme().colors.text),
+            )
+            .into_any_element(),
+    }
+}
+
 fn activate_theme_for(appearance: WindowAppearance, cx: &mut App) {
     let theme = match appearance {
         WindowAppearance::Light | WindowAppearance::VibrantLight => "studio-light",
@@ -2076,7 +2110,8 @@ pub fn run_launch(distribution: &'static Distribution, request: LaunchRequest) {
 }
 
 /// Runs a distribution with a wrapper-owned asset source. Downstream sources
-/// should delegate unknown neutral icon/font paths to `gpui_kit::assets::Assets`.
+/// must serve the configured distribution icon and delegate unknown neutral
+/// icon/font paths to `gpui_kit::assets::Assets`.
 pub fn run_with_assets(distribution: &'static Distribution, assets: impl AssetSource) {
     run_launch_with_assets(distribution, LaunchRequest::Normal, assets);
 }
@@ -2089,6 +2124,8 @@ fn run_launch_with_assets(
     distribution
         .validate()
         .expect("validate GatewayConnector distribution");
+    validate_shell_asset_source(distribution, &assets)
+        .expect("validate GatewayConnector distribution asset source");
     assert!(
         !matches!(&request, LaunchRequest::Isolated(_)) || distribution.allow_isolated_root,
         "this GatewayConnector distribution disables isolated-root mode"
@@ -2219,6 +2256,32 @@ fn run_launch_with_assets(
     });
 }
 
+fn validate_shell_asset_source(
+    distribution: &Distribution,
+    assets: &impl AssetSource,
+) -> Result<(), String> {
+    let ShellIconIdentity::Distribution(identity) =
+        ShellIconIdentity::for_distribution(distribution)
+    else {
+        return Ok(());
+    };
+    match assets.load(identity.icon_path) {
+        Ok(Some(bytes)) if !bytes.is_empty() => Ok(()),
+        Ok(Some(_)) => Err(format!(
+            "distribution shell icon `{}` is empty",
+            identity.icon_path
+        )),
+        Ok(None) => Err(format!(
+            "distribution shell icon `{}` is not provided by the active AssetSource",
+            identity.icon_path
+        )),
+        Err(error) => Err(format!(
+            "distribution shell icon `{}` could not be loaded: {error}",
+            identity.icon_path
+        )),
+    }
+}
+
 fn locale_options(distribution: &Distribution) -> Vec<SelectOption> {
     Locale::ALL
         .into_iter()
@@ -2229,7 +2292,16 @@ fn locale_options(distribution: &Distribution) -> Vec<SelectOption> {
 
 #[cfg(test)]
 mod tests {
-    use super::ProjectionStatusGeneration;
+    use std::{
+        borrow::Cow,
+        sync::{Arc, Mutex},
+    };
+
+    use gateway_connector_backend::{AssetIdentity, Distribution, GENERIC_DISTRIBUTION};
+    use gpui::{AssetSource, SharedString};
+    use gpui_kit::assets::Icon;
+
+    use super::{ProjectionStatusGeneration, ShellIconIdentity, validate_shell_asset_source};
 
     #[test]
     fn older_projection_status_results_cannot_replace_newer_evidence() {
@@ -2241,5 +2313,93 @@ mod tests {
 
         generation.invalidate();
         assert!(!generation.accepts(newer));
+    }
+
+    #[test]
+    fn configured_shell_icon_is_loaded_through_delegating_asset_source() {
+        const ICON_PATH: &str = "brand/example-connector.svg";
+        let branded = Distribution {
+            product_id: "example-connector",
+            product_name: "Example Connector",
+            allow_isolated_root: false,
+            asset_identity: Some(AssetIdentity {
+                icon_key: "example-connector-shell-icon",
+                icon_path: ICON_PATH,
+            }),
+            ..GENERIC_DISTRIBUTION
+        };
+        assert_eq!(
+            ShellIconIdentity::for_distribution(&branded),
+            ShellIconIdentity::Distribution(branded.asset_identity.expect("asset identity"))
+        );
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let assets = WrapperAssets {
+            requests: Arc::clone(&requests),
+        };
+        validate_shell_asset_source(&branded, &assets).expect("wrapper serves shell icon");
+        assert_eq!(requests.lock().expect("requests").as_slice(), [ICON_PATH]);
+        assert!(
+            assets
+                .load(Icon::Global.path())
+                .expect("neutral icon")
+                .is_some()
+        );
+        let listed = assets.list("icons/").expect("delegated neutral list");
+        assert!(listed.iter().any(|path| path == Icon::Global.path()));
+        assert_eq!(assets.list("brand/").expect("wrapper list"), [ICON_PATH]);
+        assert!(!branded.allow_isolated_root);
+    }
+
+    #[test]
+    fn generic_fallback_needs_no_distribution_asset_and_missing_brand_fails() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let assets = WrapperAssets {
+            requests: Arc::clone(&requests),
+        };
+        validate_shell_asset_source(&GENERIC_DISTRIBUTION, &assets)
+            .expect("neutral fallback is built into the shared renderer");
+        assert_eq!(
+            ShellIconIdentity::for_distribution(&GENERIC_DISTRIBUTION),
+            ShellIconIdentity::Neutral
+        );
+        assert!(requests.lock().expect("requests").is_empty());
+
+        let missing = Distribution {
+            asset_identity: Some(AssetIdentity {
+                icon_key: "missing-shell-icon",
+                icon_path: "brand/missing.svg",
+            }),
+            ..GENERIC_DISTRIBUTION
+        };
+        assert!(validate_shell_asset_source(&missing, &assets).is_err());
+    }
+
+    struct WrapperAssets {
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl AssetSource for WrapperAssets {
+        fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(path.to_owned());
+            if path == "brand/example-connector.svg" {
+                Ok(Some(Cow::Borrowed(
+                    br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/></svg>"#,
+                )))
+            } else {
+                gpui_kit::assets::Assets.load(path)
+            }
+        }
+
+        fn list(&self, prefix: &str) -> gpui::Result<Vec<SharedString>> {
+            let mut assets = gpui_kit::assets::Assets.list(prefix)?;
+            if "brand/example-connector.svg".starts_with(prefix) {
+                assets.push("brand/example-connector.svg".into());
+            }
+            Ok(assets)
+        }
     }
 }

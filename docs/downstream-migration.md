@@ -35,10 +35,15 @@ Windows native/release gate, and wrapper acceptance pass.
 1. Freeze connector behavior in the wrapper and record the currently owned
    Agent roots, coordinator state, and disconnect behavior.
 2. Add one compile-time `Distribution` value using wrapper-owned product IDs,
-   URLs, platform pin, keyring/bundle identity, locales, assets, and release
-   metadata.
+   URLs, platform pin, keyring/bundle identity, locales, `AssetIdentity`, and
+   release metadata. Keep `allow_isolated_root: false`.
 3. Replace the copied connector client entry point with
-   `gateway_connector_app::gpui_app::run(&DISTRIBUTION)`.
+   `gateway_connector_app::gpui_app::run_with_assets(&DISTRIBUTION, assets)`.
+   The wrapper-owned `AssetSource` must serve the configured relative virtual
+   `.svg` path and delegate all unknown neutral icon/font paths to
+   `gpui_kit::assets::Assets`. The shared connected-shell header renders that
+   asset; wrappers do not need to copy the UI. Use `run` only when
+   `asset_identity` is `None` and the neutral globe is intended.
 4. Remove duplicated neutral core/backend/app modules only after the wrapper
    compiles and reads existing shared coordinator ownership correctly.
 5. Keep platform account/OAuth registration, branded pages/assets, packaging,
