@@ -80,6 +80,9 @@ impl PkceFlow {
         let code = loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // A socket accepted from a nonblocking listener may inherit that mode on
+                    // some platforms. Callback reads deliberately use the timeout below.
+                    stream.set_nonblocking(false)?;
                     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
                     let mut bytes = Vec::new();
                     let mut byte = [0];
@@ -225,6 +228,7 @@ mod tests {
         WrongPath,
         WrongState,
         Code,
+        DelayedCode,
         Denied,
     }
 
@@ -273,10 +277,15 @@ mod tests {
                         redirect.port().expect("callback port"),
                     ))
                     .expect("connect callback");
+                    if matches!(callback, Callback::DelayedCode) {
+                        thread::sleep(Duration::from_millis(100));
+                    }
                     let target = match callback {
                         Callback::WrongPath => format!("/other?code=ignored&state={state}"),
                         Callback::WrongState => "/callback?code=ignored&state=wrong".to_owned(),
-                        Callback::Code => format!("/callback?code=test-code&state={state}"),
+                        Callback::Code | Callback::DelayedCode => {
+                            format!("/callback?code=test-code&state={state}")
+                        }
                         Callback::Denied => {
                             format!("/callback?error=access_denied&state={state}")
                         }
@@ -378,6 +387,27 @@ mod tests {
         assert_eq!(request["code_verifier"], "fixed-verifier");
         assert_eq!(request["redirect_uri"], query["redirect_uri"]);
         assert_eq!(request.as_object().expect("object").len(), 3);
+    }
+
+    #[test]
+    fn callback_may_connect_before_writing_request() {
+        let (token_url, token_handle) = spawn_token_response(
+            200,
+            r#"{"access_token":"token","token_type":"Bearer"}"#,
+            None,
+        );
+        let browser = CallbackBrowser::new(vec![Callback::DelayedCode]);
+        let token = PkceFlow::from_parts("verifier".into(), "state".into())
+            .login(
+                &Url::parse("https://platform.example/authorize").expect("authorize URL"),
+                &token_url,
+                "client",
+                "device",
+                &browser,
+            )
+            .expect("delayed callback login");
+        assert_eq!(token.expose_secret(), "token");
+        token_handle.join().expect("token server");
     }
 
     #[test]

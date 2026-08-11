@@ -13,8 +13,8 @@ use thiserror::Error;
 
 use crate::{
     ApiKey, Browser, CredentialStore, DiscoveryError, Distribution, DistributionError,
-    GENERIC_DISTRIBUTION, GatewayClient, ManifestLocation, ModelDescriptor, ProfileStore,
-    StoreError, SystemBrowser, VaultError,
+    GENERIC_DISTRIBUTION, GatewayClient, ManifestLocation, ModelCapability, ModelDescriptor,
+    ProfileStore, StoreError, SystemBrowser, VaultError,
 };
 
 #[derive(Debug)]
@@ -235,12 +235,20 @@ impl ConnectorBackend {
             .projection
             .as_ref()
             .ok_or(BackendError::ProjectionNotConfigured)?;
+        if connection.profile.mode == ConnectionMode::Direct
+            && self.single_profile()?.as_ref() != Some(&connection.profile)
+        {
+            return Err(BackendError::ProjectionContext(
+                "the active direct profile must be saved exactly as edited before preview".into(),
+            ));
+        }
         let bearer = self
             .credentials
             .get(&connection.profile)?
             .ok_or(BackendError::MissingCredential)?;
         let secret = core_secret(&bearer)?;
-        let (manifest, provisioning) = self.projection_contracts(connection)?;
+        let installs = runtime.discovery.discover(&runtime.home);
+        let (manifest, provisioning) = self.projection_contracts(connection, &installs)?;
         let selected_models = connection
             .profile
             .agents
@@ -259,7 +267,7 @@ impl ConnectorBackend {
                 provisioning: &provisioning,
                 bearer: &secret,
                 selected_models,
-                installs: runtime.discovery.discover(&runtime.home),
+                installs,
                 synchronized_skills: connection.synchronized_skills.clone(),
             })
             .map_err(Into::into)
@@ -729,6 +737,7 @@ impl ConnectorBackend {
     fn projection_contracts(
         &self,
         connection: &ConnectionResult,
+        installs: &[AgentInstall],
     ) -> Result<(ConnectionManifest, Provisioning), BackendError> {
         match connection.profile.mode {
             ConnectionMode::Direct => {
@@ -739,6 +748,48 @@ impl ConnectorBackend {
                     return Err(BackendError::ProjectionContext(
                         "direct connection contains platform-only data".into(),
                     ));
+                }
+                let catalog = connection
+                    .models
+                    .iter()
+                    .map(|model| (model.id.as_str(), model))
+                    .collect::<BTreeMap<_, _>>();
+                let mut explicitly_selected = Vec::new();
+                for install in installs.iter().filter(|install| install.detected) {
+                    let model_id = connection.profile.agents[&install.agent]
+                        .default_model
+                        .as_deref()
+                        .ok_or_else(|| {
+                            BackendError::ProjectionContext(format!(
+                                "{} requires an explicit direct model selection",
+                                install.agent.display_name()
+                            ))
+                        })?;
+                    let model = catalog.get(model_id).ok_or_else(|| {
+                        BackendError::ProjectionContext(format!(
+                            "selected direct model `{model_id}` is not in the discovered catalog"
+                        ))
+                    })?;
+                    match model.capability {
+                        ModelCapability::Chat => {}
+                        ModelCapability::NonChat => {
+                            return Err(BackendError::ProjectionContext(format!(
+                                "selected direct model `{model_id}` is explicitly non-chat"
+                            )));
+                        }
+                        ModelCapability::Unknown
+                            if !connection
+                                .profile
+                                .confirmed_direct_models
+                                .contains(model_id) =>
+                        {
+                            return Err(BackendError::ProjectionContext(format!(
+                                "selected direct model `{model_id}` has unknown capability and is not confirmed"
+                            )));
+                        }
+                        ModelCapability::Unknown => {}
+                    }
+                    explicitly_selected.push(model_id.to_owned());
                 }
                 let protocols = connection
                     .profile
@@ -763,6 +814,7 @@ impl ConnectorBackend {
                 let models = connection
                     .models
                     .iter()
+                    .filter(|model| explicitly_selected.contains(&model.id))
                     .map(|model| Model {
                         id: model.id.clone(),
                         chat_capable: true,
@@ -772,10 +824,11 @@ impl ConnectorBackend {
                         vendor: None,
                     })
                     .collect::<Vec<_>>();
-                let default_model = models
-                    .first()
-                    .map(|model| model.id.clone())
-                    .unwrap_or_default();
+                let default_model = explicitly_selected.first().cloned().ok_or_else(|| {
+                    BackendError::ProjectionContext(
+                        "no detected Agent is available for direct projection".into(),
+                    )
+                })?;
                 Ok((manifest, Provisioning::direct(models, default_model)?))
             }
             ConnectionMode::Provisioned => {
@@ -869,6 +922,7 @@ fn models_from_provisioning(value: &Provisioning) -> Vec<ModelDescriptor> {
         .filter(|m| m.chat_capable)
         .map(|m| ModelDescriptor {
             id: m.id.clone(),
+            capability: ModelCapability::Chat,
             owned_by: m.vendor.as_ref().map(|v| v.name.clone()),
             created: None,
             object: Some("model".into()),

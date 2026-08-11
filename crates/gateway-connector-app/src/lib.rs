@@ -2,8 +2,10 @@
 
 use std::collections::BTreeSet;
 
-use gateway_connector_backend::{BrowserLoginOffer, ConnectionResult};
-use gateway_connector_core::{AgentId, AgentInstall, Plan, Protocol, Provisioning, Verification};
+use gateway_connector_backend::{BrowserLoginOffer, ConnectionResult, ModelCapability};
+use gateway_connector_core::{
+    AgentId, AgentInstall, ConnectionMode, Plan, Protocol, Provisioning, Verification,
+};
 
 pub mod preferences;
 
@@ -81,20 +83,28 @@ pub enum AppState {
     BrowserLogin(Box<BrowserLoginOffer>),
     Connected {
         connection: Box<ConnectionResult>,
-        installs: Vec<AgentInstall>,
-        managed_agents: BTreeSet<AgentId>,
+        installs: QueryStatus<Vec<AgentInstall>>,
+        managed_agents: QueryStatus<BTreeSet<AgentId>>,
         preview: Option<Box<Plan>>,
         verification: Option<Verification>,
     },
     Failed(String),
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum QueryStatus<T> {
+    #[default]
+    Unknown,
+    Known(T),
+    Error(String),
+}
+
 impl AppState {
     pub fn connected(result: ConnectionResult) -> Self {
         Self::Connected {
             connection: Box::new(result),
-            installs: Vec::new(),
-            managed_agents: BTreeSet::new(),
+            installs: QueryStatus::Unknown,
+            managed_agents: QueryStatus::Unknown,
             preview: None,
             verification: None,
         }
@@ -130,10 +140,50 @@ impl AppState {
         }
     }
 
+    /// Applies an explicit picker choice, including the confirmation required for an
+    /// unknown-capability model in direct mode.
+    pub fn select_model(&mut self, agent: AgentId, model_id: String) -> Result<(), String> {
+        let Self::Connected {
+            connection,
+            preview,
+            verification,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        let capability = connection
+            .models
+            .iter()
+            .find(|model| model.id == model_id)
+            .map(|model| model.capability)
+            .ok_or_else(|| format!("Model `{model_id}` is not in the catalog"))?;
+        if capability == ModelCapability::NonChat {
+            return Err(format!("Model `{model_id}` is not chat-capable"));
+        }
+        if connection.profile.mode == ConnectionMode::Direct
+            && capability == ModelCapability::Unknown
+        {
+            connection
+                .profile
+                .confirm_direct_model(model_id.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        connection
+            .profile
+            .agents
+            .get_mut(&agent)
+            .expect("all Agent selections exist")
+            .default_model = Some(model_id);
+        *preview = None;
+        *verification = None;
+        Ok(())
+    }
+
     pub fn set_projection_status(
         &mut self,
-        installs: Vec<AgentInstall>,
-        managed_agents: BTreeSet<AgentId>,
+        installs: QueryStatus<Vec<AgentInstall>>,
+        managed_agents: QueryStatus<BTreeSet<AgentId>>,
     ) {
         if let Self::Connected {
             installs: current_installs,
@@ -180,6 +230,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gateway_connector_backend::ModelDescriptor;
     use gateway_connector_core::{CanonicalBaseUrl, ConnectionProfile};
 
     #[test]
@@ -220,6 +271,80 @@ mod tests {
         }
         assert!(Page::Agent(AgentId::Claude).available(None));
         assert!(Page::Settings.available(None));
+    }
+
+    #[test]
+    fn projection_status_preserves_independent_errors() {
+        let mut state = connected_fixture(Vec::new());
+        state.set_projection_status(
+            QueryStatus::Error("discovery failed".into()),
+            QueryStatus::Error("coordinator failed".into()),
+        );
+        let AppState::Connected {
+            installs,
+            managed_agents,
+            ..
+        } = state
+        else {
+            panic!("connected")
+        };
+        assert!(matches!(installs, QueryStatus::Error(error) if error == "discovery failed"));
+        assert_eq!(
+            managed_agents,
+            QueryStatus::Error("coordinator failed".into())
+        );
+    }
+
+    #[test]
+    fn explicit_unknown_selection_confirms_but_non_chat_is_rejected() {
+        let models = [
+            ("unknown", ModelCapability::Unknown),
+            ("embedding", ModelCapability::NonChat),
+        ]
+        .into_iter()
+        .map(|(id, capability)| ModelDescriptor {
+            id: id.into(),
+            capability,
+            owned_by: None,
+            created: None,
+            object: None,
+            metadata: Default::default(),
+        })
+        .collect();
+        let mut state = connected_fixture(models);
+        state
+            .select_model(AgentId::Claude, "unknown".into())
+            .expect("explicit confirmation");
+        let AppState::Connected { connection, .. } = &state else {
+            panic!("connected")
+        };
+        assert!(
+            connection
+                .profile
+                .confirmed_direct_models
+                .contains("unknown")
+        );
+        assert!(
+            state
+                .select_model(AgentId::Claude, "embedding".into())
+                .is_err()
+        );
+    }
+
+    fn connected_fixture(models: Vec<ModelDescriptor>) -> AppState {
+        let profile = ConnectionProfile::new(
+            "Test",
+            CanonicalBaseUrl::parse("https://example.com").expect("URL"),
+            Protocol::Auto,
+        )
+        .expect("profile");
+        AppState::connected(ConnectionResult {
+            profile,
+            models,
+            manifest: None,
+            provisioning: None,
+            synchronized_skills: Default::default(),
+        })
     }
 
     struct PlanFixture;

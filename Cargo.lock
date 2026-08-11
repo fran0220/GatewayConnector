@@ -1950,6 +1950,7 @@ dependencies = [
  "sys-locale",
  "tempfile",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -1960,6 +1961,7 @@ dependencies = [
  "fs2",
  "gateway-connector-core",
  "keyring",
+ "libc",
  "rand 0.9.5",
  "reqwest",
  "serde",

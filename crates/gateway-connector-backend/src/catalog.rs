@@ -67,6 +67,17 @@ impl SkillCatalog {
         provisioning: &Provisioning,
         token: &ApiKey,
     ) -> Result<BTreeMap<String, PathBuf>, CatalogError> {
+        self.synchronize_with_limits(manifest, provisioning, token, MAX_ENTRIES, MAX_EXPANDED)
+    }
+
+    fn synchronize_with_limits(
+        &self,
+        manifest: &ConnectionManifest,
+        provisioning: &Provisioning,
+        token: &ApiKey,
+        max_entries: usize,
+        max_expanded: u64,
+    ) -> Result<BTreeMap<String, PathBuf>, CatalogError> {
         let parent = self.state_dir.join("synchronized-skills");
         fs::create_dir_all(&parent).map_err(io(&parent))?;
         reject_non_directory(&parent)?;
@@ -92,10 +103,21 @@ impl SkillCatalog {
         let previous = transaction_path(&root, "previous", &nonce)?;
         reject_existing_special(&staged)?;
         let result = (|| {
+            // Authentication, digest checks, and all central-directory budget checks complete
+            // before the transaction creates or extracts into its staging directory.
+            let archives = provisioning
+                .skills
+                .iter()
+                .map(|skill| self.download(manifest, skill, token))
+                .collect::<Result<Vec<_>, _>>()?;
+            preflight_catalog(&archives, max_entries, max_expanded)?;
             fs::create_dir(&staged).map_err(io(&staged))?;
-            for skill in &provisioning.skills {
-                let bytes = self.download(manifest, skill, token)?;
-                extract_zip(&bytes, &staged.join(&skill.id))?;
+            let mut actual_budget = ExtractionBudget {
+                entries: max_entries,
+                expanded: max_expanded,
+            };
+            for (skill, bytes) in provisioning.skills.iter().zip(&archives) {
+                extract_zip_shared(bytes, &staged.join(&skill.id), &mut actual_budget)?;
             }
             if root.exists() {
                 fs::rename(&root, &previous).map_err(io(&root))?;
@@ -205,6 +227,41 @@ impl SkillCatalog {
         }
         unreachable!()
     }
+}
+
+fn preflight_catalog(
+    archives: &[Vec<u8>],
+    max_entries: usize,
+    max_expanded: u64,
+) -> Result<(), CatalogError> {
+    let mut entries = 0usize;
+    let mut expanded = 0u64;
+    for bytes in archives {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+            .map_err(|_| CatalogError::Invalid("invalid ZIP".into()))?;
+        let declared = declared_entries(bytes)?;
+        if declared != zip.len() {
+            return Err(CatalogError::Invalid("inconsistent ZIP directory".into()));
+        }
+        entries = entries
+            .checked_add(declared)
+            .ok_or_else(|| CatalogError::Invalid("ZIP entry count overflow".into()))?;
+        if entries > max_entries {
+            return Err(CatalogError::Invalid("too many catalog ZIP entries".into()));
+        }
+        for index in 0..zip.len() {
+            let entry = zip
+                .by_index(index)
+                .map_err(|_| CatalogError::Invalid("invalid ZIP".into()))?;
+            expanded = expanded
+                .checked_add(entry.size())
+                .ok_or_else(|| CatalogError::Invalid("expanded size overflow".into()))?;
+            if expanded > max_expanded {
+                return Err(CatalogError::Invalid("catalog expands beyond limit".into()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn reject_non_directory(path: &Path) -> Result<(), CatalogError> {
@@ -379,23 +436,54 @@ fn declared_entries(bytes: &[u8]) -> Result<usize, CatalogError> {
     }
     Err(CatalogError::Invalid("invalid ZIP directory".into()))
 }
+#[cfg(test)]
 fn extract_zip(bytes: &[u8], target: &Path) -> Result<(), CatalogError> {
     extract_zip_with_limits(bytes, target, MAX_ENTRIES, MAX_EXPANDED)
 }
 
+#[derive(Debug)]
+struct ExtractionBudget {
+    entries: usize,
+    expanded: u64,
+}
+
+fn extract_zip_shared(
+    bytes: &[u8],
+    target: &Path,
+    budget: &mut ExtractionBudget,
+) -> Result<(), CatalogError> {
+    extract_zip_with_budget(bytes, target, budget)
+}
+
+#[cfg(test)]
 fn extract_zip_with_limits(
     bytes: &[u8],
     target: &Path,
     max_entries: usize,
     max_expanded: u64,
 ) -> Result<(), CatalogError> {
+    extract_zip_with_budget(
+        bytes,
+        target,
+        &mut ExtractionBudget {
+            entries: max_entries,
+            expanded: max_expanded,
+        },
+    )
+}
+
+fn extract_zip_with_budget(
+    bytes: &[u8],
+    target: &Path,
+    budget: &mut ExtractionBudget,
+) -> Result<(), CatalogError> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|_| CatalogError::Invalid("invalid ZIP".into()))?;
     if declared_entries(bytes)? != zip.len() {
         return Err(CatalogError::Invalid("inconsistent ZIP directory".into()));
     }
-    if zip.len() > max_entries {
-        return Err(CatalogError::Invalid("too many ZIP entries".into()));
+    if zip.len() > budget.entries {
+        return Err(CatalogError::Invalid("too many catalog ZIP entries".into()));
     }
     if zip
         .has_overlapping_files()
@@ -432,7 +520,7 @@ fn extract_zip_with_limits(
         total = total
             .checked_add(e.size())
             .ok_or_else(|| CatalogError::Invalid("expanded size overflow".into()))?;
-        if total > max_expanded {
+        if total > budget.expanded {
             return Err(CatalogError::Invalid("ZIP expands beyond limit".into()));
         }
         plan.push(Planned {
@@ -459,8 +547,11 @@ fn extract_zip_with_limits(
     if !plan.iter().any(|e| !e.dir && e.key == "skill.md") {
         return Err(CatalogError::Invalid("missing root SKILL.md".into()));
     }
-    let mut expanded = 0u64;
     for p in plan {
+        budget.entries = budget
+            .entries
+            .checked_sub(1)
+            .ok_or_else(|| CatalogError::Invalid("catalog ZIP entry budget exhausted".into()))?;
         let mut e = zip
             .by_index(p.index)
             .map_err(|_| CatalogError::Invalid("invalid ZIP".into()))?;
@@ -473,12 +564,12 @@ fn extract_zip_with_limits(
             fs::create_dir_all(parent).map_err(io(parent))?;
         }
         let mut f = fs::File::create(&out).map_err(io(&out))?;
-        let n = std::io::copy(&mut e.by_ref().take(max_expanded - expanded + 1), &mut f)
-            .map_err(io(&out))?;
-        if n != p.size || expanded + n > max_expanded {
+        let n =
+            std::io::copy(&mut e.by_ref().take(budget.expanded + 1), &mut f).map_err(io(&out))?;
+        if n != p.size || n > budget.expanded {
             return Err(CatalogError::Invalid("expanded size mismatch".into()));
         }
-        expanded += n;
+        budget.expanded -= n;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -542,6 +633,30 @@ mod tests {
 
     fn digest(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn catalog_preflight_shares_expanded_and_entry_budgets() {
+        let compressible = vec![b'x'; 64];
+        let first = skill_zip(&[("SKILL.md", &compressible, 0o644)]);
+        let second = skill_zip(&[("SKILL.md", &compressible, 0o644)]);
+        let expanded_error = preflight_catalog(&[first.clone(), second.clone()], 10, 100)
+            .expect_err("aggregate expanded budget");
+        assert!(expanded_error.to_string().contains("expands beyond"));
+
+        let entry_error =
+            preflight_catalog(&[first, second], 1, 1_000).expect_err("aggregate entry budget");
+        assert!(entry_error.to_string().contains("entries"));
+
+        // A per-archive reset would accept roughly 64 GiB across 256 Skills.
+        // The shared production budget rejects the same highly-compressible
+        // shape as soon as its aggregate declared expansion exceeds 256 MiB.
+        let large_compressible = vec![b'x'; 1024 * 1024 + 1];
+        let archive = skill_zip(&[("SKILL.md", &large_compressible, 0o644)]);
+        let catalog = vec![archive; 256];
+        let aggregate_error = preflight_catalog(&catalog, MAX_ENTRIES, MAX_EXPANDED)
+            .expect_err("256-entry aggregate expansion must be rejected");
+        assert!(aggregate_error.to_string().contains("expands beyond"));
     }
 
     fn manifest(origin: &str, bearer_origins: &[&str]) -> ConnectionManifest {

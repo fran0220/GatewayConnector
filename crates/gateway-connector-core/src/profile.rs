@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fmt, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    str::FromStr,
+};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
@@ -292,6 +296,9 @@ pub struct ConnectionProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_url: Option<Url>,
     pub agents: BTreeMap<AgentId, AgentSelection>,
+    /// Direct-discovery models whose unknown capability the user explicitly accepted.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub confirmed_direct_models: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +349,7 @@ impl ConnectionProfile {
             platform_id: "gateway-connector".into(),
             manifest_url: None,
             agents,
+            confirmed_direct_models: BTreeSet::new(),
         })
     }
 
@@ -377,8 +385,27 @@ impl ConnectionProfile {
             selection.protocol = protocol;
             selection.default_model = None;
         }
+        existing.confirmed_direct_models.clear();
         existing.validate()?;
         Ok(existing)
+    }
+
+    /// Records an explicit user decision to use an unknown-capability direct model.
+    pub fn confirm_direct_model(
+        &mut self,
+        model_id: impl Into<String>,
+    ) -> Result<(), ProfileError> {
+        if self.mode != ConnectionMode::Direct {
+            return Err(ProfileError::InvalidDirectModelConfirmation);
+        }
+        let model_id = model_id.into();
+        validate_model_id(&model_id)?;
+        self.confirmed_direct_models.insert(model_id);
+        Ok(())
+    }
+
+    pub fn unconfirm_direct_model(&mut self, model_id: &str) {
+        self.confirmed_direct_models.remove(model_id);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -435,12 +462,16 @@ impl ConnectionProfile {
         }
         for selection in self.agents.values() {
             if let Some(model) = &selection.default_model
-                && (model.trim().is_empty()
-                    || model.len() > 512
-                    || model.chars().any(char::is_control))
+                && validate_model_id(model).is_err()
             {
                 return Err(ProfileError::InvalidModelId);
             }
+        }
+        for model in &self.confirmed_direct_models {
+            validate_model_id(model)?;
+        }
+        if self.mode != ConnectionMode::Direct && !self.confirmed_direct_models.is_empty() {
+            return Err(ProfileError::InvalidDirectModelConfirmation);
         }
         Ok(())
     }
@@ -462,6 +493,8 @@ struct UncheckedConnectionProfile {
     #[serde(default)]
     manifest_url: Option<Url>,
     agents: BTreeMap<AgentId, AgentSelection>,
+    #[serde(default)]
+    confirmed_direct_models: BTreeSet<String>,
 }
 
 impl TryFrom<UncheckedConnectionProfile> for ConnectionProfile {
@@ -503,9 +536,18 @@ impl TryFrom<UncheckedConnectionProfile> for ConnectionProfile {
             },
             manifest_url: if legacy { None } else { unchecked.manifest_url },
             agents: unchecked.agents,
+            confirmed_direct_models: unchecked.confirmed_direct_models,
         };
         profile.validate()?;
         Ok(profile)
+    }
+}
+
+fn validate_model_id(model: &str) -> Result<(), ProfileError> {
+    if model.trim().is_empty() || model.len() > 512 || model.chars().any(char::is_control) {
+        Err(ProfileError::InvalidModelId)
+    } else {
+        Ok(())
     }
 }
 
@@ -588,6 +630,8 @@ pub enum ProfileError {
     InvalidAgentSelections,
     #[error("the selected model ID is empty, overlong, or contains control characters")]
     InvalidModelId,
+    #[error("unknown-capability model confirmations are valid only for direct connections")]
+    InvalidDirectModelConfirmation,
     #[error("the credential reference is invalid")]
     InvalidCredentialReference,
     #[error("the credential reference must belong to the profile ID")]
@@ -685,6 +729,40 @@ mod tests {
 
         let decoded: ConnectionProfile = serde_json::from_str(&json).expect("deserialize profile");
         assert_eq!(decoded, profile);
+    }
+
+    #[test]
+    fn direct_model_confirmations_are_optional_persisted_and_cleared_on_reconfiguration() {
+        let mut profile = ConnectionProfile::new(
+            "Example",
+            CanonicalBaseUrl::parse("https://gateway.example").expect("valid URL"),
+            Protocol::Auto,
+        )
+        .expect("valid profile");
+        let mut old_schema_two = serde_json::to_value(&profile).expect("serialize profile");
+        old_schema_two
+            .as_object_mut()
+            .expect("profile object")
+            .remove("confirmed_direct_models");
+        let decoded: ConnectionProfile =
+            serde_json::from_value(old_schema_two).expect("older schema-2 profile loads");
+        assert!(decoded.confirmed_direct_models.is_empty());
+
+        profile
+            .confirm_direct_model("unknown-model")
+            .expect("confirmation");
+        let decoded: ConnectionProfile =
+            serde_json::from_str(&serde_json::to_string(&profile).expect("serialize confirmation"))
+                .expect("reload confirmation");
+        assert!(decoded.confirmed_direct_models.contains("unknown-model"));
+        let reconfigured = ConnectionProfile::reconfigured(
+            decoded,
+            "Other",
+            CanonicalBaseUrl::parse("https://other.example").expect("valid URL"),
+            Protocol::Auto,
+        )
+        .expect("reconfigure");
+        assert!(reconfigured.confirmed_direct_models.is_empty());
     }
 
     #[test]

@@ -12,9 +12,19 @@ use crate::ApiKey;
 const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 5;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCapability {
+    Chat,
+    NonChat,
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelDescriptor {
     pub id: String,
+    pub capability: ModelCapability,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owned_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -291,14 +301,16 @@ struct RawModel {
 }
 
 fn normalize_models(models: Vec<RawModel>) -> Result<Vec<ModelDescriptor>, DiscoveryError> {
-    let mut normalized: BTreeMap<String, ModelDescriptor> = BTreeMap::new();
+    let mut normalized: BTreeMap<String, (ModelDescriptor, CapabilityEvidence)> = BTreeMap::new();
     for (index, model) in models.into_iter().enumerate() {
         let id = model.id.trim().to_owned();
         if id.is_empty() || id.len() > 512 || id.chars().any(char::is_control) {
             return Err(DiscoveryError::InvalidModelId { index });
         }
+        let evidence = capability_evidence(&model.metadata, model.object.as_deref());
         let candidate = ModelDescriptor {
             id: id.clone(),
+            capability: evidence.capability(),
             owned_by: model.owned_by,
             created: model.created,
             object: model.object,
@@ -306,10 +318,72 @@ fn normalize_models(models: Vec<RawModel>) -> Result<Vec<ModelDescriptor>, Disco
         };
         normalized
             .entry(id)
-            .and_modify(|existing| merge_metadata(existing, &candidate))
-            .or_insert(candidate);
+            .and_modify(|(existing, existing_evidence)| {
+                merge_metadata(existing, &candidate);
+                existing_evidence.merge(evidence);
+                existing.capability = existing_evidence.capability();
+            })
+            .or_insert((candidate, evidence));
     }
-    Ok(normalized.into_values().collect())
+    Ok(normalized.into_values().map(|(model, _)| model).collect())
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CapabilityEvidence {
+    chat: bool,
+    non_chat: bool,
+}
+
+impl CapabilityEvidence {
+    fn merge(&mut self, other: Self) {
+        self.chat |= other.chat;
+        self.non_chat |= other.non_chat;
+    }
+    fn capability(self) -> ModelCapability {
+        match (self.chat, self.non_chat) {
+            (true, false) => ModelCapability::Chat,
+            (false, true) => ModelCapability::NonChat,
+            _ => ModelCapability::Unknown,
+        }
+    }
+}
+
+fn capability_evidence(metadata: &Map<String, Value>, object: Option<&str>) -> CapabilityEvidence {
+    let mut evidence = CapabilityEvidence::default();
+    if let Some(value) = metadata.get("chat_capable").and_then(Value::as_bool) {
+        evidence.chat |= value;
+        evidence.non_chat |= !value;
+    }
+    for container in ["capability", "capabilities", "supported_capabilities"] {
+        if let Some(object) = metadata.get(container).and_then(Value::as_object) {
+            for field in [
+                "chat",
+                "chat_capable",
+                "chat_completion",
+                "chat_completions",
+            ] {
+                if let Some(value) = object.get(field).and_then(Value::as_bool) {
+                    evidence.chat |= value;
+                    evidence.non_chat |= !value;
+                }
+            }
+        }
+    }
+    for value in ["kind", "model_kind", "task", "model_task", "type"]
+        .into_iter()
+        .filter_map(|field| metadata.get(field).and_then(Value::as_str))
+        .chain(object)
+    {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "chat" | "chat_completion" | "chat-completion" | "conversational" => {
+                evidence.chat = true
+            }
+            "embedding" | "embeddings" | "rerank" | "reranking" | "image" | "image_generation"
+            | "image-generation" => evidence.non_chat = true,
+            _ => {}
+        }
+    }
+    evidence
 }
 
 fn merge_metadata(existing: &mut ModelDescriptor, candidate: &ModelDescriptor) {

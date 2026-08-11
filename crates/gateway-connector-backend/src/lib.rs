@@ -13,7 +13,8 @@ pub use backend::{
     ConnectionResult, ConnectorBackend, ProbeResult,
 };
 pub use discovery::{
-    DiscoveredManifest, DiscoveryError, GatewayClient, ManifestLocation, ModelDescriptor,
+    DiscoveredManifest, DiscoveryError, GatewayClient, ManifestLocation, ModelCapability,
+    ModelDescriptor,
 };
 pub use distribution::{
     AssetIdentity, Distribution, DistributionError, GENERIC_DISTRIBUTION, ReleaseMetadata,

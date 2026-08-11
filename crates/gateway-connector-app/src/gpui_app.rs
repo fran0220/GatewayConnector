@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use crate::{
-    AppState, Page,
+    AppState, Page, QueryStatus,
     preferences::{Locale, PreferenceStore, Preferences, ThemePreference},
 };
 use directories::{ProjectDirs, UserDirs};
 use gateway_connector_backend::{
     ApiKey, BackendError, BrowserLoginOffer, ConnectRequest, ConnectRequestWithoutCredential,
-    ConnectionResult, ConnectorBackend, Distribution, JsonProfileStore, OsCredentialStore,
-    ProbeResult, SystemBrowser,
+    ConnectionResult, ConnectorBackend, Distribution, JsonProfileStore, ModelCapability,
+    OsCredentialStore, ProbeResult, SystemBrowser,
 };
 use gateway_connector_core::{AgentId, CanonicalBaseUrl, ChangeKind, ConnectionProfile, Protocol};
 use gpui::{
@@ -17,6 +17,7 @@ use gpui::{
     prelude::*, px, size,
 };
 use gpui_kit::{assets::Icon, prelude::*};
+use zeroize::Zeroize;
 
 enum ConnectOutcome {
     Connected(Box<ConnectionResult>),
@@ -140,7 +141,9 @@ impl ConnectorView {
             cx.subscribe(select, move |this, select, event, cx| {
                 if let SelectEvent::Selected(id) = event {
                     select.update(cx, |select, cx| select.set_selected(Some(id.clone()), cx));
-                    this.commit_selection(agent, cx);
+                    if let Ok(protocol) = id.parse() {
+                        this.commit_protocol(agent, protocol, cx);
+                    }
                 }
             })
             .detach();
@@ -342,6 +345,7 @@ impl ConnectorView {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    let mut raw_key = raw_key;
                     if raw_key.trim().is_empty() {
                         return match backend.probe(&base_url) {
                             Ok(ProbeResult::Provisioned {
@@ -365,10 +369,14 @@ impl ConnectorView {
                             Err(error) => ConnectOutcome::Failed(error.to_string()),
                         };
                     }
-                    let api_key = match ApiKey::new(raw_key) {
+                    let api_key = match ApiKey::new(raw_key.clone()) {
                         Ok(api_key) => api_key,
-                        Err(error) => return ConnectOutcome::Failed(error.to_string()),
+                        Err(error) => {
+                            raw_key.zeroize();
+                            return ConnectOutcome::Failed(error.to_string());
+                        }
                     };
+                    raw_key.zeroize();
                     match backend.connect(ConnectRequest {
                         display_name,
                         base_url,
@@ -384,6 +392,7 @@ impl ConnectorView {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                this.api_key.update(cx, |input, cx| input.set_value("", cx));
                 match result {
                     ConnectOutcome::Connected(result) => this.complete_connection(*result, cx),
                     ConnectOutcome::Browser(offer) => this.state = AppState::BrowserLogin(offer),
@@ -454,6 +463,10 @@ impl ConnectorView {
             .models
             .iter()
             .filter(|model| {
+                connection.profile.mode != gateway_connector_core::ConnectionMode::Direct
+                    || model.capability != ModelCapability::NonChat
+            })
+            .filter(|model| {
                 query.is_empty()
                     || model.id.to_ascii_lowercase().contains(&query)
                     || model
@@ -463,8 +476,14 @@ impl ConnectorView {
             })
             .map(|model| {
                 let mut option = SelectOption::new(model.id.clone(), model.id.clone());
-                if let Some(owner) = &model.owned_by {
-                    option = option.description(owner.clone());
+                let description = match model.capability {
+                    ModelCapability::Unknown => {
+                        "Unknown chat capability — choosing this model confirms its use".to_owned()
+                    }
+                    _ => model.owned_by.clone().unwrap_or_default(),
+                };
+                if !description.is_empty() {
+                    option = option.description(description);
                 }
                 option
             })
@@ -517,22 +536,17 @@ impl ConnectorView {
     }
 
     fn commit_selection(&mut self, agent: AgentId, cx: &mut Context<Self>) {
-        let protocol = self
-            .protocol_selects
-            .iter()
-            .find(|(candidate, _)| *candidate == agent)
-            .and_then(|(_, select)| select.read(cx).selected_id().cloned())
-            .and_then(|id| id.parse().ok())
-            .unwrap_or(Protocol::Auto);
         let model = self
             .model_selects
             .iter()
             .find(|(candidate, _)| *candidate == agent)
             .and_then(|(_, select)| select.read(cx).selected_id().cloned())
             .map(|id| id.to_string());
-        self.state.update_protocol(agent, protocol);
-        if let Some(model) = model {
-            self.state.update_model(agent, model);
+        if let Some(model) = model
+            && let Err(error) = self.state.select_model(agent, model)
+        {
+            self.action_error = Some(error);
+            return;
         }
         self.sync_model_selects(cx);
         self.sync_all_protocol(cx);
@@ -540,9 +554,19 @@ impl ConnectorView {
         cx.notify();
     }
 
+    fn commit_protocol(&mut self, agent: AgentId, protocol: Protocol, cx: &mut Context<Self>) {
+        self.state.update_protocol(agent, protocol);
+        self.sync_all_protocol(cx);
+        self.queue_profile_save(cx);
+        cx.notify();
+    }
+
     fn use_model_for_all(&mut self, model: String, cx: &mut Context<Self>) {
         for agent in AgentId::ALL {
-            self.state.update_model(agent, model.clone());
+            if let Err(error) = self.state.select_model(agent, model.clone()) {
+                self.action_error = Some(error);
+                return;
+            }
         }
         self.sync_model_selects(cx);
         self.queue_profile_save(cx);
@@ -592,14 +616,20 @@ impl ConnectorView {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let installs = backend.discover_agents()?;
-                    let managed = backend.managed_agents(&profile)?;
-                    Ok::<_, gateway_connector_backend::BackendError>((profile, installs, managed))
+                    let installs = backend
+                        .discover_agents()
+                        .map(QueryStatus::Known)
+                        .unwrap_or_else(|error| QueryStatus::Error(error.to_string()));
+                    let managed = backend
+                        .managed_agents(&profile)
+                        .map(QueryStatus::Known)
+                        .unwrap_or_else(|error| QueryStatus::Error(error.to_string()));
+                    (profile, installs, managed)
                 })
                 .await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok((profile, installs, managed)) => {
+                    (profile, installs, managed) => {
                         if matches!(
                             &this.state,
                             AppState::Connected { connection, .. }
@@ -608,7 +638,6 @@ impl ConnectorView {
                             this.state.set_projection_status(installs, managed);
                         }
                     }
-                    Err(error) => this.action_error = Some(error.to_string()),
                 }
                 cx.notify();
             })
@@ -741,7 +770,7 @@ impl ConnectorView {
                         } = &mut this.state
                             && connection.profile.id == profile.id
                         {
-                            *managed_agents = managed;
+                            *managed_agents = QueryStatus::Known(managed);
                             this.state.set_verification(verification);
                         }
                     }
@@ -1416,9 +1445,15 @@ impl ConnectorView {
         }
         let profile = &connection.profile;
         let models = &connection.models;
-        let detected = installs.iter().filter(|install| install.detected).count();
-        let supported_detected = installs
-            .iter()
+        let known_installs = match installs {
+            QueryStatus::Known(value) => Some(value),
+            _ => None,
+        };
+        let detected =
+            known_installs.map(|values| values.iter().filter(|install| install.detected).count());
+        let supported_detected = known_installs
+            .into_iter()
+            .flatten()
             .filter(|install| {
                 install.detected
                     && connection
@@ -1487,7 +1522,11 @@ impl ConnectorView {
                     .item(DescriptionItem::new(
                         "connector.summary.agents",
                         locale.text("Detected Agents"),
-                        format!("{detected} / {}", AgentId::ALL.len()),
+                        match installs {
+                            QueryStatus::Known(_) => format!("{} / {}", detected.unwrap_or_default(), AgentId::ALL.len()),
+                            QueryStatus::Unknown => locale.text("Unknown").into(),
+                            QueryStatus::Error(error) => format!("Error: {error}"),
+                        },
                     )),
                 )
                 .child(
@@ -1539,24 +1578,34 @@ impl ConnectorView {
             if selected_agent != Some(agent) {
                 continue;
             }
-            let install = installs.iter().find(|install| install.agent == agent);
+            let install = match installs {
+                QueryStatus::Known(values) => values.iter().find(|install| install.agent == agent),
+                _ => None,
+            };
             let detected = install.is_some_and(|install| install.detected);
             let supported = connection
                 .manifest
                 .as_ref()
                 .is_none_or(|manifest| manifest.supported_agents.contains(&agent));
-            let ownership = if managed_agents.contains(&agent) {
-                locale.text("Managed by this connection")
-            } else {
-                locale.text("Not managed")
+            let ownership = match managed_agents {
+                QueryStatus::Known(values) if values.contains(&agent) => {
+                    locale.text("Managed by this connection").into()
+                }
+                QueryStatus::Known(_) => locale.text("Not managed").into(),
+                QueryStatus::Unknown => locale.text("Unknown").into(),
+                QueryStatus::Error(error) => format!("Error: {error}"),
             };
             let location = install
                 .map(|install| install.root.display().to_string())
                 .unwrap_or_else(|| "Checking standard root…".into());
-            let availability = match (detected, supported) {
-                (true, true) => locale.text("Detected"),
-                (false, true) => locale.text("Not detected"),
-                (_, false) => locale.text("Not advertised by this platform"),
+            let availability = match installs {
+                QueryStatus::Unknown => locale.text("Unknown").into(),
+                QueryStatus::Error(error) => format!("Error: {error}"),
+                QueryStatus::Known(_) => match (detected, supported) {
+                    (true, true) => locale.text("Detected").into(),
+                    (false, true) => locale.text("Not detected").into(),
+                    (_, false) => locale.text("Not advertised by this platform").into(),
+                },
             };
             let protocol = self
                 .protocol_selects

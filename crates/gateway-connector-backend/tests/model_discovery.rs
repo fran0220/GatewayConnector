@@ -12,8 +12,8 @@ use std::{
 use gateway_connector_backend::{
     ApiKey, BackendError, Browser, ConnectRequest, ConnectionResult, ConnectorBackend,
     CredentialStore, DiscoveryError, Distribution, GatewayClient, InMemoryCredentialStore,
-    InMemoryProfileStore, ManifestLocation, ModelDescriptor, PkceError, ProfileStore, StoreError,
-    SystemBrowser, VaultError,
+    InMemoryProfileStore, ManifestLocation, ModelCapability, ModelDescriptor, PkceError,
+    ProfileStore, StoreError, SystemBrowser, VaultError,
 };
 use gateway_connector_core::{
     AgentId, CanonicalBaseUrl, ConnectionManifest, ConnectionMode, ConnectionProfile,
@@ -347,9 +347,57 @@ fn sends_bearer_to_models_endpoint_and_normalizes_catalog() {
     assert_eq!(models[1].owned_by.as_deref(), Some("vendor-a"));
     assert_eq!(models[1].created, Some(7));
     assert_eq!(models[1].metadata["context_window"], 32000);
+    assert!(
+        models
+            .iter()
+            .all(|model| model.capability == ModelCapability::Unknown)
+    );
     let capture = capture.lock().expect("capture lock");
     assert_eq!(capture.path, "/v1/models");
     assert_eq!(capture.authorization.as_deref(), Some("Bearer test-key"));
+}
+
+#[test]
+fn generic_catalog_uses_only_explicit_capability_evidence() {
+    let (base, _, handle) = spawn_response(
+        200,
+        r#"{"data":[
+            {"id":"chat","chat_capable":true},
+            {"id":"embed","type":"embedding"},
+            {"id":"rerank","task":"rerank"},
+            {"id":"image","capabilities":{"chat":false},"type":"image"},
+            {"id":"unknown"},
+            {"id":"conflict","chat_capable":true},
+            {"id":"conflict","capabilities":{"chat":false}}
+        ]}"#,
+    );
+    let models = GatewayClient::new()
+        .expect("client")
+        .discover_models(
+            &CanonicalBaseUrl::parse(&base).expect("base URL"),
+            &ApiKey::new("test-key").expect("key"),
+        )
+        .expect("discover models");
+    handle.join().expect("mock server");
+    let capabilities = models
+        .iter()
+        .map(|model| (model.id.as_str(), model.capability))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(capabilities["chat"], ModelCapability::Chat);
+    for id in ["embed", "rerank", "image"] {
+        assert_eq!(capabilities[id], ModelCapability::NonChat, "{id}");
+    }
+    for id in ["unknown", "conflict"] {
+        assert_eq!(capabilities[id], ModelCapability::Unknown, "{id}");
+    }
+    assert_eq!(
+        models
+            .iter()
+            .find(|m| m.id == "embed")
+            .expect("embedding model")
+            .metadata["type"],
+        "embedding"
+    );
 }
 
 #[test]
@@ -644,27 +692,31 @@ fn provisioned_connection_uses_manifest_catalog_and_bearer_boundary() {
 #[test]
 fn direct_projection_uses_discovered_models_without_inventing_services() {
     let credentials = Arc::new(InMemoryCredentialStore::default());
+    let profiles = Arc::new(InMemoryProfileStore::default());
     let state = tempfile::tempdir().expect("projection state");
     let home = tempfile::tempdir().expect("Agent home");
     fs::create_dir(home.path().join(".codex")).expect("Codex root");
-    let backend = ConnectorBackend::new(
-        credentials.clone(),
-        Arc::new(InMemoryProfileStore::default()),
-    )
-    .and_then(|backend| {
-        backend.with_runtime_directories(
-            state.path(),
-            state.path().join("shared-coordinator"),
-            home.path(),
-        )
-    })
-    .expect("backend");
-    let profile = ConnectionProfile::new(
+    let backend = ConnectorBackend::new(credentials.clone(), profiles.clone())
+        .and_then(|backend| {
+            backend.with_runtime_directories(
+                state.path(),
+                state.path().join("shared-coordinator"),
+                home.path(),
+            )
+        })
+        .expect("backend");
+    let mut profile = ConnectionProfile::new(
         "Direct Gateway",
         CanonicalBaseUrl::parse("https://gateway.example/proxy/v1/models").expect("URL"),
         Protocol::OpenaiResponses,
     )
     .expect("profile");
+    profile
+        .agents
+        .get_mut(&AgentId::Codex)
+        .expect("Codex selection")
+        .default_model = Some("model-a".into());
+    profiles.create(&profile).expect("persist profile");
     credentials
         .set(&profile, &ApiKey::new("direct-secret").expect("direct key"))
         .expect("credential");
@@ -672,6 +724,7 @@ fn direct_projection_uses_discovered_models_without_inventing_services() {
         profile: profile.clone(),
         models: vec![ModelDescriptor {
             id: "model-a".into(),
+            capability: ModelCapability::Chat,
             owned_by: Some("vendor".into()),
             created: None,
             object: Some("model".into()),
@@ -707,6 +760,110 @@ fn direct_projection_uses_discovered_models_without_inventing_services() {
         .disconnect_projection(&profile)
         .expect("disconnect direct projection");
     assert!(!home.path().join(".codex/config.toml").exists());
+}
+
+#[test]
+fn direct_projection_requires_saved_explicit_capability_decisions() {
+    let credentials = Arc::new(InMemoryCredentialStore::default());
+    let profiles = Arc::new(InMemoryProfileStore::default());
+    let state = tempfile::tempdir().expect("projection state");
+    let home = tempfile::tempdir().expect("Agent home");
+    fs::create_dir(home.path().join(".codex")).expect("Codex root");
+    let backend = ConnectorBackend::new(credentials.clone(), profiles.clone())
+        .and_then(|backend| {
+            backend.with_runtime_directories(
+                state.path(),
+                state.path().join("shared-coordinator"),
+                home.path(),
+            )
+        })
+        .expect("backend");
+    let mut profile = ConnectionProfile::new(
+        "Direct Gateway",
+        CanonicalBaseUrl::parse("https://gateway.example").expect("URL"),
+        Protocol::OpenaiResponses,
+    )
+    .expect("profile");
+    profiles.create(&profile).expect("persist profile");
+    credentials
+        .set(&profile, &ApiKey::new("direct-secret").expect("key"))
+        .expect("credential");
+    let models = vec![
+        ModelDescriptor {
+            id: "chat".into(),
+            capability: ModelCapability::Chat,
+            owned_by: None,
+            created: None,
+            object: None,
+            metadata: BTreeMap::new(),
+        },
+        ModelDescriptor {
+            id: "unknown".into(),
+            capability: ModelCapability::Unknown,
+            owned_by: None,
+            created: None,
+            object: None,
+            metadata: BTreeMap::new(),
+        },
+        ModelDescriptor {
+            id: "embedding".into(),
+            capability: ModelCapability::NonChat,
+            owned_by: None,
+            created: None,
+            object: None,
+            metadata: BTreeMap::new(),
+        },
+    ];
+    let connection = |profile: ConnectionProfile| ConnectionResult {
+        profile,
+        models: models.clone(),
+        manifest: None,
+        provisioning: None,
+        synchronized_skills: BTreeMap::new(),
+    };
+
+    let error = backend
+        .plan_projection(&connection(profile.clone()))
+        .expect_err("direct mode must not choose a model automatically")
+        .to_string();
+    assert!(error.contains("explicit direct model selection"), "{error}");
+
+    profile
+        .agents
+        .get_mut(&AgentId::Codex)
+        .expect("Codex selection")
+        .default_model = Some("unknown".into());
+    profiles.save(&profile).expect("persist selection");
+    let error = backend
+        .plan_projection(&connection(profile.clone()))
+        .expect_err("unknown model needs confirmation")
+        .to_string();
+    assert!(error.contains("not confirmed"), "{error}");
+
+    profile
+        .confirm_direct_model("unknown")
+        .expect("confirm unknown model");
+    let error = backend
+        .plan_projection(&connection(profile.clone()))
+        .expect_err("confirmation must be durable before preview")
+        .to_string();
+    assert!(error.contains("saved exactly as edited"), "{error}");
+    profiles.save(&profile).expect("persist confirmation");
+    backend
+        .plan_projection(&connection(profile.clone()))
+        .expect("persisted explicit unknown selection is projectable");
+
+    profile
+        .agents
+        .get_mut(&AgentId::Codex)
+        .expect("Codex selection")
+        .default_model = Some("embedding".into());
+    profiles.save(&profile).expect("persist non-chat choice");
+    let error = backend
+        .plan_projection(&connection(profile))
+        .expect_err("non-chat model must never be projected")
+        .to_string();
+    assert!(error.contains("explicitly non-chat"), "{error}");
 }
 
 #[test]

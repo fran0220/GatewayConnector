@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -73,8 +73,13 @@ impl JsonProfileStore {
     }
 
     fn read_unlocked(&self) -> Result<ProfileFile, StoreError> {
-        match fs::read(&self.path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(StoreError::InvalidJson),
+        reject_reparse_components(&self.path)?;
+        match open_nofollow(&self.path, false) {
+            Ok(mut input) => {
+                let mut bytes = Vec::new();
+                input.read_to_end(&mut bytes).map_err(StoreError::Io)?;
+                serde_json::from_slice(&bytes).map_err(StoreError::InvalidJson)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Ok(ProfileFile::default())
             }
@@ -84,41 +89,117 @@ impl JsonProfileStore {
 
     fn write_unlocked(&self, file: &ProfileFile) -> Result<(), StoreError> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        reject_reparse_components(parent)?;
         fs::create_dir_all(parent).map_err(StoreError::Io)?;
+        reject_reparse_components(parent)?;
+        reject_reparse_components(&self.path)?;
         let bytes = serde_json::to_vec_pretty(file).map_err(StoreError::InvalidJson)?;
-        let temporary = self.path.with_extension("tmp");
-        let mut options = fs::OpenOptions::new();
-        options.create(true).truncate(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut output = options.open(&temporary).map_err(StoreError::Io)?;
+        let (temporary, mut output) = create_temporary(&self.path)?;
         output.write_all(&bytes).map_err(StoreError::Io)?;
         output.sync_all().map_err(StoreError::Io)?;
         if let Err(error) = replace_file(&temporary, &self.path) {
             let _ = fs::remove_file(temporary);
             return Err(error);
         }
+        sync_parent(parent)?;
         Ok(())
     }
 
     fn acquire_file_lock(&self) -> Result<fs::File, StoreError> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(StoreError::Io)?;
         let lock_path = self.path.with_extension("lock");
-        let mut options = fs::OpenOptions::new();
-        options.create(true).read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(lock_path).map_err(StoreError::Io)?;
+        reject_reparse_components(parent)?;
+        fs::create_dir_all(parent).map_err(StoreError::Io)?;
+        reject_reparse_components(parent)?;
+        reject_reparse_components(&lock_path)?;
+        let file = open_nofollow(&lock_path, true).map_err(StoreError::Io)?;
+        reject_reparse_components(&lock_path)?;
         file.lock_exclusive().map_err(StoreError::Io)?;
         Ok(file)
     }
+}
+
+fn reject_reparse_components(path: &Path) -> Result<(), StoreError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if is_reparse(&metadata) => {
+                return Err(StoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "profile storage path contains a symlink or reparse point",
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(StoreError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+fn is_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+fn open_nofollow(path: &Path, create: bool) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(create).create(create);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
+fn create_temporary(path: &Path) -> Result<(PathBuf, fs::File), StoreError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    for _ in 0..128 {
+        let temporary = parent.join(format!(".{name}.{:016x}.tmp", rand::random::<u64>()));
+        reject_reparse_components(&temporary)?;
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        match options.open(&temporary) {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(StoreError::Io(error)),
+        }
+    }
+    Err(StoreError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique profile temporary file",
+    )))
+}
+
+fn sync_parent(parent: &Path) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(StoreError::Io)?;
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -272,6 +353,61 @@ mod tests {
                 .expect("load profiles")
                 .len(),
             1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_parent_profile_and_lock_paths() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temp directory");
+        let real = directory.path().join("real");
+        fs::create_dir(&real).expect("real directory");
+        let linked = directory.path().join("linked");
+        symlink(&real, &linked).expect("parent symlink");
+        assert!(
+            JsonProfileStore::new(linked.join("profiles.json"))
+                .load()
+                .is_err()
+        );
+
+        let path = real.join("profiles.json");
+        let target = real.join("target");
+        fs::write(&target, b"{}").expect("target");
+        symlink(&target, &path).expect("profile symlink");
+        assert!(JsonProfileStore::new(&path).load().is_err());
+        fs::remove_file(&path).expect("remove profile symlink");
+        let lock_path = real.join("profiles.lock");
+        if lock_path.exists() {
+            fs::remove_file(&lock_path).expect("remove prior lock");
+        }
+
+        symlink(&target, lock_path).expect("lock symlink");
+        assert!(JsonProfileStore::new(path).load().is_err());
+    }
+
+    #[test]
+    fn unique_temporary_files_do_not_clobber_an_existing_candidate() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("profiles.json");
+        let stale = directory.path().join("profiles.tmp");
+        fs::write(&stale, b"do not overwrite").expect("stale temporary");
+        JsonProfileStore::new(&path)
+            .delete(ProfileId::new())
+            .expect("write profile store");
+        assert_eq!(
+            fs::read(stale).expect("stale temporary"),
+            b"do not overwrite"
+        );
+        assert!(
+            fs::read_dir(directory.path())
+                .expect("directory")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".profiles.json."))
         );
     }
 }
