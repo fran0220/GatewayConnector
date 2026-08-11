@@ -3,11 +3,11 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$isWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+$runningOnWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
     [System.Runtime.InteropServices.OSPlatform]::Windows
 )
-$isX64 = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [System.Runtime.InteropServices.Architecture]::X64
-if (-not $isWindows -or -not $isX64) {
+$runningOnX64 = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [System.Runtime.InteropServices.Architecture]::X64
+if (-not $runningOnWindows -or -not $runningOnX64) {
     throw 'this staging script produces only native Windows x64 artifacts'
 }
 
@@ -79,13 +79,13 @@ try {
         foreach ($name in $expected) {
             $entry = $archive.CreateEntry($name, [System.IO.Compression.CompressionLevel]::Optimal)
             $entry.LastWriteTime = $fixedTimestamp
-            $input = [System.IO.File]::OpenRead((Join-Path $stage $name))
-            $output = $entry.Open()
+            $inputStream = [System.IO.File]::OpenRead((Join-Path $stage $name))
+            $outputStream = $entry.Open()
             try {
-                $input.CopyTo($output)
+                $inputStream.CopyTo($outputStream)
             } finally {
-                $output.Dispose()
-                $input.Dispose()
+                $outputStream.Dispose()
+                $inputStream.Dispose()
             }
         }
     } finally {
