@@ -206,14 +206,34 @@ cargo run -p gateway-connector-app --features gpui-app --bin gateway-connector
 
 ## Next extraction steps
 
-CI runs the Linux behavior gate and Windows/macOS GPUI compile checks. The
-compile-time wrapper boundary and exact-revision migration are documented in
+CI runs the Linux behavior gate and Windows/macOS GPUI compile checks. Native
+Windows CI also builds and inspects the unsigned manual release package,
+including its GUI subsystem, embedded neutral icon/version resources, and ZIP
+contents. Build the same artifact locally on Windows with:
+
+```powershell
+./packaging/windows/stage-release.ps1
+./packaging/windows/test-release-assertions.ps1
+```
+
+The output is `dist/GatewayConnector-<version>-windows-x64.zip`, containing
+only `gateway-connector.exe`, `LICENSE`, and `release-metadata.json`. It is not
+signed and has no updater or latest-release feed. `release-metadata.json` is
+the neutral packaging contract and is checked against the Cargo workspace
+version during both compilation and staging. The original icon source and its
+license notice live in `packaging/windows/`; builds use the tracked `.ico`
+without downloading or generating assets.
+
+macOS remains compile-checked only; this repository does not currently claim a
+macOS package, signature, or notarization. The compile-time wrapper boundary
+and exact-revision migration are documented in
 [`docs/distribution.md`](docs/distribution.md) and
 [`docs/downstream-migration.md`](docs/downstream-migration.md). Native Windows
 visual acceptance remains required before calling the desktop client complete.
 
-Packaging, OAuth client IDs, account/billing schemas, brand assets, product
-URLs, signing, update feeds, and release infrastructure remain downstream.
+Branded packaging, OAuth client IDs, account/billing schemas, brand assets,
+product URLs, signing, update feeds, and automated release infrastructure
+remain downstream.
 
 ## License
 

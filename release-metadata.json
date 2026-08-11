@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "product_name": "GatewayConnector",
+  "file_description": "Gateway Connector",
+  "company_name": "GatewayConnector contributors",
+  "legal_copyright": "Copyright 2026 GatewayConnector contributors",
+  "version": "0.1.0",
+  "binary_name": "gateway-connector",
+  "original_filename": "gateway-connector.exe",
+  "release_mode": "unsigned-manual",
+  "signed": false,
+  "updater": false,
+  "windows_target": "windows-x64",
+  "windows_rust_target": "x86_64-pc-windows-msvc",
+  "windows_icon_images": 9,
+  "windows_artifact": "GatewayConnector-{version}-windows-x64.zip"
+}

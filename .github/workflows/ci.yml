@@ -55,3 +55,11 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo check -p gateway-connector-app --features gpui-app
+      - name: Stage unsigned Windows release package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./packaging/windows/stage-release.ps1
+      - name: Assert Windows PE resources and package contract
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./packaging/windows/test-release-assertions.ps1
