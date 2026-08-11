@@ -172,6 +172,12 @@ fail closed without rewriting the file.
 Rust 1.97 is pinned. In an Amp orb, `.agents/setup` installs Rust and the Linux
 libraries used by GPUI.
 
+The desktop dependency provenance is pinned exactly: `fran0220/gpui-kit` at
+`31e08fc7ab420cb218122dd157df8309ee667d58`, with direct `gpui` and
+`gpui_platform` dependencies from `fran0220/zed` at
+`0b9c8dc932b65cba2dc87464148984e93f60ae18`. `Cargo.lock` must resolve the GPUI
+graph from that single Zed revision.
+
 ```bash
 cargo fmt --all --check
 cargo test --workspace
