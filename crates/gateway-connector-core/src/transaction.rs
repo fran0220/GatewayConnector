@@ -18,6 +18,7 @@ use std::{
 use toml_edit::{DocumentMut, Item, Table, value};
 
 const SKILL_OWNER_FILE: &str = ".gateway-connector-owner";
+const MAX_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct ApplyInput<'a> {
@@ -43,25 +44,57 @@ pub struct Change {
     pub managed_entries: Vec<String>,
 }
 #[derive(Clone)]
-enum Op {
-    File {
-        path: PathBuf,
-        bytes: Vec<u8>,
-    },
-    Dir {
-        path: PathBuf,
-        source: PathBuf,
-        marker: Vec<u8>,
-    },
-    Remove {
-        path: PathBuf,
-    },
+struct Op {
+    path: PathBuf,
+    guard: RootGuard,
+    kind: OpKind,
+}
+#[derive(Clone)]
+enum OpKind {
+    File { bytes: Vec<u8> },
+    Dir { source: PathBuf, marker: Vec<u8> },
+    Remove,
+}
+impl Op {
+    fn file(root: &Path, path: PathBuf, bytes: Vec<u8>) -> Result<Self> {
+        Ok(Self {
+            guard: RootGuard::capture(root, &path)?,
+            path,
+            kind: OpKind::File { bytes },
+        })
+    }
+
+    fn dir(root: &Path, path: PathBuf, source: PathBuf, marker: Vec<u8>) -> Result<Self> {
+        Ok(Self {
+            guard: RootGuard::capture(root, &path)?,
+            path,
+            kind: OpKind::Dir { source, marker },
+        })
+    }
+
+    fn remove(root: &Path, path: PathBuf) -> Result<Self> {
+        Ok(Self {
+            guard: RootGuard::capture(root, &path)?,
+            path,
+            kind: OpKind::Remove,
+        })
+    }
 }
 type FileProjection = (PathBuf, Vec<u8>, Vec<String>);
-enum Saved {
-    Missing,
-    Bytes(Vec<u8>),
-    Disk(PathBuf),
+struct JsonProjection {
+    value: Value,
+    source: Option<String>,
+}
+impl std::ops::Deref for JsonProjection {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        &self.value
+    }
+}
+impl std::ops::DerefMut for JsonProjection {
+    fn deref_mut(&mut self) -> &mut Value {
+        &mut self.value
+    }
 }
 #[derive(Clone)]
 pub struct Plan {
@@ -157,6 +190,9 @@ impl Connector {
         }
     }
     pub fn plan(&self, input: ApplyInput<'_>) -> Result<Plan> {
+        let _lock = self.lock(&input.manifest.platform.id)?;
+        ensure_plain_dir(&self.state_dir)?;
+        self.recover_locked(&input.manifest.platform.id, &receipt_key(input.bearer)?)?;
         input.manifest.validate()?;
         input.provisioning.validate_for(input.manifest)?;
         if !input
@@ -185,8 +221,13 @@ impl Connector {
         let mut changes = Vec::new();
         let mut projected_paths = BTreeSet::new();
         let key = receipt_key(input.bearer)?;
-        let expected_receipt = snapshot_file(&self.receipt_path(platform))?;
+        let receipt_path = self.receipt_path(platform);
+        RootGuard::capture(&self.state_dir, &receipt_path)?;
+        let expected_receipt = snapshot_file(&receipt_path)?;
         let old_receipt = self.load_receipt(platform, &key)?;
+        if let Some(receipt) = &old_receipt {
+            validate_receipt_paths(&self.state_dir, receipt)?;
+        }
         let mut projection_bases = BTreeMap::new();
         let mut expected_files = BTreeMap::new();
         let mut expected_skills = BTreeMap::new();
@@ -295,16 +336,14 @@ impl Connector {
                 .expect("staged Skill receipt exists")
                 .marker
                 .clone();
-            ops.push(Op::Dir {
-                path: ssot,
-                source: source.clone(),
-                marker,
-            });
+            ops.push(Op::dir(&self.state_dir, ssot, source.clone(), marker)?);
         }
         for install in installs.iter().filter(|x| x.detected) {
             if !input.manifest.supported_agents.contains(&install.agent) {
                 continue;
             }
+            let boundary = install_boundary(install)?;
+            validate_agent_destinations(install, boundary)?;
             let model = input
                 .selected_models
                 .get(&install.agent)
@@ -359,11 +398,12 @@ impl Connector {
                     original,
                     applied: bytes.clone(),
                 });
-                ops.push(Op::File { path, bytes });
+                ops.push(Op::file(boundary, path, bytes)?);
             }
             for skill in &input.provisioning.skills {
                 let ssot = self.state_dir.join("skills").join(platform).join(&skill.id);
                 let target = install.root.join("skills").join(&skill.id);
+                RootGuard::capture(boundary, &target)?;
                 claim_path(&mut projected_paths, &target)?;
                 let previous = old_receipt
                     .as_ref()
@@ -410,11 +450,19 @@ impl Connector {
                     .expect("target Skill receipt exists")
                     .marker
                     .clone();
-                ops.push(Op::Dir {
-                    path: target,
-                    source: ssot,
+                ops.push(Op::dir(
+                    boundary,
+                    target,
+                    // Capture every target from the immutable synchronized
+                    // input.  Preparing a transaction must not depend on an
+                    // earlier operation having populated the SSOT directory.
+                    input
+                        .synchronized_skills
+                        .get(&skill.id)
+                        .expect("validated synchronized Skill")
+                        .clone(),
                     marker,
-                });
+                )?);
             }
         }
         let receipt = Receipt {
@@ -436,10 +484,11 @@ impl Connector {
                                 kind: ChangeKind::Update,
                                 managed_entries: vec!["restore prior configuration".into()],
                             });
-                            cleanup_ops.push(Op::File {
-                                path: file.path.clone(),
+                            cleanup_ops.push(Op::file(
+                                receipt_root(&self.state_dir, old, &file.path)?,
+                                file.path.clone(),
                                 bytes,
-                            });
+                            )?);
                         }
                         Some(_) => {}
                         None if exists(&file.path) => {
@@ -448,9 +497,10 @@ impl Connector {
                                 kind: ChangeKind::Remove,
                                 managed_entries: vec!["remove managed configuration".into()],
                             });
-                            cleanup_ops.push(Op::Remove {
-                                path: file.path.clone(),
-                            });
+                            cleanup_ops.push(Op::remove(
+                                receipt_root(&self.state_dir, old, &file.path)?,
+                                file.path.clone(),
+                            )?);
                         }
                         None => {}
                     }
@@ -463,18 +513,20 @@ impl Connector {
                         kind: ChangeKind::Remove,
                         managed_entries: vec!["remove managed Skill".into()],
                     });
-                    cleanup_ops.push(Op::Remove {
-                        path: skill.path.clone(),
-                    });
+                    cleanup_ops.push(Op::remove(
+                        receipt_root(&self.state_dir, old, &skill.path)?,
+                        skill.path.clone(),
+                    )?);
                 }
             }
         }
         cleanup_ops.extend(ops);
-        cleanup_ops.push(Op::File {
-            path: ownership_path,
-            bytes: serde_json::to_vec_pretty(&coordinator)
+        cleanup_ops.push(Op::file(
+            &self.coordinator_dir,
+            ownership_path,
+            serde_json::to_vec_pretty(&coordinator)
                 .map_err(|error| Error::Transaction(error.to_string()))?,
-        });
+        )?);
         Ok(Plan {
             platform_id: platform.clone(),
             changes,
@@ -487,9 +539,15 @@ impl Connector {
         })
     }
     pub fn apply(&self, plan: &Plan) -> Result<()> {
-        fs::create_dir_all(&self.state_dir).map_err(|e| io(&self.state_dir, e))?;
         let _lock = self.lock(&plan.platform_id)?;
-        if snapshot_file(&self.receipt_path(&plan.platform_id))? != plan.expected_receipt {
+        ensure_plain_dir(&self.state_dir)?;
+        self.recover_locked(&plan.platform_id, &plan.key)?;
+        for op in &plan.ops {
+            op.guard.validate(&op.path)?;
+        }
+        let receipt_path = self.receipt_path(&plan.platform_id);
+        RootGuard::capture(&self.state_dir, &receipt_path)?;
+        if snapshot_file(&receipt_path)? != plan.expected_receipt {
             return Err(Error::Validation(
                 "Connector state changed after this plan was created; preview again".into(),
             ));
@@ -511,43 +569,38 @@ impl Connector {
             }
         }
         let mut all_ops = plan.ops.clone();
-        let receipt_path = self.receipt_path(&plan.platform_id);
         let receipt_bytes = seal_receipt(&plan.receipt, &plan.key)?;
-        all_ops.push(Op::File {
-            path: receipt_path,
-            bytes: receipt_bytes,
-        });
-        execute_ops(&self.state_dir, &plan.platform_id, all_ops)
+        all_ops.push(Op::file(&self.state_dir, receipt_path, receipt_bytes)?);
+        execute_ops(&self.coordinator_dir, &plan.platform_id, &plan.key, all_ops)
     }
     pub fn verify(&self, plan: &Plan) -> Result<Verification> {
+        let _lock = self.lock(&plan.platform_id)?;
+        self.recover_locked(&plan.platform_id, &plan.key)?;
         let mut mismatches = Vec::new();
         for op in &plan.ops {
-            match op {
-                Op::File { path, bytes } => {
-                    if fs::read(path).ok().as_deref() != Some(bytes) {
-                        mismatches.push(path.clone())
+            op.guard.validate(&op.path)?;
+            match &op.kind {
+                OpKind::File { bytes } => {
+                    if fs::read(&op.path).ok().as_deref() != Some(bytes) {
+                        mismatches.push(op.path.clone())
                     }
                 }
-                Op::Dir {
-                    path,
-                    source,
-                    marker,
-                } => {
+                OpKind::Dir { source, marker } => {
                     let content_matches =
-                        match (hash_skill_content(path), hash_skill_content(source)) {
+                        match (hash_skill_content(&op.path), hash_skill_content(source)) {
                             (Ok(applied), Ok(expected)) => applied == expected,
                             _ => false,
                         };
-                    if fs::read(path.join(SKILL_OWNER_FILE)).ok().as_deref()
+                    if fs::read(op.path.join(SKILL_OWNER_FILE)).ok().as_deref()
                         != Some(marker.as_slice())
                         || !content_matches
                     {
-                        mismatches.push(path.clone())
+                        mismatches.push(op.path.clone())
                     }
                 }
-                Op::Remove { path } => {
-                    if exists(path) {
-                        mismatches.push(path.clone())
+                OpKind::Remove => {
+                    if exists(&op.path) {
+                        mismatches.push(op.path.clone())
                     }
                 }
             }
@@ -558,34 +611,37 @@ impl Connector {
         })
     }
     pub fn disconnect(&self, platform: &str, bearer: &Secret) -> Result<()> {
-        fs::create_dir_all(&self.state_dir).map_err(|e| io(&self.state_dir, e))?;
         let _lock = self.lock(platform)?;
+        ensure_plain_dir(&self.state_dir)?;
+        let key = receipt_key(bearer)?;
+        self.recover_locked(platform, &key)?;
         let rp = self.receipt_path(platform);
+        RootGuard::capture(&self.state_dir, &rp)?;
         if !rp.exists() {
             return Ok(());
         }
-        let receipt = open_receipt(
-            &fs::read(&rp).map_err(|e| io(&rp, e))?,
-            &receipt_key(bearer)?,
-        )?;
+        let receipt = open_receipt(&fs::read(&rp).map_err(|e| io(&rp, e))?, &key)?;
         if receipt.platform_id != platform {
             return Err(Error::Transaction(
                 "receipt does not belong to the requested platform".into(),
             ));
         }
+        validate_receipt_paths(&self.state_dir, &receipt)?;
         let mut ops = Vec::new();
         for file in &receipt.files {
             match reconciled_file(file)? {
                 Some(bytes) if fs::read(&file.path).ok().as_deref() != Some(bytes.as_slice()) => {
-                    ops.push(Op::File {
-                        path: file.path.clone(),
+                    ops.push(Op::file(
+                        receipt_root(&self.state_dir, &receipt, &file.path)?,
+                        file.path.clone(),
                         bytes,
-                    });
+                    )?);
                 }
                 Some(_) => {}
-                None if exists(&file.path) => ops.push(Op::Remove {
-                    path: file.path.clone(),
-                }),
+                None if exists(&file.path) => ops.push(Op::remove(
+                    receipt_root(&self.state_dir, &receipt, &file.path)?,
+                    file.path.clone(),
+                )?),
                 None => {}
             }
         }
@@ -602,9 +658,10 @@ impl Connector {
         }
         skills.sort_by_key(|skill| !is_symlink(&skill.path));
         for skill in skills {
-            ops.push(Op::Remove {
-                path: skill.path.clone(),
-            });
+            ops.push(Op::remove(
+                receipt_root(&self.state_dir, &receipt, &skill.path)?,
+                skill.path.clone(),
+            )?);
         }
         let mut coordinator = self.load_coordinator()?;
         for lease in &receipt.leases {
@@ -619,21 +676,20 @@ impl Connector {
         coordinator
             .leases
             .retain(|lease| !receipt.leases.iter().any(|owned| owned == lease));
-        ops.push(Op::File {
-            path: self.ownership_path(),
-            bytes: serde_json::to_vec_pretty(&coordinator)
+        ops.push(Op::file(
+            &self.coordinator_dir,
+            self.ownership_path(),
+            serde_json::to_vec_pretty(&coordinator)
                 .map_err(|error| Error::Transaction(error.to_string()))?,
-        });
+        )?);
         // Removing the authenticated receipt is the final transactional step.
         // Any earlier failure rolls every projection back and leaves ownership
         // recoverable with the credential still held by the caller.
-        ops.push(Op::Remove { path: rp });
-        execute_ops(&self.state_dir, platform, ops)
-    }
-    pub fn has_receipt(&self, platform: &str) -> bool {
-        self.receipt_path(platform).is_file()
+        ops.push(Op::remove(&self.state_dir, rp)?);
+        execute_ops(&self.coordinator_dir, platform, &key, ops)
     }
     pub fn managed_agents(&self, platform: &str, bearer: &Secret) -> Result<BTreeSet<AgentId>> {
+        self.recover(platform, bearer)?;
         let Some(receipt) = self.load_receipt(platform, &receipt_key(bearer)?)? else {
             return Ok(BTreeSet::new());
         };
@@ -650,19 +706,39 @@ impl Connector {
             })
             .collect())
     }
+    /// Recovers or finishes the single global projection transaction.
+    pub fn recover(&self, platform: &str, bearer: &Secret) -> Result<()> {
+        let _lock = self.lock(platform)?;
+        self.recover_locked(platform, &receipt_key(bearer)?)
+    }
+
+    fn recover_locked(&self, platform: &str, key: &[u8; 32]) -> Result<()> {
+        recover_transaction(&self.coordinator_dir, platform, key)
+    }
     fn lock(&self, _platform: &str) -> Result<fs::File> {
+        ensure_plain_dir(&self.coordinator_dir)?;
         let locks = self.coordinator_dir.join("locks");
-        fs::create_dir_all(&locks).map_err(|error| io(&locks, error))?;
+        ensure_plain_dir(&locks)?;
         // Agent config paths are global even when receipt/keyring state is
         // platform-partitioned, so all platforms share one process lock.
         let path = locks.join("connector.lock");
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|error| io(&path, error))?;
+        reject_absolute_reparse_components(&path)?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            );
+        }
+        let file = options.open(&path).map_err(|error| io(&path, error))?;
+        reject_absolute_reparse_components(&path)?;
         file.lock_exclusive().map_err(|error| io(&path, error))?;
         Ok(file)
     }
@@ -671,6 +747,7 @@ impl Connector {
     }
     fn load_coordinator(&self) -> Result<ProjectionCoordinator> {
         let path = self.ownership_path();
+        RootGuard::capture(&self.coordinator_dir, &path)?;
         match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| Error::Config {
                 path,
@@ -687,6 +764,7 @@ impl Connector {
     }
     fn load_receipt(&self, platform: &str, key: &[u8; 32]) -> Result<Option<Receipt>> {
         let path = self.receipt_path(platform);
+        RootGuard::capture(&self.state_dir, &path)?;
         if !path.exists() {
             return Ok(None);
         }
@@ -700,71 +778,1390 @@ impl Connector {
     }
 }
 
-fn execute_ops(state_dir: &Path, platform: &str, ops: Vec<Op>) -> Result<()> {
-    let backup = state_dir.join("backups").join(platform).join(format!(
-        "run-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&backup).map_err(|e| io(&backup, e))?;
-    let mut done: Vec<(PathBuf, Saved)> = Vec::new();
-    for (index, op) in ops.iter().enumerate() {
-        let path = match op {
-            Op::File { path, .. } | Op::Dir { path, .. } | Op::Remove { path } => path,
-        };
-        let saved = if path.is_file() && !path.is_symlink() {
-            match fs::read(path) {
-                Ok(bytes) => Saved::Bytes(bytes),
-                Err(error) => {
-                    let rollback_error = rollback(done).err();
-                    let _ = fs::remove_dir_all(&backup);
-                    return Err(transaction_error(io(path, error), rollback_error));
-                }
-            }
-        } else if exists(path) {
-            let saved = backup.join(index.to_string());
-            if let Err(error) = copy_any(path, &saved) {
-                let rollback_error = rollback(done).err();
-                let _ = fs::remove_dir_all(&backup);
-                return Err(transaction_error(error, rollback_error));
-            }
-            Saved::Disk(saved)
-        } else {
-            Saved::Missing
-        };
-        let result = match op {
-            Op::File { path, bytes } => atomic(path, bytes),
-            Op::Dir {
-                path,
-                source,
-                marker,
-            } => {
-                if exists(path) {
-                    remove_any(path)
-                        .and_then(|()| copy_dir(source, path))
-                        .and_then(|()| atomic(&path.join(SKILL_OWNER_FILE), marker))
-                } else {
-                    copy_dir(source, path)
-                        .and_then(|()| atomic(&path.join(SKILL_OWNER_FILE), marker))
-                }
-            }
-            Op::Remove { path } => remove_any(path),
-        };
-        if let Err(error) = result {
-            done.push((path.clone(), saved));
-            let rollback_error = rollback(done).err();
-            let _ = fs::remove_dir_all(&backup);
-            return Err(transaction_error(error, rollback_error));
+#[derive(Clone, Serialize, Deserialize)]
+struct RootGuard {
+    root: PathBuf,
+    ancestors: Vec<PathIdentity>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PathIdentity {
+    path: PathBuf,
+    device: u64,
+    file: u64,
+}
+
+impl RootGuard {
+    fn capture(root: &Path, path: &Path) -> Result<Self> {
+        validate_lexical_boundary(root, path)?;
+        reject_reparse_components(root, path)?;
+        let mut ancestors = Vec::new();
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::Validation("destination has no parent".into()))?;
+        let mut current = root.to_path_buf();
+        if let Some(identity) = existing_identity(&current)? {
+            ancestors.push(identity);
         }
-        done.push((path.clone(), saved));
+        let relative = parent.strip_prefix(root).map_err(|_| {
+            Error::Validation(format!(
+                "destination escapes its canonical root: {}",
+                path.display()
+            ))
+        })?;
+        for component in relative.components() {
+            current.push(component.as_os_str());
+            match existing_identity(&current)? {
+                Some(identity) => ancestors.push(identity),
+                None => break,
+            }
+        }
+        let guard = Self {
+            root: root.to_path_buf(),
+            ancestors,
+        };
+        guard.validate(path)?;
+        Ok(guard)
     }
-    // Directory backups contain only synchronized Skills or links. Secret-bearing
-    // files and the encrypted receipt are kept in memory for rollback.
-    let _ = fs::remove_dir_all(&backup);
+
+    fn validate(&self, path: &Path) -> Result<()> {
+        validate_lexical_boundary(&self.root, path)?;
+        reject_reparse_components(&self.root, path)?;
+        for expected in &self.ancestors {
+            let actual = existing_identity(&expected.path)?.ok_or_else(|| {
+                Error::Validation(format!(
+                    "projection parent was removed after preview: {}",
+                    expected.path.display()
+                ))
+            })?;
+            if actual.device != expected.device || actual.file != expected.file {
+                return Err(Error::Validation(format!(
+                    "projection parent was replaced after preview: {}",
+                    expected.path.display()
+                )));
+            }
+        }
+        let root_canonical = canonical_existing(&self.root)?;
+        let ancestor = nearest_existing(path)?;
+        let ancestor_canonical =
+            fs::canonicalize(&ancestor).map_err(|error| io(&ancestor, error))?;
+        if !ancestor_canonical.starts_with(&root_canonical) {
+            return Err(Error::Validation(format!(
+                "projection destination resolves outside its canonical root: {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn validate_lexical_boundary(root: &Path, path: &Path) -> Result<()> {
+    use std::path::Component;
+    if !root.is_absolute()
+        || !path.is_absolute()
+        || root
+            .components()
+            .chain(path.components())
+            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+        || path == root
+        || !path.starts_with(root)
+    {
+        return Err(Error::Validation(format!(
+            "projection destination is outside its canonical root: {}",
+            path.display()
+        )));
+    }
     Ok(())
+}
+
+fn reject_reparse_components(root: &Path, path: &Path) -> Result<()> {
+    let mut current = root.to_path_buf();
+    check_component(&current, true)?;
+    let relative = path.strip_prefix(root).map_err(|_| {
+        Error::Validation(format!(
+            "projection destination escapes its root: {}",
+            path.display()
+        ))
+    })?;
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        check_component(&current, index + 1 < components.len())?;
+        if !exists(&current) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn check_component(path: &Path, must_be_directory: bool) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io(path, error)),
+    };
+    if is_reparse(&metadata) {
+        return Err(Error::Validation(format!(
+            "projection path contains a symlink or reparse point: {}",
+            path.display()
+        )));
+    }
+    if (!metadata.is_file() && !metadata.is_dir()) || (must_be_directory && !metadata.is_dir()) {
+        return Err(Error::Validation(format!(
+            "projection path contains a special or non-directory component: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn is_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+#[cfg_attr(windows, allow(unsafe_code))]
+fn existing_identity(path: &Path) -> Result<Option<PathIdentity>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io(path, error)),
+    };
+    if is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(Error::Validation(format!(
+            "projection parent is not a plain directory: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    let (device, file) = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    };
+    #[cfg(windows)]
+    let (device, file) = {
+        use std::{mem::zeroed, os::windows::io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            GetFileInformationByHandle,
+        };
+        let mut options = fs::OpenOptions::new();
+        use std::os::windows::fs::OpenOptionsExt;
+        options
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let handle = options.open(path).map_err(|error| io(path, error))?;
+        let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
+        if unsafe { GetFileInformationByHandle(handle.as_raw_handle() as _, &mut information) } == 0
+        {
+            return Err(io(path, std::io::Error::last_os_error()));
+        }
+        (
+            u64::from(information.dwVolumeSerialNumber),
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+        )
+    };
+    Ok(Some(PathIdentity {
+        path: path.to_path_buf(),
+        device,
+        file,
+    }))
+}
+
+fn canonical_existing(root: &Path) -> Result<PathBuf> {
+    let existing = nearest_existing(root)?;
+    if existing != root {
+        return Err(Error::Validation(format!(
+            "projection root does not exist: {}",
+            root.display()
+        )));
+    }
+    fs::canonicalize(root).map_err(|error| io(root, error))
+}
+
+fn nearest_existing(path: &Path) -> Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    loop {
+        match fs::symlink_metadata(&current) {
+            Ok(_) => return Ok(current),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !current.pop() {
+                    return Err(Error::Validation(format!(
+                        "projection path has no existing ancestor: {}",
+                        path.display()
+                    )));
+                }
+            }
+            Err(error) => return Err(io(&current, error)),
+        }
+    }
+}
+
+fn receipt_root<'a>(state_dir: &'a Path, receipt: &'a Receipt, path: &Path) -> Result<&'a Path> {
+    if path.starts_with(state_dir) && path != state_dir {
+        return Ok(state_dir);
+    }
+    receipt
+        .leases
+        .iter()
+        .filter_map(|lease| lease_boundary_for_path(lease, path).map(|root| (lease, root)))
+        .max_by_key(|(lease, _)| lease.root.components().count())
+        .map(|(_, root)| root)
+        .ok_or_else(|| {
+            Error::Validation(format!(
+                "authenticated receipt path is outside every leased root: {}",
+                path.display()
+            ))
+        })
+}
+
+fn install_boundary(install: &AgentInstall) -> Result<&Path> {
+    if install.agent == AgentId::Claude
+        && install.root.file_name().and_then(|name| name.to_str()) == Some(".claude")
+    {
+        install.root.parent().ok_or_else(|| {
+            Error::Validation("the canonical Claude root has no security boundary parent".into())
+        })
+    } else {
+        Ok(&install.root)
+    }
+}
+
+fn validate_agent_destinations(install: &AgentInstall, boundary: &Path) -> Result<()> {
+    let mut paths = match install.agent {
+        AgentId::Claude => vec![
+            install.root.join("settings.json"),
+            install.root.join("claude.json"),
+            install.root.join(".claude.json"),
+        ],
+        AgentId::Gemini => vec![
+            install.root.join(".env"),
+            install.root.join("settings.json"),
+        ],
+        AgentId::Opencode => vec![
+            install.root.join("opencode.json"),
+            install.root.join("opencode.jsonc"),
+        ],
+        AgentId::Codex | AgentId::Grokbuild => vec![install.root.join("config.toml")],
+    };
+    if install.agent == AgentId::Claude
+        && install.root.file_name().and_then(|name| name.to_str()) == Some(".claude")
+    {
+        paths.push(
+            install
+                .root
+                .parent()
+                .ok_or_else(|| Error::Validation("Claude root has no parent".into()))?
+                .join(".claude.json"),
+        );
+    }
+    for path in paths {
+        RootGuard::capture(boundary, &path)?;
+    }
+    Ok(())
+}
+
+fn lease_boundary_for_path<'a>(lease: &'a ProjectionLease, path: &Path) -> Option<&'a Path> {
+    if path.starts_with(&lease.root) && path != lease.root {
+        return Some(&lease.root);
+    }
+    if lease.agent == AgentId::Claude.as_str()
+        && lease.root.file_name().and_then(|name| name.to_str()) == Some(".claude")
+        && path == lease.root.parent()?.join(".claude.json")
+    {
+        lease.root.parent()
+    } else {
+        None
+    }
+}
+
+fn validate_receipt_paths(state_dir: &Path, receipt: &Receipt) -> Result<()> {
+    for path in receipt
+        .files
+        .iter()
+        .map(|file| &file.path)
+        .chain(receipt.skills.iter().map(|skill| &skill.path))
+    {
+        RootGuard::capture(receipt_root(state_dir, receipt, path)?, path)?;
+    }
+    Ok(())
+}
+
+fn reject_absolute_reparse_components(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if is_reparse(&metadata) => {
+                return Err(Error::Validation(format!(
+                    "storage path contains a symlink or reparse point: {}",
+                    current.display()
+                )));
+            }
+            Ok(metadata) if current != path && (!metadata.is_dir() || is_reparse(&metadata)) => {
+                return Err(Error::Validation(format!(
+                    "storage path contains a non-directory component: {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(io(&current, error)),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_plain_dir(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(Error::Validation(format!(
+            "storage directory must be absolute: {}",
+            path.display()
+        )));
+    }
+    reject_absolute_reparse_components(path)?;
+    fs::create_dir_all(path).map_err(|error| io(path, error))?;
+    reject_absolute_reparse_components(path)?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| io(path, error))?;
+    if !metadata.is_dir() || is_reparse(&metadata) {
+        return Err(Error::Validation(format!(
+            "storage path is not a plain directory: {}",
+            path.display()
+        )));
+    }
+    sync_parent(path)
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ActiveHeader {
+    version: u32,
+    transaction: String,
+    platform: String,
+    bundle: String,
+    salt: Vec<u8>,
+}
+#[derive(Serialize, Deserialize)]
+struct JournalManifest {
+    ops: Vec<JournalOp>,
+    created_parents: Vec<CreatedParent>,
+}
+#[derive(Serialize, Deserialize)]
+struct JournalOp {
+    path: PathBuf,
+    guard: RootGuard,
+    prior: Snapshot,
+    intended: Snapshot,
+    stage: PathBuf,
+    displaced: PathBuf,
+}
+#[derive(Serialize, Deserialize)]
+struct CreatedParent {
+    path: PathBuf,
+    guard: RootGuard,
+}
+#[derive(Clone, Serialize, Deserialize)]
+enum Snapshot {
+    Missing,
+    File {
+        digest: Vec<u8>,
+        length: u64,
+        mode: u32,
+    },
+    Directory {
+        entries: Vec<TreeEntry>,
+        mode: u32,
+    },
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct TreeEntry {
+    path: PathBuf,
+    directory: bool,
+    digest: Vec<u8>,
+    length: u64,
+    mode: u32,
+}
+#[derive(Serialize, Deserialize)]
+struct SealedJournal {
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+#[derive(Serialize, Deserialize)]
+struct StoredJournal {
+    header: ActiveHeader,
+    manifest: SealedJournal,
+}
+
+fn journal_key(receipt: &[u8; 32], salt: &[u8]) -> Result<[u8; 32]> {
+    let mut key = [0; 32];
+    Hkdf::<Sha256>::new(Some(salt), receipt)
+        .expand(b"Gateway Connector durable projection journal v1", &mut key)
+        .map_err(|_| Error::Transaction("could not derive journal key".into()))?;
+    Ok(key)
+}
+fn seal_journal<T: Serialize>(value: &T, key: &[u8; 32], aad: &[u8]) -> Result<Vec<u8>> {
+    use aes_gcm::aead::Payload;
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let plain = serde_json::to_vec(value).map_err(|e| Error::Transaction(e.to_string()))?;
+    let ciphertext = Aes256Gcm::new(key.into())
+        .encrypt(&nonce, Payload { msg: &plain, aad })
+        .map_err(|_| Error::Transaction("journal encryption failed".into()))?;
+    serde_json::to_vec(&SealedJournal {
+        nonce: nonce.to_vec(),
+        ciphertext,
+    })
+    .map_err(|e| Error::Transaction(e.to_string()))
+}
+fn open_journal<T: for<'a> Deserialize<'a>>(bytes: &[u8], key: &[u8; 32], aad: &[u8]) -> Result<T> {
+    use aes_gcm::aead::Payload;
+    let sealed: SealedJournal = serde_json::from_slice(bytes)
+        .map_err(|e| Error::Transaction(format!("invalid transaction envelope: {e}")))?;
+    if sealed.nonce.len() != 12 {
+        return Err(Error::Transaction("invalid transaction nonce".into()));
+    }
+    let plain = Aes256Gcm::new(key.into()).decrypt(aes_gcm::Nonce::from_slice(&sealed.nonce),
+        Payload { msg: &sealed.ciphertext, aad })
+        .map_err(|_| Error::Transaction("transaction authentication failed; preserve the transaction bundle and use the original credential".into()))?;
+    serde_json::from_slice(&plain)
+        .map_err(|e| Error::Transaction(format!("invalid transaction manifest: {e}")))
+}
+
+fn execute_ops(
+    coordinator: &Path,
+    platform: &str,
+    receipt_key: &[u8; 32],
+    ops: Vec<Op>,
+) -> Result<()> {
+    validate_operation_graph(&ops)?;
+    let txid = uuid::Uuid::new_v4().to_string();
+    let transactions = coordinator.join("transactions");
+    ensure_plain_dir(&transactions)?;
+    let active_path = transactions.join("active.json");
+    recover_transaction(coordinator, platform, receipt_key)?;
+    if exists(&active_path) {
+        return Err(Error::Transaction(
+            "projection transaction remains active after recovery".into(),
+        ));
+    }
+    if fs::read_dir(&transactions)
+        .map_err(|error| io(&transactions, error))?
+        .next()
+        .is_some()
+    {
+        return Err(Error::Transaction(
+            "projection transaction directory is not clean after recovery".into(),
+        ));
+    }
+    let bundle_name = format!("bundle-{txid}");
+    let bundle = transactions.join(&bundle_name);
+    let salt = Aes256Gcm::generate_nonce(&mut OsRng).to_vec();
+    let header = ActiveHeader {
+        version: 1,
+        transaction: txid.clone(),
+        platform: platform.into(),
+        bundle: bundle_name,
+        salt,
+    };
+    let aad = serde_json::to_vec(&header).map_err(|e| Error::Transaction(e.to_string()))?;
+    let key = journal_key(receipt_key, &header.salt)?;
+    let mut journal_ops = Vec::new();
+    let mut created_parents = BTreeMap::<PathBuf, CreatedParent>::new();
+    for (index, op) in ops.iter().enumerate() {
+        op.guard.validate(&op.path)?;
+        let intended = match &op.kind {
+            OpKind::File { bytes } => file_snapshot(bytes, managed_file_mode()),
+            OpKind::Dir { source, marker } => {
+                let mut snapshot = take_snapshot(source)?;
+                if let Snapshot::Directory { entries, .. } = &mut snapshot {
+                    entries.push(TreeEntry {
+                        path: PathBuf::from(SKILL_OWNER_FILE),
+                        directory: false,
+                        digest: Sha256::digest(marker).to_vec(),
+                        length: marker.len() as u64,
+                        mode: managed_file_mode(),
+                    });
+                    entries.sort_by(|left, right| left.path.cmp(&right.path));
+                }
+                snapshot
+            }
+            OpKind::Remove => Snapshot::Missing,
+        };
+        let parent = op
+            .path
+            .parent()
+            .ok_or_else(|| Error::Transaction("destination has no parent".into()))?;
+        for missing in missing_parents(&op.guard.root, parent)? {
+            created_parents
+                .entry(missing.clone())
+                .or_insert(CreatedParent {
+                    guard: RootGuard::capture(&op.guard.root, &missing)?,
+                    path: missing,
+                });
+        }
+        let stage = parent.join(format!(".gateway-stage-{txid}-{index}"));
+        let displaced = parent.join(format!(".gateway-displaced-{txid}-{index}"));
+        op.guard.validate(&stage)?;
+        op.guard.validate(&displaced)?;
+        if exists(&stage) || exists(&displaced) {
+            return Err(Error::Transaction(
+                "transaction sibling already exists before prepare".into(),
+            ));
+        }
+        journal_ops.push(JournalOp {
+            path: op.path.clone(),
+            guard: op.guard.clone(),
+            prior: take_snapshot(&op.path)?,
+            intended,
+            stage,
+            displaced,
+        });
+    }
+    let mut created_parents = created_parents.into_values().collect::<Vec<_>>();
+    created_parents.sort_by_key(|parent| parent.path.components().count());
+    let manifest = JournalManifest {
+        ops: journal_ops,
+        created_parents,
+    };
+    validate_journal_manifest(&manifest)?;
+    let manifest_envelope: SealedJournal =
+        serde_json::from_slice(&seal_journal(&manifest, &key, &aad)?)
+            .map_err(|error| Error::Transaction(error.to_string()))?;
+    let stored_journal = serde_json::to_vec(&StoredJournal {
+        header: header.clone(),
+        manifest: manifest_envelope,
+    })
+    .map_err(|error| Error::Transaction(error.to_string()))?;
+    if stored_journal.len() as u64 > MAX_JOURNAL_BYTES {
+        return Err(Error::Transaction(
+            "projection journal exceeds its serialized size limit".into(),
+        ));
+    }
+    ensure_plain_dir(&bundle)?;
+    atomic(&bundle.join("manifest.enc"), &stored_journal)?;
+    maybe_failpoint("manifest-durable");
+    atomic(&active_path, &aad)?;
+    maybe_failpoint("prepared-durable");
+    let prepared_result = (|| {
+        create_journal_parents(&manifest.created_parents)?;
+        for (journal_op, op) in manifest.ops.iter().zip(&ops) {
+            apply_journal_op(journal_op, op)?;
+        }
+        maybe_failpoint("mutations-complete");
+        let mut commit_aad = aad.clone();
+        commit_aad.extend_from_slice(b"/committed");
+        atomic(
+            &bundle.join("committed.enc"),
+            &seal_journal(&txid, &key, &commit_aad)?,
+        )
+    })();
+    if let Err(error) = prepared_result {
+        return match recover_transaction(coordinator, platform, receipt_key) {
+            Ok(()) => Err(error),
+            Err(recovery) => Err(Error::Transaction(format!(
+                "projection failed ({error}); durable recovery also failed ({recovery})"
+            ))),
+        };
+    }
+    maybe_failpoint("committed-durable");
+    cleanup_transaction(&transactions, &bundle, &manifest)
+}
+
+fn recover_transaction(coordinator: &Path, platform: &str, receipt_key: &[u8; 32]) -> Result<()> {
+    let transactions = coordinator.join("transactions");
+    if !transactions.exists() {
+        return Ok(());
+    }
+    let active = transactions.join("active.json");
+    RootGuard::capture(coordinator, &transactions)?;
+    RootGuard::capture(&transactions, &active)?;
+    let active_aad = read_optional_bounded(&active)?;
+    let active_header = active_aad
+        .as_deref()
+        .map(|bytes| {
+            serde_json::from_slice::<ActiveHeader>(bytes).map_err(|error| {
+                Error::Transaction(format!("invalid global active transaction header: {error}"))
+            })
+        })
+        .transpose()?;
+    if let Some(header) = &active_header {
+        validate_active_header(header)?;
+    }
+    let bundle = transaction_bundle(
+        &transactions,
+        active_header.as_ref().map(|header| header.bundle.as_str()),
+    )?;
+    let Some(bundle) = bundle else {
+        return if active_header.is_some() {
+            Err(Error::Transaction(
+                "incomplete projection transaction has no authenticated bundle".into(),
+            ))
+        } else {
+            Ok(())
+        };
+    };
+    RootGuard::capture(&transactions, &bundle)?;
+    let manifest_path = bundle.join("manifest.enc");
+    RootGuard::capture(&bundle, &manifest_path)?;
+    let stored: StoredJournal =
+        serde_json::from_slice(&read_bounded(&manifest_path)?).map_err(|error| {
+            Error::Transaction(format!("invalid stored transaction journal: {error}"))
+        })?;
+    validate_active_header(&stored.header)?;
+    if bundle.file_name().and_then(|name| name.to_str()) != Some(stored.header.bundle.as_str()) {
+        return Err(Error::Transaction(
+            "authenticated transaction header does not match its bundle".into(),
+        ));
+    }
+    let aad = serde_json::to_vec(&stored.header)
+        .map_err(|error| Error::Transaction(error.to_string()))?;
+    if active_aad.as_deref().is_some_and(|active| active != aad) {
+        return Err(Error::Transaction(
+            "active transaction pointer does not match the authenticated bundle header".into(),
+        ));
+    }
+    let header = stored.header;
+    if header.platform != platform {
+        return Err(Error::Transaction(format!(
+            "global projection transaction {} belongs to platform {}; recover it with that platform credential",
+            header.transaction, header.platform
+        )));
+    }
+    let key = journal_key(receipt_key, &header.salt)?;
+    let manifest_envelope = serde_json::to_vec(&stored.manifest)
+        .map_err(|error| Error::Transaction(error.to_string()))?;
+    let manifest: JournalManifest = open_journal(&manifest_envelope, &key, &aad)?;
+    validate_journal_manifest(&manifest)?;
+    let committed = bundle.join("committed.enc");
+    if committed.exists() {
+        RootGuard::capture(&bundle, &committed)?;
+        let mut commit_aad = aad.clone();
+        commit_aad.extend_from_slice(b"/committed");
+        let id: String = open_journal(&read_bounded(&committed)?, &key, &commit_aad)?;
+        if id != header.transaction {
+            return Err(Error::Transaction(
+                "commit marker transaction mismatch".into(),
+            ));
+        }
+        for op in &manifest.ops {
+            op.guard.validate(&op.path)?;
+            if !snapshot_matches(&op.path, &op.intended)? {
+                return Err(Error::Transaction(format!(
+                    "committed destination does not match authenticated intent: {}",
+                    op.path.display()
+                )));
+            }
+            if exists(&op.stage) {
+                return Err(Error::Transaction(format!(
+                    "committed transaction has an unexpected stage: {}",
+                    op.stage.display()
+                )));
+            }
+            if exists(&op.displaced) && !snapshot_matches(&op.displaced, &op.prior)? {
+                return Err(Error::Transaction(format!(
+                    "committed transaction has an invalid displaced snapshot: {}",
+                    op.displaced.display()
+                )));
+            }
+        }
+    } else {
+        for op in manifest.ops.iter().rev() {
+            rollback_journal_op(op)?;
+        }
+        remove_created_parents(&manifest.created_parents)?;
+    }
+    cleanup_transaction(&transactions, &bundle, &manifest)
+}
+
+fn validate_active_header(header: &ActiveHeader) -> Result<()> {
+    let expected_bundle = format!("bundle-{}", header.transaction);
+    if header.version != 1
+        || header.salt.len() != 12
+        || uuid::Uuid::parse_str(&header.transaction).is_err()
+        || header.bundle != expected_bundle
+    {
+        return Err(Error::Transaction(
+            "invalid global active transaction header fields".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn transaction_bundle(transactions: &Path, expected: Option<&str>) -> Result<Option<PathBuf>> {
+    let mut bundle = None;
+    let mut temporary = false;
+    for entry in fs::read_dir(transactions).map_err(|error| io(transactions, error))? {
+        let entry = entry.map_err(|error| io(transactions, error))?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "active.json" {
+            continue;
+        }
+        if name.starts_with(".connector-") && name.ends_with(".tmp") {
+            let metadata = fs::symlink_metadata(&path).map_err(|error| io(&path, error))?;
+            if is_reparse(&metadata) || !metadata.is_file() {
+                return Err(Error::Transaction(format!(
+                    "invalid transaction temporary artifact: {}",
+                    path.display()
+                )));
+            }
+            temporary = true;
+            continue;
+        }
+        let valid_bundle = name
+            .strip_prefix("bundle-")
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
+        let metadata = fs::symlink_metadata(&path).map_err(|error| io(&path, error))?;
+        if !valid_bundle || is_reparse(&metadata) || !metadata.is_dir() {
+            return Err(Error::Transaction(format!(
+                "unknown or invalid content in transaction directory: {}",
+                path.display()
+            )));
+        }
+        if expected.is_some_and(|expected| expected != name) || bundle.replace(path).is_some() {
+            return Err(Error::Transaction(
+                "multiple or mismatched projection transaction bundles require manual recovery"
+                    .into(),
+            ));
+        }
+    }
+    if expected.is_some() && bundle.is_none() {
+        return Err(Error::Transaction(
+            "active projection transaction bundle is missing".into(),
+        ));
+    }
+    if temporary && bundle.is_none() {
+        return Err(Error::Transaction(
+            "incomplete transaction temporary has no authenticated bundle".into(),
+        ));
+    }
+    Ok(bundle)
+}
+
+fn apply_journal_op(op: &JournalOp, source: &Op) -> Result<()> {
+    op.guard.validate(&op.path)?;
+    op.guard.validate(&op.stage)?;
+    op.guard.validate(&op.displaced)?;
+    if exists(&op.stage) || exists(&op.displaced) {
+        return Err(Error::Transaction(
+            "transaction sibling already exists".into(),
+        ));
+    }
+    if !matches!(op.intended, Snapshot::Missing) {
+        stage_operation(source, &op.stage)?;
+        sync_tree(&op.stage)?;
+        if !snapshot_matches(&op.stage, &op.intended)? {
+            return Err(Error::Transaction(format!(
+                "durable stage does not match authenticated intent: {}",
+                op.stage.display()
+            )));
+        }
+    }
+    maybe_failpoint("stage-durable");
+    op.guard.validate(&op.path)?;
+    if exists(&op.path) {
+        durable_rename(&op.path, &op.displaced)?;
+    }
+    maybe_failpoint("destination-displaced");
+    op.guard.validate(&op.path)?;
+    if !matches!(op.intended, Snapshot::Missing) {
+        durable_rename(&op.stage, &op.path)?;
+    }
+    maybe_failpoint("destination-installed");
+    Ok(())
+}
+fn cleanup_transaction(
+    transactions: &Path,
+    bundle: &Path,
+    manifest: &JournalManifest,
+) -> Result<()> {
+    for op in &manifest.ops {
+        op.guard.validate(&op.path)?;
+        if exists(&op.stage) {
+            op.guard.validate(&op.stage)?;
+            durable_remove_any(&op.stage)?;
+        }
+        if exists(&op.displaced) {
+            op.guard.validate(&op.displaced)?;
+            durable_remove_any(&op.displaced)?;
+        }
+        maybe_failpoint("cleanup-artifact");
+    }
+    let active = transactions.join("active.json");
+    if active.exists() {
+        durable_remove_any(&active)?;
+    }
+    maybe_failpoint("active-cleared");
+    cleanup_transaction_temporaries(transactions)?;
+    if bundle.exists() {
+        durable_remove_any(bundle)?;
+    }
+    maybe_failpoint("bundle-cleared");
+    Ok(())
+}
+
+fn rollback_journal_op(op: &JournalOp) -> Result<()> {
+    op.guard.validate(&op.path)?;
+    op.guard.validate(&op.stage)?;
+    op.guard.validate(&op.displaced)?;
+    let destination_is_prior = snapshot_matches(&op.path, &op.prior)?;
+    let destination_is_intended = snapshot_matches(&op.path, &op.intended)?;
+    let displaced_is_prior = snapshot_matches(&op.displaced, &op.prior)?;
+
+    if !matches!(op.prior, Snapshot::Missing) && exists(&op.displaced) && !displaced_is_prior {
+        return Err(Error::Transaction(format!(
+            "rollback found an invalid displaced snapshot: {}",
+            op.displaced.display()
+        )));
+    }
+    if matches!(op.prior, Snapshot::Missing) && exists(&op.displaced) {
+        return Err(Error::Transaction(format!(
+            "rollback found an unexpected displaced snapshot: {}",
+            op.displaced.display()
+        )));
+    }
+
+    if destination_is_prior {
+        if exists(&op.stage) {
+            op.guard.validate(&op.stage)?;
+            durable_remove_any(&op.stage)?;
+        }
+        if exists(&op.displaced) {
+            op.guard.validate(&op.displaced)?;
+            durable_remove_any(&op.displaced)?;
+        }
+        return Ok(());
+    }
+
+    if matches!(op.prior, Snapshot::Missing) {
+        if exists(&op.path) && !destination_is_intended {
+            return Err(Error::Transaction(format!(
+                "rollback found unknown destination content: {}",
+                op.path.display()
+            )));
+        }
+        if exists(&op.path) {
+            op.guard.validate(&op.path)?;
+            durable_remove_any(&op.path)?;
+        }
+        if exists(&op.stage) {
+            op.guard.validate(&op.stage)?;
+            durable_remove_any(&op.stage)?;
+        }
+        return Ok(());
+    }
+
+    if displaced_is_prior {
+        if exists(&op.path) && !destination_is_intended {
+            return Err(Error::Transaction(format!(
+                "rollback found unknown destination content: {}",
+                op.path.display()
+            )));
+        }
+        if exists(&op.path) {
+            op.guard.validate(&op.path)?;
+            durable_remove_any(&op.path)?;
+        }
+        if exists(&op.stage) {
+            op.guard.validate(&op.stage)?;
+            durable_remove_any(&op.stage)?;
+        }
+        op.guard.validate(&op.displaced)?;
+        durable_rename(&op.displaced, &op.path)?;
+        if !snapshot_matches(&op.path, &op.prior)? {
+            return Err(Error::Transaction(format!(
+                "rollback did not restore the authenticated prior snapshot: {}",
+                op.path.display()
+            )));
+        }
+        return Ok(());
+    }
+
+    Err(Error::Transaction(format!(
+        "rollback cannot locate the authenticated prior snapshot for {}",
+        op.path.display()
+    )))
+}
+
+fn missing_parents(root: &Path, parent: &Path) -> Result<Vec<PathBuf>> {
+    validate_lexical_boundary(root, &parent.join(".gateway-parent-probe"))?;
+    let mut missing = Vec::new();
+    let mut current = parent.to_path_buf();
+    while current != root && !exists(&current) {
+        missing.push(current.clone());
+        if !current.pop() {
+            return Err(Error::Validation(
+                "destination parent escaped its root".into(),
+            ));
+        }
+    }
+    if current != root && !current.starts_with(root) {
+        return Err(Error::Validation(
+            "destination parent escaped its root".into(),
+        ));
+    }
+    missing.reverse();
+    Ok(missing)
+}
+
+fn create_journal_parents(parents: &[CreatedParent]) -> Result<()> {
+    for parent in parents {
+        parent.guard.validate(&parent.path)?;
+        if exists(&parent.path) {
+            return Err(Error::Validation(format!(
+                "destination parent appeared after the journal was prepared: {}",
+                parent.path.display()
+            )));
+        }
+        fs::create_dir(&parent.path).map_err(|error| io(&parent.path, error))?;
+        sync_parent(&parent.path)?;
+        maybe_failpoint("parent-created");
+    }
+    Ok(())
+}
+
+fn remove_created_parents(parents: &[CreatedParent]) -> Result<()> {
+    for parent in parents.iter().rev() {
+        parent.guard.validate(&parent.path)?;
+        if !exists(&parent.path) {
+            continue;
+        }
+        if fs::read_dir(&parent.path)
+            .map_err(|error| io(&parent.path, error))?
+            .next()
+            .is_some()
+        {
+            return Err(Error::Transaction(format!(
+                "journal-created parent is not empty during rollback: {}",
+                parent.path.display()
+            )));
+        }
+        fs::remove_dir(&parent.path).map_err(|error| io(&parent.path, error))?;
+        sync_parent(&parent.path)?;
+    }
+    Ok(())
+}
+
+fn validate_operation_graph(ops: &[Op]) -> Result<()> {
+    const MAX_OPS: usize = 2048;
+    if ops.is_empty() || ops.len() > MAX_OPS {
+        return Err(Error::Transaction(
+            "projection transaction has an invalid operation count".into(),
+        ));
+    }
+    for (index, op) in ops.iter().enumerate() {
+        op.guard.validate(&op.path)?;
+        for other in ops.iter().skip(index + 1) {
+            let left = op.path.to_string_lossy().to_lowercase();
+            let right = other.path.to_string_lossy().to_lowercase();
+            if left == right || op.path.starts_with(&other.path) || other.path.starts_with(&op.path)
+            {
+                return Err(Error::Validation(format!(
+                    "projection operations overlap: {} and {}",
+                    op.path.display(),
+                    other.path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_journal_manifest(manifest: &JournalManifest) -> Result<()> {
+    if manifest.ops.is_empty() || manifest.ops.len() > 2048 {
+        return Err(Error::Transaction(
+            "authenticated journal has an invalid operation count".into(),
+        ));
+    }
+    for op in &manifest.ops {
+        validate_snapshot(&op.prior)?;
+        validate_snapshot(&op.intended)?;
+        op.guard.validate(&op.path)?;
+        let parent = op.path.parent().ok_or_else(|| {
+            Error::Transaction("authenticated journal destination has no parent".into())
+        })?;
+        if op.stage.parent() != Some(parent)
+            || op.displaced.parent() != Some(parent)
+            || op.stage == op.displaced
+        {
+            return Err(Error::Transaction(
+                "authenticated journal has invalid sibling paths".into(),
+            ));
+        }
+        op.guard.validate(&op.stage)?;
+        op.guard.validate(&op.displaced)?;
+    }
+    for (index, op) in manifest.ops.iter().enumerate() {
+        for other in manifest.ops.iter().skip(index + 1) {
+            if op.path == other.path
+                || op.path.starts_with(&other.path)
+                || other.path.starts_with(&op.path)
+            {
+                return Err(Error::Transaction(
+                    "authenticated journal contains overlapping operations".into(),
+                ));
+            }
+        }
+    }
+    let mut entries = 0usize;
+    let mut bytes = 0u64;
+    for snapshot in manifest.ops.iter().flat_map(|op| [&op.prior, &op.intended]) {
+        match snapshot {
+            Snapshot::Missing => {}
+            Snapshot::File { length, .. } => {
+                entries = entries.checked_add(1).ok_or_else(|| {
+                    Error::Transaction("journal snapshot entry count overflow".into())
+                })?;
+                bytes = bytes.checked_add(*length).ok_or_else(|| {
+                    Error::Transaction("journal snapshot byte count overflow".into())
+                })?;
+            }
+            Snapshot::Directory {
+                entries: tree_entries,
+                ..
+            } => {
+                entries = entries.checked_add(tree_entries.len()).ok_or_else(|| {
+                    Error::Transaction("journal snapshot entry count overflow".into())
+                })?;
+                for entry in tree_entries {
+                    bytes = bytes.checked_add(entry.length).ok_or_else(|| {
+                        Error::Transaction("journal snapshot byte count overflow".into())
+                    })?;
+                }
+            }
+        }
+    }
+    if entries > 4096 || bytes > 4 * 1024 * 1024 * 1024 {
+        return Err(Error::Transaction(
+            "projection journal exceeds its aggregate snapshot budget".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
+    match snapshot {
+        Snapshot::Missing => Ok(()),
+        Snapshot::File { digest, .. } if digest.len() == 32 => Ok(()),
+        Snapshot::Directory { entries, .. } => {
+            let mut previous: Option<&Path> = None;
+            for entry in entries {
+                if entry.path.is_absolute()
+                    || entry.path.components().any(|component| {
+                        matches!(
+                            component,
+                            std::path::Component::ParentDir
+                                | std::path::Component::CurDir
+                                | std::path::Component::RootDir
+                                | std::path::Component::Prefix(_)
+                        )
+                    })
+                    || (!entry.directory && entry.digest.len() != 32)
+                    || (entry.directory && (!entry.digest.is_empty() || entry.length != 0))
+                    || previous.is_some_and(|path| path >= entry.path.as_path())
+                {
+                    return Err(Error::Transaction(
+                        "authenticated journal contains an invalid tree snapshot".into(),
+                    ));
+                }
+                previous = Some(&entry.path);
+            }
+            Ok(())
+        }
+        Snapshot::File { .. } => Err(Error::Transaction(
+            "authenticated journal contains an invalid file snapshot".into(),
+        )),
+    }
+}
+
+fn read_bounded(path: &Path) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| io(path, error))?;
+    if is_reparse(&metadata) || !metadata.is_file() || metadata.len() > MAX_JOURNAL_BYTES {
+        return Err(Error::Transaction(format!(
+            "journal file is special or exceeds the size limit: {}",
+            path.display()
+        )));
+    }
+    fs::read(path).map_err(|error| io(path, error))
+}
+
+fn read_optional_bounded(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if is_reparse(&metadata) || !metadata.is_file() || metadata.len() > MAX_JOURNAL_BYTES {
+                return Err(Error::Transaction(format!(
+                    "journal file is special or exceeds the size limit: {}",
+                    path.display()
+                )));
+            }
+            fs::read(path).map(Some).map_err(|error| io(path, error))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io(path, error)),
+    }
+}
+
+fn cleanup_transaction_temporaries(transactions: &Path) -> Result<()> {
+    for entry in fs::read_dir(transactions).map_err(|error| io(transactions, error))? {
+        let entry = entry.map_err(|error| io(transactions, error))?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let temporary = name.starts_with(".connector-") && name.ends_with(".tmp");
+        if temporary {
+            let metadata = fs::symlink_metadata(&path).map_err(|error| io(&path, error))?;
+            if is_reparse(&metadata) || !metadata.is_file() {
+                return Err(Error::Transaction(format!(
+                    "invalid transaction temporary artifact: {}",
+                    path.display()
+                )));
+            }
+            durable_remove_any(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn mode(metadata: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        if metadata.permissions().readonly() {
+            0o444
+        } else {
+            0o666
+        }
+    }
+}
+fn take_snapshot(path: &Path) -> Result<Snapshot> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Snapshot::Missing),
+        Err(e) => return Err(io(path, e)),
+    };
+    if is_reparse(&metadata) || (!metadata.is_file() && !metadata.is_dir()) {
+        return Err(Error::Validation(format!(
+            "symlink or special filesystem entry is not supported in a transaction: {}",
+            path.display()
+        )));
+    }
+    if metadata.is_file() {
+        return Ok(Snapshot::File {
+            digest: digest_file(path)?,
+            length: metadata.len(),
+            mode: mode(&metadata),
+        });
+    }
+    let mut entries = Vec::new();
+    snapshot_tree(path, path, &mut entries)?;
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(Snapshot::Directory {
+        entries,
+        mode: mode(&metadata),
+    })
+}
+fn snapshot_tree(root: &Path, directory: &Path, out: &mut Vec<TreeEntry>) -> Result<()> {
+    let mut children = fs::read_dir(directory)
+        .map_err(|e| io(directory, e))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| io(directory, e))?;
+    children.sort_by_key(fs::DirEntry::file_name);
+    for child in children {
+        let path = child.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|e| io(&path, e))?;
+        if is_reparse(&metadata) || (!metadata.is_file() && !metadata.is_dir()) {
+            return Err(Error::Validation(format!(
+                "symlink or special Skill entry is not supported: {}",
+                path.display()
+            )));
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| Error::Transaction("invalid tree path".into()))?
+            .to_owned();
+        out.push(TreeEntry {
+            path: relative,
+            directory: metadata.is_dir(),
+            digest: if metadata.is_file() {
+                digest_file(&path)?
+            } else {
+                Vec::new()
+            },
+            length: if metadata.is_file() {
+                metadata.len()
+            } else {
+                0
+            },
+            mode: mode(&metadata),
+        });
+        if metadata.is_dir() {
+            snapshot_tree(root, &path, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn file_snapshot(bytes: &[u8], mode: u32) -> Snapshot {
+    Snapshot::File {
+        digest: Sha256::digest(bytes).to_vec(),
+        length: bytes.len() as u64,
+        mode,
+    }
+}
+
+fn managed_file_mode() -> u32 {
+    #[cfg(unix)]
+    {
+        0o600
+    }
+    #[cfg(not(unix))]
+    {
+        0o666
+    }
+}
+
+fn digest_file(path: &Path) -> Result<Vec<u8>> {
+    let mut file = open_source_nofollow(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer).map_err(|error| io(path, error))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest.finalize().to_vec())
+}
+
+fn stage_operation(op: &Op, stage: &Path) -> Result<()> {
+    op.guard.validate(stage)?;
+    match &op.kind {
+        OpKind::File { bytes } => {
+            atomic(stage, bytes)?;
+            op.guard.validate(stage)?;
+            set_mode(stage, 0o600)
+        }
+        OpKind::Dir { source, marker } => {
+            copy_tree_durable(source, stage, &op.guard)?;
+            let source_mode =
+                mode(&fs::symlink_metadata(source).map_err(|error| io(source, error))?);
+            set_mode(stage, source_mode | 0o200)?;
+            let owner = stage.join(SKILL_OWNER_FILE);
+            op.guard.validate(&owner)?;
+            atomic(&owner, marker)?;
+            set_mode(&owner, 0o600)?;
+            set_mode(stage, source_mode)
+        }
+        OpKind::Remove => Ok(()),
+    }
+}
+
+fn copy_tree_durable(source: &Path, destination: &Path, guard: &RootGuard) -> Result<()> {
+    let metadata = fs::symlink_metadata(source).map_err(|error| io(source, error))?;
+    if is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(Error::Validation(format!(
+            "Skill source is not a plain directory: {}",
+            source.display()
+        )));
+    }
+    guard.validate(destination)?;
+    fs::create_dir(destination).map_err(|error| io(destination, error))?;
+    let mut children = fs::read_dir(source)
+        .map_err(|error| io(source, error))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| io(source, error))?;
+    children.sort_by_key(fs::DirEntry::file_name);
+    for child in children {
+        let source_path = child.path();
+        let destination_path = destination.join(child.file_name());
+        let child_metadata =
+            fs::symlink_metadata(&source_path).map_err(|error| io(&source_path, error))?;
+        if is_reparse(&child_metadata) || (!child_metadata.is_file() && !child_metadata.is_dir()) {
+            return Err(Error::Validation(format!(
+                "Skill source contains a symlink or special entry: {}",
+                source_path.display()
+            )));
+        }
+        guard.validate(&destination_path)?;
+        if child_metadata.is_dir() {
+            copy_tree_durable(&source_path, &destination_path, guard)?;
+        } else {
+            copy_file_durable(&source_path, &destination_path)?;
+        }
+        guard.validate(&destination_path)?;
+        set_mode(&destination_path, mode(&child_metadata))?;
+    }
+    guard.validate(destination)?;
+    set_mode(destination, mode(&metadata))
+}
+
+fn open_source_nofollow(path: &Path) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path).map_err(|error| io(path, error))
+}
+
+fn copy_file_durable(source: &Path, destination: &Path) -> Result<()> {
+    let mut input = open_source_nofollow(source)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut output = options
+        .open(destination)
+        .map_err(|error| io(destination, error))?;
+    std::io::copy(&mut input, &mut output).map_err(|error| io(destination, error))?;
+    output.sync_all().map_err(|error| io(destination, error))
+}
+
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| io(path, e))
+    }
+    #[cfg(not(unix))]
+    {
+        let mut p = fs::metadata(path).map_err(|e| io(path, e))?.permissions();
+        p.set_readonly(mode & 0o200 == 0);
+        fs::set_permissions(path, p).map_err(|e| io(path, e))
+    }
+}
+fn snapshot_matches(path: &Path, expected: &Snapshot) -> Result<bool> {
+    let actual = take_snapshot(path)?;
+    let a = serde_json::to_vec(&actual).map_err(|e| Error::Transaction(e.to_string()))?;
+    let b = serde_json::to_vec(expected).map_err(|e| Error::Transaction(e.to_string()))?;
+    Ok(a == b)
 }
 
 fn project(
@@ -958,7 +2355,8 @@ fn openai_api_base(gateway: &url::Url) -> String {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::openai_api_base;
+    use super::{edit_json, openai_api_base};
+    use serde_json::json;
 
     #[test]
     fn normalizes_openai_api_base_without_duplicate_v1() {
@@ -979,6 +2377,37 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn jsonc_removal_preserves_neighboring_comments_and_formatting() {
+        let source = r#"{
+  "theme": "dark", // unrelated theme comment
+  "managed": {},
+  "nested": {
+    "keep": true, /* unrelated nested comment */
+    "managed_one": {},
+    "managed_two": {} // trailing local comment
+  }
+}
+"#;
+        let target = json!({"theme":"dark","nested":{"keep":true}});
+        let edited = edit_json(source, &target).expect("surgical JSONC edit");
+
+        assert!(
+            edited.contains("  \"theme\": \"dark\", // unrelated theme comment"),
+            "{edited}"
+        );
+        assert!(edited.contains("  \"nested\": {"), "{edited}");
+        assert!(
+            edited.contains("    \"keep\": true /* unrelated nested comment */"),
+            "{edited}"
+        );
+        assert!(edited.contains("// trailing local comment"), "{edited}");
+        assert_eq!(
+            json5::from_str::<serde_json::Value>(&edited).expect("edited JSONC must parse"),
+            target
+        );
     }
 }
 fn receipt_key(secret: &Secret) -> Result<[u8; 32]> {
@@ -1045,17 +2474,35 @@ fn reconciled_file(file: &FileReceipt) -> Result<Option<Vec<u8>>> {
         file.path.extension().and_then(|x| x.to_str()),
         Some("json" | "jsonc")
     ) {
-        let mut cur: Value =
-            json5::from_str(std::str::from_utf8(&current).unwrap_or("")).map_err(|e| {
-                Error::Config {
-                    path: file.path.clone(),
-                    message: e.to_string(),
-                }
-            })?;
-        let old: Value = json5::from_str(std::str::from_utf8(original).unwrap_or("{}"))
-            .unwrap_or_else(|_| json!({}));
+        let current_text = std::str::from_utf8(&current).map_err(|e| Error::Config {
+            path: file.path.clone(),
+            message: e.to_string(),
+        })?;
+        JsonSyntax::parse(current_text).map_err(|message| Error::Config {
+            path: file.path.clone(),
+            message,
+        })?;
+        let mut cur: Value = json5::from_str(current_text).map_err(|e| Error::Config {
+            path: file.path.clone(),
+            message: e.to_string(),
+        })?;
+        let original_text = std::str::from_utf8(original).map_err(|e| Error::Config {
+            path: file.path.clone(),
+            message: e.to_string(),
+        })?;
+        JsonSyntax::parse(original_text).map_err(|message| Error::Config {
+            path: file.path.clone(),
+            message,
+        })?;
+        let old: Value = json5::from_str(original_text).map_err(|e| Error::Config {
+            path: file.path.clone(),
+            message: e.to_string(),
+        })?;
+        let applied_text =
+            std::str::from_utf8(&file.applied).map_err(|e| Error::Transaction(e.to_string()))?;
+        JsonSyntax::parse(applied_text).map_err(|e| Error::Transaction(e.to_string()))?;
         let applied: Value =
-            serde_json::from_slice(&file.applied).map_err(|e| Error::Transaction(e.to_string()))?;
+            json5::from_str(applied_text).map_err(|e| Error::Transaction(e.to_string()))?;
         if json_managed_drift(&cur, Some(&old), &applied) {
             return Err(Error::Validation(format!(
                 "managed configuration has local changes: {}",
@@ -1063,9 +2510,7 @@ fn reconciled_file(file: &FileReceipt) -> Result<Option<Vec<u8>>> {
             )));
         }
         reconcile_json(&mut cur, Some(&old), &applied);
-        return serde_json::to_vec_pretty(&cur)
-            .map(Some)
-            .map_err(|e| Error::Transaction(e.to_string()));
+        return edit_json(current_text, &cur).map(|text| Some(text.into_bytes()));
     }
     // Text, env, and TOML projections cannot be three-way merged without
     // risking an old bearer. Keep the receipt and credential recoverable until
@@ -1123,33 +2568,6 @@ fn reconcile_json(current: &mut Value, original: Option<&Value>, applied: &Value
         }
     }
 }
-fn transaction_error(error: Error, rollback: Option<Error>) -> Error {
-    match rollback {
-        Some(r) => Error::Transaction(format!("{error}; rollback also failed: {r}")),
-        None => Error::Transaction(error.to_string()),
-    }
-}
-fn rollback(done: Vec<(PathBuf, Saved)>) -> Result<()> {
-    let mut failures = Vec::new();
-    for (path, saved) in done.into_iter().rev() {
-        if let Err(e) = remove_any(&path) {
-            failures.push(e.to_string());
-        }
-        let result = match saved {
-            Saved::Missing => Ok(()),
-            Saved::Bytes(bytes) => atomic(&path, &bytes),
-            Saved::Disk(saved) => copy_any(&saved, &path),
-        };
-        if let Err(e) = result {
-            failures.push(e.to_string());
-        }
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::Transaction(failures.join("; ")))
-    }
-}
 fn owned(platform: &str, kind: &str, id: &str) -> String {
     let mut hash = Sha256::new();
     for value in [platform, kind, id] {
@@ -1197,7 +2615,7 @@ fn snapshot_skill(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 fn is_symlink(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    fs::symlink_metadata(path).is_ok_and(|metadata| is_reparse(&metadata))
 }
 fn read_text_projection(path: &Path, bases: &BTreeMap<PathBuf, Vec<u8>>) -> Result<String> {
     match bases.get(path) {
@@ -1209,24 +2627,343 @@ fn read_text_projection(path: &Path, bases: &BTreeMap<PathBuf, Vec<u8>>) -> Resu
         None => Ok(String::new()),
     }
 }
+
+#[derive(Clone)]
+struct JsonSyntax {
+    start: usize,
+    end: usize,
+    object: Option<JsonObject>,
+}
+#[derive(Clone)]
+struct JsonObject {
+    close: usize,
+    members: Vec<JsonMember>,
+}
+#[derive(Clone)]
+struct JsonMember {
+    key: String,
+    start: usize,
+    comma: Option<usize>,
+    value: JsonSyntax,
+}
+struct JsonParser<'a> {
+    text: &'a str,
+    at: usize,
+}
+impl JsonSyntax {
+    fn parse(text: &str) -> std::result::Result<Self, String> {
+        let mut parser = JsonParser { text, at: 0 };
+        parser.trivia()?;
+        let node = parser.value()?;
+        parser.trivia()?;
+        if parser.at != text.len() {
+            return Err("unsupported content after JSON value".into());
+        }
+        Ok(node)
+    }
+}
+impl JsonParser<'_> {
+    fn trivia(&mut self) -> std::result::Result<(), String> {
+        loop {
+            while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
+                self.at += 1;
+            }
+            if self.rest().starts_with("//") {
+                self.at += 2;
+                while self.peek().is_some_and(|b| b != b'\n') {
+                    self.at += 1;
+                }
+            } else if self.rest().starts_with("/*") {
+                let Some(n) = self.rest()[2..].find("*/") else {
+                    return Err("unterminated JSON comment".into());
+                };
+                self.at += n + 4;
+            } else {
+                return Ok(());
+            }
+        }
+    }
+    fn value(&mut self) -> std::result::Result<JsonSyntax, String> {
+        self.trivia()?;
+        let start = self.at;
+        let object =
+            match self.peek() {
+                Some(b'{') => Some(self.object()?),
+                Some(b'[') => {
+                    self.array()?;
+                    None
+                }
+                Some(b'"') => {
+                    self.string()?;
+                    None
+                }
+                Some(b'-' | b'0'..=b'9') => {
+                    self.number()?;
+                    None
+                }
+                _ if self.rest().starts_with("true") => {
+                    self.at += 4;
+                    None
+                }
+                _ if self.rest().starts_with("false") => {
+                    self.at += 5;
+                    None
+                }
+                _ if self.rest().starts_with("null") => {
+                    self.at += 4;
+                    None
+                }
+                _ => return Err(
+                    "unsupported JSON/JSONC construct (keys and strings must use double quotes)"
+                        .into(),
+                ),
+            };
+        Ok(JsonSyntax {
+            start,
+            end: self.at,
+            object,
+        })
+    }
+    fn object(&mut self) -> std::result::Result<JsonObject, String> {
+        self.at += 1;
+        let mut members = Vec::new();
+        let mut keys = BTreeSet::new();
+        loop {
+            self.trivia()?;
+            if self.peek() == Some(b'}') {
+                let close = self.at;
+                self.at += 1;
+                return Ok(JsonObject { close, members });
+            }
+            let start = self.at;
+            if self.peek() != Some(b'"') {
+                return Err("object keys must use double quotes".into());
+            }
+            let key_start = self.at;
+            self.string()?;
+            let key: String =
+                serde_json::from_str(&self.text[key_start..self.at]).map_err(|e| e.to_string())?;
+            if !keys.insert(key.clone()) {
+                return Err(format!("duplicate object key `{key}`"));
+            }
+            self.trivia()?;
+            if self.peek() != Some(b':') {
+                return Err("expected `:` after object key".into());
+            }
+            self.at += 1;
+            let value = self.value()?;
+            self.trivia()?;
+            let comma = if self.peek() == Some(b',') {
+                let p = self.at;
+                self.at += 1;
+                Some(p)
+            } else {
+                None
+            };
+            members.push(JsonMember {
+                key,
+                start,
+                comma,
+                value,
+            });
+            if comma.is_none() {
+                self.trivia()?;
+                if self.peek() != Some(b'}') {
+                    return Err("expected `,` or `}`".into());
+                }
+            }
+        }
+    }
+    fn array(&mut self) -> std::result::Result<(), String> {
+        self.at += 1;
+        loop {
+            self.trivia()?;
+            if self.peek() == Some(b']') {
+                self.at += 1;
+                return Ok(());
+            }
+            self.value()?;
+            self.trivia()?;
+            if self.peek() == Some(b',') {
+                self.at += 1;
+            } else if self.peek() != Some(b']') {
+                return Err("expected `,` or `]`".into());
+            }
+        }
+    }
+    fn string(&mut self) -> std::result::Result<(), String> {
+        self.at += 1;
+        while let Some(b) = self.peek() {
+            self.at += 1;
+            if b == b'"' {
+                return Ok(());
+            }
+            if b == b'\\' {
+                if self.peek().is_none() {
+                    break;
+                }
+                self.at += 1;
+            } else if b < 0x20 {
+                return Err("control character in JSON string".into());
+            }
+        }
+        Err("unterminated JSON string".into())
+    }
+    fn number(&mut self) -> std::result::Result<(), String> {
+        let start = self.at;
+        while self
+            .peek()
+            .is_some_and(|b| b.is_ascii_digit() || matches!(b, b'-' | b'+' | b'.' | b'e' | b'E'))
+        {
+            self.at += 1;
+        }
+        serde_json::from_str::<serde_json::Number>(&self.text[start..self.at])
+            .map(|_| ())
+            .map_err(|_| "unsupported JSON number".into())
+    }
+    fn peek(&self) -> Option<u8> {
+        self.text.as_bytes().get(self.at).copied()
+    }
+    fn rest(&self) -> &str {
+        &self.text[self.at..]
+    }
+}
+
+fn edit_json(source: &str, target: &Value) -> Result<String> {
+    let syntax = JsonSyntax::parse(source).map_err(Error::Transaction)?;
+    let original: Value = json5::from_str(source).map_err(|e| Error::Transaction(e.to_string()))?;
+    let mut edits = Vec::new();
+    collect_json_edits(source, &syntax, &original, target, &mut edits)?;
+    edits.sort_by_key(|edit| edit.0);
+    edits.dedup();
+    let mut out = source.to_owned();
+    for (start, end, replacement) in edits.into_iter().rev() {
+        out.replace_range(start..end, &replacement);
+    }
+    Ok(out)
+}
+fn collect_json_edits(
+    source: &str,
+    syntax: &JsonSyntax,
+    old: &Value,
+    new: &Value,
+    edits: &mut Vec<(usize, usize, String)>,
+) -> Result<()> {
+    if old == new {
+        return Ok(());
+    }
+    let (Some(object), Some(old_map), Some(new_map)) =
+        (&syntax.object, old.as_object(), new.as_object())
+    else {
+        edits.push((
+            syntax.start,
+            syntax.end,
+            serde_json::to_string_pretty(new).map_err(|e| Error::Transaction(e.to_string()))?,
+        ));
+        return Ok(());
+    };
+    for member in &object.members {
+        match new_map.get(&member.key) {
+            Some(value) => {
+                collect_json_edits(source, &member.value, &old_map[&member.key], value, edits)?
+            }
+            None => {
+                edits.push((member.start, member.value.end, String::new()));
+            }
+        }
+    }
+    for (index, member) in object.members.iter().enumerate() {
+        let Some(comma) = member.comma else {
+            continue;
+        };
+        let retained = new_map.contains_key(&member.key);
+        let later_retained = object.members[index + 1..]
+            .iter()
+            .any(|later| new_map.contains_key(&later.key));
+        let original_trailing_comma = index + 1 == object.members.len();
+        if !(retained && (later_retained || original_trailing_comma)) {
+            edits.push((comma, comma + 1, String::new()));
+        }
+    }
+    let added: Vec<_> = new_map
+        .iter()
+        .filter(|(key, _)| !old_map.contains_key(*key))
+        .collect();
+    if !added.is_empty() {
+        let multiline = source[syntax.start..object.close].contains('\n');
+        let indent = if multiline {
+            object
+                .members
+                .first()
+                .map(|m| &source[source[..m.start].rfind('\n').map_or(m.start, |p| p + 1)..m.start])
+                .unwrap_or("  ")
+        } else {
+            ""
+        };
+        let mut insertion = String::new();
+        let needs_comma = object.members.last().is_some_and(|m| m.comma.is_none());
+        if needs_comma {
+            insertion.push(',');
+        }
+        for (i, (key, value)) in added.iter().enumerate() {
+            if multiline {
+                insertion.push('\n');
+                insertion.push_str(indent);
+            } else if !object.members.is_empty() || i > 0 {
+                insertion.push(' ');
+            }
+            insertion.push_str(
+                &serde_json::to_string(key).map_err(|e| Error::Transaction(e.to_string()))?,
+            );
+            insertion.push_str(if multiline { ": " } else { ":" });
+            insertion.push_str(
+                &serde_json::to_string(value).map_err(|e| Error::Transaction(e.to_string()))?,
+            );
+            if i + 1 < added.len() {
+                insertion.push(',');
+            }
+        }
+        edits.push((object.close, object.close, insertion));
+    }
+    Ok(())
+}
 fn read_json_projection(
     path: &Path,
     json5_ok: bool,
     bases: &BTreeMap<PathBuf, Vec<u8>>,
-) -> Result<Value> {
+) -> Result<JsonProjection> {
     let s = read_text_projection(path, bases)?;
     if s.trim().is_empty() {
-        return Ok(json!({}));
+        return Ok(JsonProjection {
+            value: json!({}),
+            source: None,
+        });
     }
     if json5_ok {
-        json5::from_str(&s).map_err(|e| Error::Config {
+        let value = json5::from_str(&s).map_err(|e| Error::Config {
             path: path.into(),
             message: e.to_string(),
+        })?;
+        JsonSyntax::parse(&s).map_err(|message| Error::Config {
+            path: path.into(),
+            message,
+        })?;
+        Ok(JsonProjection {
+            value,
+            source: Some(s),
         })
     } else {
-        serde_json::from_str(&s).map_err(|e| Error::Config {
+        let value = serde_json::from_str(&s).map_err(|e| Error::Config {
             path: path.into(),
             message: e.to_string(),
+        })?;
+        JsonSyntax::parse(&s).map_err(|message| Error::Config {
+            path: path.into(),
+            message,
+        })?;
+        Ok(JsonProjection {
+            value,
+            source: Some(s),
         })
     }
 }
@@ -1288,12 +3025,18 @@ fn reject_toml_collision(
         Ok(())
     }
 }
-fn file(path: PathBuf, v: Value, e: Vec<String>) -> Result<(PathBuf, Vec<u8>, Vec<String>)> {
-    Ok((
-        path,
-        serde_json::to_vec_pretty(&v).map_err(|x| Error::Transaction(x.to_string()))?,
-        e,
-    ))
+fn file(
+    path: PathBuf,
+    v: JsonProjection,
+    e: Vec<String>,
+) -> Result<(PathBuf, Vec<u8>, Vec<String>)> {
+    let bytes = match v.source {
+        Some(source) => edit_json(&source, &v.value)?.into_bytes(),
+        None => {
+            serde_json::to_vec_pretty(&v.value).map_err(|x| Error::Transaction(x.to_string()))?
+        }
+    };
+    Ok((path, bytes, e))
 }
 fn merge_env(old: &str, items: &[(&str, &str)]) -> String {
     let mut lines: Vec<String> = old
@@ -1322,15 +3065,11 @@ fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| Error::Transaction("path has no parent".into()))?;
+    reject_absolute_reparse_components(parent)?;
     fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
-    let temp = parent.join(format!(
-        ".connector-{}-{}.tmp",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    reject_absolute_reparse_components(parent)?;
+    reject_absolute_reparse_components(path)?;
+    let temp = parent.join(format!(".connector-{}.tmp", uuid::Uuid::new_v4()));
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1339,6 +3078,7 @@ fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
                 .open(&temp)?;
             file.write_all(bytes)?;
             file.sync_all()
@@ -1350,7 +3090,22 @@ fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        if let Err(error) = fs::write(&temp, bytes) {
+        let write = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                options.custom_flags(
+                    windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+                );
+            }
+            let mut file = options.open(&temp)?;
+            file.write_all(bytes)?;
+            file.sync_all()
+        })();
+        if let Err(error) = write {
             let _ = fs::remove_file(&temp);
             return Err(io(&temp, error));
         }
@@ -1358,7 +3113,7 @@ fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     #[cfg(not(windows))]
     {
         match fs::rename(&temp, path) {
-            Ok(()) => Ok(()),
+            Ok(()) => sync_parent(path),
             Err(error) => {
                 let _ = fs::remove_file(&temp);
                 Err(io(path, error))
@@ -1386,21 +3141,127 @@ fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             let _ = fs::remove_file(&temp);
             Err(io(path, error))
         } else {
-            Ok(())
+            sync_parent(path)
         }
     }
 }
+
+fn sync_parent(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| io(parent, error))?;
+    }
+    #[cfg(windows)]
+    let _ = path;
+    // Windows has no documented POSIX-equivalent parent-directory fsync.
+    // File writes are flushed and renames use MOVEFILE_WRITE_THROUGH instead.
+    Ok(())
+}
+
+fn sync_tree(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| io(path, error))?;
+    if is_reparse(&metadata) || (!metadata.is_file() && !metadata.is_dir()) {
+        return Err(Error::Validation(format!(
+            "cannot sync a special filesystem entry: {}",
+            path.display()
+        )));
+    }
+    if metadata.is_file() {
+        #[cfg(unix)]
+        fs::File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| io(path, error))?;
+        return Ok(());
+    }
+    for entry in fs::read_dir(path).map_err(|error| io(path, error))? {
+        let entry = entry.map_err(|error| io(path, error))?;
+        sync_tree(&entry.path())?;
+    }
+    #[cfg(unix)]
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| io(path, error))?;
+    Ok(())
+}
+
+#[cfg_attr(windows, allow(unsafe_code))]
+fn durable_rename(from: &Path, to: &Path) -> Result<()> {
+    if from.parent() != to.parent() {
+        return Err(Error::Transaction(
+            "durable projection rename must stay within one parent".into(),
+        ));
+    }
+    reject_absolute_reparse_components(from)?;
+    reject_absolute_reparse_components(to)?;
+    #[cfg(not(windows))]
+    fs::rename(from, to).map_err(|error| io(from, error))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+        let from_wide = from
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let to_wide = to
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        if unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0
+        {
+            return Err(io(from, std::io::Error::last_os_error()));
+        }
+    }
+    sync_parent(to)
+}
+
+fn durable_remove_any(path: &Path) -> Result<()> {
+    remove_any(path)?;
+    sync_parent(path)
+}
+
+#[cfg(debug_assertions)]
+fn maybe_failpoint(name: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static MATCHES: AtomicUsize = AtomicUsize::new(0);
+    if std::env::var_os("GATEWAY_CONNECTOR_CRASH_CHILD_ROOT").is_none() {
+        return;
+    }
+    let Ok(value) = std::env::var("GATEWAY_CONNECTOR_TEST_FAILPOINT") else {
+        return;
+    };
+    let (requested, occurrence) = value
+        .rsplit_once(':')
+        .and_then(|(name, occurrence)| occurrence.parse::<usize>().ok().map(|n| (name, n)))
+        .unwrap_or((value.as_str(), 1));
+    if requested == name && MATCHES.fetch_add(1, Ordering::SeqCst) + 1 == occurrence {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn maybe_failpoint(_name: &str) {}
+
 fn remove_any(p: &Path) -> Result<()> {
     if !exists(p) {
         return Ok(());
     }
-    if fs::symlink_metadata(p)
-        .map_err(|e| io(p, e))?
-        .file_type()
-        .is_symlink()
-    {
-        remove_symlink(p)
-    } else if p.is_dir() {
+    let metadata = fs::symlink_metadata(p).map_err(|e| io(p, e))?;
+    if is_reparse(&metadata) {
+        return Err(Error::Validation(format!(
+            "refusing to remove a symlink or reparse point: {}",
+            p.display()
+        )));
+    }
+    if metadata.is_dir() {
+        validate_plain_tree(p)?;
         fs::remove_dir_all(p)
     } else {
         fs::remove_file(p)
@@ -1408,55 +3269,28 @@ fn remove_any(p: &Path) -> Result<()> {
     .map_err(|e| io(p, e))
 }
 
-#[cfg(unix)]
-fn remove_symlink(path: &Path) -> std::io::Result<()> {
-    fs::remove_file(path)
-}
-
-#[cfg(windows)]
-fn remove_symlink(path: &Path) -> std::io::Result<()> {
-    if path.is_dir() {
-        fs::remove_dir(path)
-    } else {
-        fs::remove_file(path)
-    }
-}
-fn copy_any(a: &Path, b: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(a).map_err(|e| io(a, e))?;
-    if metadata.file_type().is_symlink() {
-        let target = fs::read_link(a).map_err(|e| io(a, e))?;
-        create_symlink(&target, b)
-    } else if a.is_dir() {
-        copy_dir(a, b)
-    } else {
-        if let Some(p) = b.parent() {
-            fs::create_dir_all(p).map_err(|e| io(p, e))?;
+fn validate_plain_tree(directory: &Path) -> Result<()> {
+    for entry in fs::read_dir(directory).map_err(|error| io(directory, error))? {
+        let entry = entry.map_err(|error| io(directory, error))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|error| io(&path, error))?;
+        if is_reparse(&metadata) || (!metadata.is_file() && !metadata.is_dir()) {
+            return Err(Error::Validation(format!(
+                "refusing to remove a tree containing a symlink, reparse point, or special entry: {}",
+                path.display()
+            )));
         }
-        fs::copy(a, b).map(|_| ()).map_err(|e| io(b, e))
+        if metadata.is_dir() {
+            validate_plain_tree(&path)?;
+        }
     }
+    Ok(())
 }
 fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
-
-#[cfg(unix)]
-fn create_symlink(source: &Path, target: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(source, target).map_err(|e| io(target, e))
-}
-#[cfg(windows)]
-fn create_symlink(source: &Path, target: &Path) -> Result<()> {
-    std::os::windows::fs::symlink_dir(source, target).map_err(|e| io(target, e))
-}
 fn hash_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
-}
-fn copy_dir(a: &Path, b: &Path) -> Result<()> {
-    fs::create_dir_all(b).map_err(|e| io(b, e))?;
-    for x in fs::read_dir(a).map_err(|e| io(a, e))? {
-        let x = x.map_err(|e| io(a, e))?;
-        copy_any(&x.path(), &b.join(x.file_name()))?;
-    }
-    Ok(())
 }
 fn hash_dir(path: &Path) -> Result<Vec<u8>> {
     hash_tree(path, false)
@@ -1479,9 +3313,11 @@ fn hash_tree(p: &Path, skip_owner: bool) -> Result<Vec<u8>> {
                 continue;
             }
             let name = os_bytes(relative.as_os_str());
-            if metadata.file_type().is_symlink() {
-                let target = fs::read_link(&path).map_err(|error| io(&path, error))?;
-                out.push((name, b'L', false, os_bytes(target.as_os_str())));
+            if is_reparse(&metadata) {
+                return Err(Error::Validation(format!(
+                    "unsupported symlink or reparse point in Skill: {}",
+                    path.display()
+                )));
             } else if metadata.is_dir() {
                 out.push((name, b'D', false, Vec::new()));
                 walk(base, &path, skip_owner, out)?;

@@ -210,9 +210,6 @@ impl ConnectorBackend {
             .projection
             .as_ref()
             .ok_or(BackendError::ProjectionNotConfigured)?;
-        if !runtime.connector.has_receipt(&profile.platform_id) {
-            return Ok(BTreeSet::new());
-        }
         let bearer = self
             .credentials
             .get(profile)?
@@ -564,6 +561,15 @@ impl ConnectorBackend {
             .credentials
             .get(&profile)?
             .ok_or(BackendError::MissingCredential)?;
+        if let Some(runtime) = &self.projection {
+            let _guard = self
+                .projection_lock
+                .lock()
+                .map_err(|_| BackendError::ProjectionLock)?;
+            runtime
+                .connector
+                .recover(&profile.platform_id, &core_secret(&api_key)?)?;
+        }
         match profile.mode {
             ConnectionMode::Direct => {
                 let models = self.client.discover_models(&profile.base_url, &api_key)?;
@@ -721,9 +727,6 @@ impl ConnectorBackend {
             .projection
             .as_ref()
             .ok_or(BackendError::ProjectionNotConfigured)?;
-        if !runtime.connector.has_receipt(&profile.platform_id) {
-            return Ok(());
-        }
         let bearer = self
             .credentials
             .get(profile)?

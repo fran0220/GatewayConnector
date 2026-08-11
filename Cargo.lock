@@ -1985,6 +1985,7 @@ dependencies = [
  "fs2",
  "hkdf",
  "json5",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

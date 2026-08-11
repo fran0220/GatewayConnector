@@ -6,7 +6,13 @@ use gateway_connector_core::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fs, io::Write, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    process::Command,
+};
 use tempfile::tempdir;
 
 fn contracts() -> (ConnectionManifest, Provisioning) {
@@ -216,9 +222,9 @@ fn projects_all_clients_preserves_and_disconnects_owned_entries() {
             && grok.contains("api_backend = \"responses\"")
             && grok.contains("headers")
     );
-    let oc: Value =
-        serde_json::from_slice(&fs::read(t.path().join("opencode/opencode.json")).unwrap())
-            .unwrap();
+    let opencode_text = fs::read_to_string(t.path().join("opencode/opencode.json")).unwrap();
+    assert!(opencode_text.contains("// comment"));
+    let oc: Value = json5::from_str(&opencode_text).unwrap();
     assert_eq!(oc["theme"], "dark");
     assert_eq!(oc["model"], format!("{provider}/alpha"));
     assert!(oc["provider"][&provider]["models"]["beta"].is_object());
@@ -574,7 +580,10 @@ fn configuration_symlinks_are_rejected_without_replacing_them() {
         })
         .unwrap_err()
         .to_string();
-    assert!(error.contains("symlinks are not supported"), "{error}");
+    assert!(
+        error.contains("symlink") || error.contains("reparse point"),
+        "{error}"
+    );
     assert!(
         fs::symlink_metadata(codex.join("config.toml"))
             .unwrap()
@@ -637,18 +646,38 @@ fn reapply_keeps_first_original_and_drift_disconnect_is_semantic() {
     let (_, second) = setup(t.path());
     c.apply(&second).unwrap();
     let opencode = t.path().join("opencode/opencode.json");
-    let mut drift: Value = serde_json::from_slice(&fs::read(&opencode).unwrap()).unwrap();
-    drift["user_after"] = Value::Bool(true);
-    fs::write(&opencode, serde_json::to_vec_pretty(&drift).unwrap()).unwrap();
+    let mut drift = fs::read_to_string(&opencode).unwrap();
+    let close = drift.rfind('}').unwrap();
+    drift.insert_str(close, ",\n// unrelated local comment\n\"user_after\":true");
+    fs::write(&opencode, drift).unwrap();
     c.disconnect("platform-a", &Secret::new("super-secret").unwrap())
         .unwrap();
     assert_eq!(
         fs::read(t.path().join("codex/config.toml")).unwrap(),
         original_codex
     );
-    let after: Value = serde_json::from_slice(&fs::read(opencode).unwrap()).unwrap();
+    let after_text = fs::read_to_string(opencode).unwrap();
+    assert!(after_text.contains("// unrelated local comment"));
+    let after: Value = json5::from_str(&after_text).unwrap();
     assert_eq!(after["user_after"], true);
     assert!(after["provider"][managed("platform-a", "provider", "default")].is_null());
+}
+
+#[test]
+fn duplicate_json_keys_are_refused_without_writing() {
+    let t = tempdir().unwrap();
+    let (connector, plan) = setup(t.path());
+    connector.apply(&plan).unwrap();
+    let path = t.path().join("opencode/opencode.json");
+    let duplicate = b"{\n  // ambiguity must fail closed\n  \"same\": 1,\n  \"nested\": {\"same\": 2, \"same\": 3}\n}\n";
+    fs::write(&path, duplicate).unwrap();
+
+    let error = connector
+        .disconnect("platform-a", &Secret::new("super-secret").unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("duplicate object key"), "{error}");
+    assert_eq!(fs::read(path).unwrap(), duplicate);
 }
 
 #[test]
@@ -896,4 +925,467 @@ fn claude_legacy_settings_and_opencode_jsonc_are_respected() {
     assert!(claude.join(".claude.json").exists());
     assert!(opencode.join("opencode.jsonc").exists());
     assert!(!opencode.join("opencode.json").exists());
+}
+
+fn crash_test_plan(root: &Path) -> (Connector, gateway_connector_core::Plan) {
+    let (manifest, provisioning) = contracts();
+    let source = root.join("source-skill");
+    let connector = std::env::var_os("GATEWAY_CONNECTOR_CRASH_CHILD_COORDINATOR")
+        .map(|coordinator| Connector::with_coordinator(root.join("state"), coordinator))
+        .unwrap_or_else(|| Connector::new(root.join("state")));
+    let plan = connector
+        .plan(ApplyInput {
+            manifest: &manifest,
+            provisioning: &provisioning,
+            bearer: &Secret::new("crash-secret").unwrap(),
+            selected_models: BTreeMap::from([(AgentId::Codex, "beta".into())]),
+            installs: vec![AgentInstall {
+                agent: AgentId::Codex,
+                root: root.join("codex"),
+                detected: true,
+            }],
+            synchronized_skills: BTreeMap::from([("deploy".into(), source)]),
+        })
+        .unwrap();
+    (connector, plan)
+}
+
+fn initialize_crash_tree(root: &Path) -> Vec<u8> {
+    let codex = root.join("codex");
+    let source = root.join("source-skill");
+    fs::create_dir_all(&codex).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    let original = b"# exact original\nsandbox = \"workspace-write\"\n".to_vec();
+    fs::write(codex.join("config.toml"), &original).unwrap();
+    fs::write(source.join("SKILL.md"), "complete Skill tree").unwrap();
+    original
+}
+
+#[test]
+fn apply_rejects_a_replaced_agent_root_before_any_mutation() {
+    let temp = tempdir().unwrap();
+    let original = initialize_crash_tree(temp.path());
+    let (connector, plan) = crash_test_plan(temp.path());
+    let root = temp.path().join("codex");
+    let displaced = temp.path().join("original-codex");
+    fs::rename(&root, &displaced).unwrap();
+    fs::create_dir(&root).unwrap();
+
+    let error = connector.apply(&plan).unwrap_err().to_string();
+    assert!(error.contains("replaced after preview"), "{error}");
+    assert!(!root.join("config.toml").exists());
+    assert_eq!(fs::read(displaced.join("config.toml")).unwrap(), original);
+    assert!(!temp.path().join("state/skills").exists());
+    assert!(transaction_artifacts(temp.path()).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn projection_rejects_a_symlinked_destination_ancestor() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempdir().unwrap();
+    initialize_crash_tree(temp.path());
+    let (connector, plan) = crash_test_plan(temp.path());
+    let outside = temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    symlink(&outside, temp.path().join("codex/skills")).unwrap();
+
+    let apply_error = connector.apply(&plan).unwrap_err().to_string();
+    assert!(
+        apply_error.contains("symlink or reparse") || apply_error.contains("changed after"),
+        "{apply_error}"
+    );
+    assert!(fs::read_dir(&outside).unwrap().next().is_none());
+}
+
+#[cfg(windows)]
+#[test]
+fn projection_rejects_a_junction_destination_ancestor() {
+    let temp = tempdir().unwrap();
+    initialize_crash_tree(temp.path());
+    let (connector, plan) = crash_test_plan(temp.path());
+    let outside = temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let link = temp.path().join("codex/skills");
+    let output = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&outside)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "mklink /J failed: {output:?}");
+
+    let error = connector.apply(&plan).unwrap_err().to_string();
+    assert!(error.contains("symlink or reparse"), "{error}");
+    assert!(fs::read_dir(&outside).unwrap().next().is_none());
+}
+
+fn transaction_artifacts(root: &Path) -> Vec<PathBuf> {
+    fn visit(path: &Path, output: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == "active.json"
+                || name.starts_with("bundle-")
+                || name.starts_with(".gateway-stage-")
+                || name.starts_with(".gateway-displaced-")
+                || (name.starts_with(".connector-") && name.ends_with(".tmp"))
+            {
+                output.push(path.clone());
+            }
+            if path.is_dir() {
+                visit(&path, output);
+            }
+        }
+    }
+    let mut output = Vec::new();
+    visit(root, &mut output);
+    output
+}
+
+#[test]
+fn projection_crash_child() {
+    let Some(root) = std::env::var_os("GATEWAY_CONNECTOR_CRASH_CHILD_ROOT") else {
+        return;
+    };
+    if std::env::var_os("GATEWAY_CONNECTOR_CRASH_CHILD_DISCONNECT").is_some() {
+        Connector::new(Path::new(&root).join("state"))
+            .disconnect("platform-a", &Secret::new("crash-secret").unwrap())
+            .unwrap();
+        return;
+    }
+    let (connector, plan) = crash_test_plan(Path::new(&root));
+    connector.apply(&plan).unwrap();
+}
+
+#[test]
+fn subprocess_crashes_recover_every_projection_commit_boundary() {
+    let mut prepared_boundaries = vec![
+        "manifest-durable".to_owned(),
+        "prepared-durable".to_owned(),
+        "mutations-complete".to_owned(),
+    ];
+    for boundary in [
+        "stage-durable",
+        "destination-displaced",
+        "destination-installed",
+    ] {
+        for occurrence in 1..=5 {
+            prepared_boundaries.push(format!("{boundary}:{occurrence}"));
+        }
+    }
+    for occurrence in 1..=4 {
+        prepared_boundaries.push(format!("parent-created:{occurrence}"));
+    }
+    let mut committed_boundaries = vec![
+        "committed-durable".to_owned(),
+        "active-cleared".to_owned(),
+        "bundle-cleared".to_owned(),
+    ];
+    for occurrence in 1..=5 {
+        committed_boundaries.push(format!("cleanup-artifact:{occurrence}"));
+    }
+
+    for (failpoint, committed) in prepared_boundaries
+        .iter()
+        .map(|value| (value.as_str(), false))
+        .chain(
+            committed_boundaries
+                .iter()
+                .map(|value| (value.as_str(), true)),
+        )
+    {
+        let temp = tempdir().unwrap();
+        let original = initialize_crash_tree(temp.path());
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("projection_crash_child")
+            .arg("--nocapture")
+            .env("GATEWAY_CONNECTOR_CRASH_CHILD_ROOT", temp.path())
+            .env("GATEWAY_CONNECTOR_TEST_FAILPOINT", failpoint)
+            .status()
+            .unwrap();
+        assert!(!status.success(), "failpoint did not abort: {failpoint}");
+
+        let connector = Connector::new(temp.path().join("state"));
+        connector
+            .recover("platform-a", &Secret::new("crash-secret").unwrap())
+            .unwrap_or_else(|error| panic!("recovery failed at {failpoint}: {error}"));
+
+        let config = temp.path().join("codex/config.toml");
+        let target_skill = temp.path().join("codex/skills/deploy");
+        let ssot_skill = temp.path().join("state/skills/platform-a/deploy");
+        let receipt = temp.path().join("state/receipts/platform-a.json");
+        let ownership = temp
+            .path()
+            .join("state/projection-coordinator/ownership.json");
+        if committed {
+            assert_ne!(fs::read(&config).unwrap(), original, "{failpoint}");
+            assert_eq!(
+                fs::read(target_skill.join("SKILL.md")).unwrap(),
+                b"complete Skill tree",
+                "{failpoint}"
+            );
+            assert_eq!(
+                fs::read(ssot_skill.join("SKILL.md")).unwrap(),
+                b"complete Skill tree",
+                "{failpoint}"
+            );
+            assert!(receipt.is_file(), "{failpoint}");
+            let coordinator: Value =
+                serde_json::from_slice(&fs::read(&ownership).unwrap()).unwrap();
+            assert_eq!(
+                coordinator["leases"].as_array().map(Vec::len),
+                Some(1),
+                "{failpoint}"
+            );
+        } else {
+            assert_eq!(fs::read(&config).unwrap(), original, "{failpoint}");
+            assert!(!target_skill.exists(), "{failpoint}");
+            assert!(!temp.path().join("codex/skills").exists(), "{failpoint}");
+            assert!(!ssot_skill.exists(), "{failpoint}");
+            assert!(!temp.path().join("state/skills").exists(), "{failpoint}");
+            assert!(!receipt.exists(), "{failpoint}");
+            assert!(!ownership.exists(), "{failpoint}");
+        }
+        assert!(
+            transaction_artifacts(temp.path()).is_empty(),
+            "transaction artifacts remain at {failpoint}: {:?}",
+            transaction_artifacts(temp.path())
+        );
+    }
+}
+
+#[test]
+fn subprocess_disconnect_crashes_restore_receipt_lease_and_skill_tree() {
+    let mut prepared_boundaries = vec![
+        "prepared-durable".to_owned(),
+        "mutations-complete".to_owned(),
+    ];
+    for boundary in [
+        "stage-durable",
+        "destination-displaced",
+        "destination-installed",
+    ] {
+        for occurrence in 1..=5 {
+            prepared_boundaries.push(format!("{boundary}:{occurrence}"));
+        }
+    }
+    let mut committed_boundaries = vec![
+        "committed-durable".to_owned(),
+        "active-cleared".to_owned(),
+        "bundle-cleared".to_owned(),
+    ];
+    for occurrence in 1..=5 {
+        committed_boundaries.push(format!("cleanup-artifact:{occurrence}"));
+    }
+
+    for (failpoint, committed) in prepared_boundaries
+        .iter()
+        .map(|value| (value.as_str(), false))
+        .chain(
+            committed_boundaries
+                .iter()
+                .map(|value| (value.as_str(), true)),
+        )
+    {
+        let temp = tempdir().unwrap();
+        let original = initialize_crash_tree(temp.path());
+        let (connector, plan) = crash_test_plan(temp.path());
+        connector.apply(&plan).unwrap();
+        let applied_config = fs::read(temp.path().join("codex/config.toml")).unwrap();
+        let receipt_path = temp.path().join("state/receipts/platform-a.json");
+        let ownership_path = temp
+            .path()
+            .join("state/projection-coordinator/ownership.json");
+        let prior_receipt = fs::read(&receipt_path).unwrap();
+        let prior_ownership = fs::read(&ownership_path).unwrap();
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("projection_crash_child")
+            .arg("--nocapture")
+            .env("GATEWAY_CONNECTOR_CRASH_CHILD_ROOT", temp.path())
+            .env("GATEWAY_CONNECTOR_CRASH_CHILD_DISCONNECT", "1")
+            .env("GATEWAY_CONNECTOR_TEST_FAILPOINT", failpoint)
+            .status()
+            .unwrap();
+        assert!(!status.success(), "failpoint did not abort: {failpoint}");
+        connector
+            .recover("platform-a", &Secret::new("crash-secret").unwrap())
+            .unwrap_or_else(|error| panic!("disconnect recovery failed at {failpoint}: {error}"));
+
+        let target_skill = temp.path().join("codex/skills/deploy/SKILL.md");
+        let ssot_skill = temp.path().join("state/skills/platform-a/deploy/SKILL.md");
+        if committed {
+            assert_eq!(
+                fs::read(temp.path().join("codex/config.toml")).unwrap(),
+                original,
+                "{failpoint}"
+            );
+            assert!(!target_skill.exists(), "{failpoint}");
+            assert!(!ssot_skill.exists(), "{failpoint}");
+            assert!(!receipt_path.exists(), "{failpoint}");
+            let coordinator: Value =
+                serde_json::from_slice(&fs::read(&ownership_path).unwrap()).unwrap();
+            assert_eq!(
+                coordinator["leases"].as_array().map(Vec::len),
+                Some(0),
+                "{failpoint}"
+            );
+        } else {
+            assert_eq!(
+                fs::read(temp.path().join("codex/config.toml")).unwrap(),
+                applied_config,
+                "{failpoint}"
+            );
+            assert_eq!(
+                fs::read(&receipt_path).unwrap(),
+                prior_receipt,
+                "{failpoint}"
+            );
+            assert_eq!(
+                fs::read(&ownership_path).unwrap(),
+                prior_ownership,
+                "{failpoint}"
+            );
+            assert_eq!(fs::read(&target_skill).unwrap(), b"complete Skill tree");
+            assert_eq!(fs::read(&ssot_skill).unwrap(), b"complete Skill tree");
+        }
+        assert!(
+            transaction_artifacts(temp.path()).is_empty(),
+            "transaction artifacts remain at {failpoint}: {:?}",
+            transaction_artifacts(temp.path())
+        );
+    }
+}
+
+#[test]
+fn shared_coordinator_recovery_is_owned_by_the_interrupted_distribution() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("distribution-a");
+    fs::create_dir(&root).unwrap();
+    let original = initialize_crash_tree(&root);
+    let coordinator = temp.path().join("shared-coordinator");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("projection_crash_child")
+        .arg("--nocapture")
+        .env("GATEWAY_CONNECTOR_CRASH_CHILD_ROOT", &root)
+        .env("GATEWAY_CONNECTOR_CRASH_CHILD_COORDINATOR", &coordinator)
+        .env(
+            "GATEWAY_CONNECTOR_TEST_FAILPOINT",
+            "destination-installed:1",
+        )
+        .status()
+        .unwrap();
+    assert!(!status.success());
+
+    let other = Connector::with_coordinator(temp.path().join("state-b"), &coordinator);
+    let error = other
+        .recover("platform-b", &Secret::new("other-secret").unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("belongs to platform platform-a"), "{error}");
+    assert!(!transaction_artifacts(temp.path()).is_empty());
+
+    Connector::with_coordinator(root.join("state"), coordinator)
+        .recover("platform-a", &Secret::new("crash-secret").unwrap())
+        .unwrap();
+    assert_eq!(fs::read(root.join("codex/config.toml")).unwrap(), original);
+    assert!(!root.join("codex/skills").exists());
+    assert!(transaction_artifacts(temp.path()).is_empty());
+}
+
+#[test]
+fn missing_or_tampered_active_pointer_never_discards_the_authenticated_bundle() {
+    for (failpoint, committed) in [
+        ("destination-displaced:1", false),
+        ("committed-durable", true),
+    ] {
+        let temp = tempdir().unwrap();
+        let original = initialize_crash_tree(temp.path());
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("projection_crash_child")
+            .arg("--nocapture")
+            .env("GATEWAY_CONNECTOR_CRASH_CHILD_ROOT", temp.path())
+            .env("GATEWAY_CONNECTOR_TEST_FAILPOINT", failpoint)
+            .status()
+            .unwrap();
+        assert!(!status.success(), "failpoint did not abort: {failpoint}");
+
+        let active = temp
+            .path()
+            .join("state/projection-coordinator/transactions/active.json");
+        let active_bytes = fs::read(&active).unwrap();
+        fs::write(&active, b"{}").unwrap();
+        let connector = Connector::new(temp.path().join("state"));
+        assert!(
+            connector
+                .recover("platform-a", &Secret::new("crash-secret").unwrap())
+                .is_err()
+        );
+        assert!(!transaction_artifacts(temp.path()).is_empty());
+
+        fs::write(&active, active_bytes).unwrap();
+        fs::remove_file(&active).unwrap();
+        let transactions = active.parent().unwrap();
+        let bundle = fs::read_dir(transactions)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("bundle-")
+            })
+            .unwrap();
+        let manifest = bundle.join("manifest.enc");
+        let manifest_bytes = fs::read(&manifest).unwrap();
+        fs::write(&manifest, b"{}").unwrap();
+        assert!(
+            connector
+                .recover("platform-a", &Secret::new("crash-secret").unwrap())
+                .is_err()
+        );
+        assert!(bundle.exists());
+        fs::remove_file(&manifest).unwrap();
+        assert!(
+            connector
+                .recover("platform-a", &Secret::new("crash-secret").unwrap())
+                .is_err()
+        );
+        assert!(bundle.exists());
+        fs::write(&manifest, manifest_bytes).unwrap();
+
+        let wrong_platform = connector
+            .recover("platform-b", &Secret::new("crash-secret").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_platform.contains("belongs to platform platform-a"));
+        assert!(
+            connector
+                .recover("platform-a", &Secret::new("wrong-secret").unwrap())
+                .is_err()
+        );
+        assert!(!transaction_artifacts(temp.path()).is_empty());
+
+        connector
+            .recover("platform-a", &Secret::new("crash-secret").unwrap())
+            .unwrap();
+        let config = temp.path().join("codex/config.toml");
+        if committed {
+            assert_ne!(fs::read(config).unwrap(), original);
+            assert!(temp.path().join("state/receipts/platform-a.json").is_file());
+        } else {
+            assert_eq!(fs::read(config).unwrap(), original);
+            assert!(!temp.path().join("state/receipts/platform-a.json").exists());
+        }
+        assert!(transaction_artifacts(temp.path()).is_empty());
+    }
 }
