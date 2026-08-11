@@ -19,6 +19,8 @@ use toml_edit::{DocumentMut, Item, Table, value};
 
 const SKILL_OWNER_FILE: &str = ".gateway-connector-owner";
 const MAX_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
+const TEMPORARY_BUNDLE_PREFIX: &str = ".gateway-bundle-";
+const TEMPORARY_BUNDLE_SUFFIX: &str = ".tmp";
 
 #[derive(Debug)]
 pub struct ApplyInput<'a> {
@@ -1270,6 +1272,9 @@ fn execute_ops(
     }
     let bundle_name = format!("bundle-{txid}");
     let bundle = transactions.join(&bundle_name);
+    let temporary_bundle = transactions.join(format!(
+        "{TEMPORARY_BUNDLE_PREFIX}{txid}{TEMPORARY_BUNDLE_SUFFIX}"
+    ));
     let salt = Aes256Gcm::generate_nonce(&mut OsRng).to_vec();
     let header = ActiveHeader {
         version: 1,
@@ -1352,8 +1357,26 @@ fn execute_ops(
             "projection journal exceeds its serialized size limit".into(),
         ));
     }
-    ensure_plain_dir(&bundle)?;
-    atomic(&bundle.join("manifest.enc"), &stored_journal)?;
+    ensure_plain_dir(&temporary_bundle)?;
+    let temporary_guard = RootGuard::capture(&transactions, &temporary_bundle)?;
+    temporary_guard.validate(&temporary_bundle)?;
+    maybe_failpoint("bundle-created");
+    atomic_with_failpoint(
+        &temporary_bundle.join("manifest.enc"),
+        &stored_journal,
+        Some("manifest-temporary-durable"),
+    )?;
+    maybe_failpoint("manifest-in-temporary-bundle");
+    if exists(&bundle) {
+        return Err(Error::Transaction(format!(
+            "projection transaction bundle already exists: {}",
+            bundle.display()
+        )));
+    }
+    let bundle_guard = RootGuard::capture(&transactions, &bundle)?;
+    temporary_guard.validate(&temporary_bundle)?;
+    bundle_guard.validate(&bundle)?;
+    durable_publish_bundle(&temporary_bundle, &bundle)?;
     maybe_failpoint("manifest-durable");
     atomic(&active_path, &aad)?;
     maybe_failpoint("prepared-durable");
@@ -1391,6 +1414,9 @@ fn recover_transaction(coordinator: &Path, platform: &str, receipt_key: &[u8; 32
     RootGuard::capture(coordinator, &transactions)?;
     RootGuard::capture(&transactions, &active)?;
     let active_aad = read_optional_bounded(&active)?;
+    if active_aad.is_none() {
+        recover_temporary_bundle(&transactions, platform, receipt_key)?;
+    }
     let active_header = active_aad
         .as_deref()
         .map(|bytes| {
@@ -1500,6 +1526,132 @@ fn validate_active_header(header: &ActiveHeader) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn recover_temporary_bundle(
+    transactions: &Path,
+    platform: &str,
+    receipt_key: &[u8; 32],
+) -> Result<()> {
+    let mut temporary = Vec::new();
+    let mut other_artifacts = false;
+    for entry in fs::read_dir(transactions).map_err(|error| io(transactions, error))? {
+        let entry = entry.map_err(|error| io(transactions, error))?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(transaction) = temporary_bundle_transaction(&name) {
+            let metadata = fs::symlink_metadata(&path).map_err(|error| io(&path, error))?;
+            if is_reparse(&metadata) || !metadata.is_dir() {
+                return Err(Error::Transaction(format!(
+                    "temporary transaction bundle is not a plain directory: {}",
+                    path.display()
+                )));
+            }
+            temporary.push((path, transaction));
+        } else {
+            other_artifacts = true;
+        }
+    }
+    if temporary.is_empty() {
+        return Ok(());
+    }
+    if temporary.len() != 1 || other_artifacts {
+        return Err(Error::Transaction(
+            "temporary projection bundle is ambiguous with other transaction artifacts".into(),
+        ));
+    }
+    let (temporary, transaction) = temporary.pop().expect("one temporary bundle");
+    let guard = RootGuard::capture(transactions, &temporary)?;
+    let mut entries = fs::read_dir(&temporary)
+        .map_err(|error| io(&temporary, error))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| io(&temporary, error))?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    match entries.as_slice() {
+        [] => {
+            // The final bundle name was never published, so no mutation could
+            // have begun. An empty private preparation directory is safe to
+            // discard after reparse/containment checks.
+            guard.validate(&temporary)?;
+            durable_remove_empty_dir(&temporary)
+        }
+        [entry] if atomic_temporary_name(&entry.file_name().to_string_lossy()) => {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| io(&path, error))?;
+            if is_reparse(&metadata) || !metadata.is_file() {
+                return Err(Error::Transaction(format!(
+                    "manifest temporary is not a plain file: {}",
+                    path.display()
+                )));
+            }
+            // This is the synced-but-not-renamed file created inside the
+            // unpublished bundle. Mutations remain impossible at this point.
+            guard.validate(&temporary)?;
+            let file_guard = RootGuard::capture(&temporary, &path)?;
+            file_guard.validate(&path)?;
+            fs::remove_file(&path).map_err(|error| io(&path, error))?;
+            sync_parent(&path)?;
+            guard.validate(&temporary)?;
+            durable_remove_empty_dir(&temporary)
+        }
+        [entry] if entry.file_name() == "manifest.enc" => {
+            let manifest_path = entry.path();
+            RootGuard::capture(&temporary, &manifest_path)?;
+            let stored: StoredJournal = serde_json::from_slice(&read_bounded(&manifest_path)?)
+                .map_err(|error| {
+                    Error::Transaction(format!(
+                        "invalid stored temporary transaction journal: {error}"
+                    ))
+                })?;
+            validate_active_header(&stored.header)?;
+            if stored.header.transaction != transaction {
+                return Err(Error::Transaction(
+                    "temporary bundle name does not match its authenticated header".into(),
+                ));
+            }
+            if stored.header.platform != platform {
+                return Err(Error::Transaction(format!(
+                    "temporary projection transaction {} belongs to platform {}; recover it with that platform credential",
+                    stored.header.transaction, stored.header.platform
+                )));
+            }
+            let aad = serde_json::to_vec(&stored.header)
+                .map_err(|error| Error::Transaction(error.to_string()))?;
+            let key = journal_key(receipt_key, &stored.header.salt)?;
+            let envelope = serde_json::to_vec(&stored.manifest)
+                .map_err(|error| Error::Transaction(error.to_string()))?;
+            let manifest: JournalManifest = open_journal(&envelope, &key, &aad)?;
+            validate_journal_manifest(&manifest)?;
+            let final_bundle = transactions.join(&stored.header.bundle);
+            if exists(&final_bundle) {
+                return Err(Error::Transaction(
+                    "temporary and final projection bundles both exist".into(),
+                ));
+            }
+            let final_guard = RootGuard::capture(transactions, &final_bundle)?;
+            guard.validate(&temporary)?;
+            final_guard.validate(&final_bundle)?;
+            durable_publish_bundle(&temporary, &final_bundle)
+        }
+        _ => Err(Error::Transaction(
+            "temporary projection bundle contains unexpected or multiple artifacts".into(),
+        )),
+    }
+}
+
+fn temporary_bundle_transaction(name: &str) -> Option<String> {
+    let transaction = name
+        .strip_prefix(TEMPORARY_BUNDLE_PREFIX)?
+        .strip_suffix(TEMPORARY_BUNDLE_SUFFIX)?;
+    uuid::Uuid::parse_str(transaction)
+        .ok()
+        .map(|_| transaction.to_owned())
+}
+
+fn atomic_temporary_name(name: &str) -> bool {
+    name.strip_prefix(".connector-")
+        .and_then(|value| value.strip_suffix(".tmp"))
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
 }
 
 fn transaction_bundle(transactions: &Path, expected: Option<&str>) -> Result<Option<PathBuf>> {
@@ -2362,8 +2514,9 @@ fn openai_api_base(gateway: &url::Url) -> String {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{edit_json, openai_api_base};
+    use super::{durable_publish_bundle, edit_json, openai_api_base};
     use serde_json::json;
+    use std::fs;
 
     #[test]
     fn normalizes_openai_api_base_without_duplicate_v1() {
@@ -2415,6 +2568,23 @@ mod tests {
             json5::from_str::<serde_json::Value>(&edited).expect("edited JSONC must parse"),
             target
         );
+    }
+
+    #[test]
+    fn bundle_publication_never_replaces_an_existing_destination() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        fs::create_dir(&source).expect("source directory");
+        fs::write(source.join("manifest.enc"), b"source").expect("source manifest");
+        fs::create_dir(&destination).expect("destination directory");
+
+        assert!(durable_publish_bundle(&source, &destination).is_err());
+        assert_eq!(
+            fs::read(source.join("manifest.enc")).expect("source is preserved"),
+            b"source"
+        );
+        assert!(destination.is_dir());
     }
 }
 fn receipt_key(secret: &Secret) -> Result<[u8; 32]> {
@@ -3069,6 +3239,15 @@ fn dotenv_value(value: &str) -> String {
 }
 #[cfg_attr(windows, allow(unsafe_code))]
 fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_with_failpoint(path, bytes, None)
+}
+
+#[cfg_attr(windows, allow(unsafe_code))]
+fn atomic_with_failpoint(
+    path: &Path,
+    bytes: &[u8],
+    before_rename_failpoint: Option<&str>,
+) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| Error::Transaction("path has no parent".into()))?;
@@ -3116,6 +3295,9 @@ fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             let _ = fs::remove_file(&temp);
             return Err(io(&temp, error));
         }
+    }
+    if let Some(failpoint) = before_rename_failpoint {
+        maybe_failpoint(failpoint);
     }
     #[cfg(not(windows))]
     {
@@ -3196,6 +3378,76 @@ fn sync_tree(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(unsafe_code)]
+fn durable_publish_bundle(from: &Path, to: &Path) -> Result<()> {
+    if from.parent() != to.parent() {
+        return Err(Error::Transaction(
+            "durable bundle publication must stay within one parent".into(),
+        ));
+    }
+    reject_absolute_reparse_components(from)?;
+    reject_absolute_reparse_components(to)?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let from_name = CString::new(from.as_os_str().as_bytes())
+            .map_err(|_| Error::Transaction("bundle path contains a NUL byte".into()))?;
+        let to_name = CString::new(to.as_os_str().as_bytes())
+            .map_err(|_| Error::Transaction("bundle path contains a NUL byte".into()))?;
+        if unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from_name.as_ptr(),
+                libc::AT_FDCWD,
+                to_name.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            return Err(io(from, std::io::Error::last_os_error()));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let from_name = CString::new(from.as_os_str().as_bytes())
+            .map_err(|_| Error::Transaction("bundle path contains a NUL byte".into()))?;
+        let to_name = CString::new(to.as_os_str().as_bytes())
+            .map_err(|_| Error::Transaction("bundle path contains a NUL byte".into()))?;
+        if unsafe { libc::renamex_np(from_name.as_ptr(), to_name.as_ptr(), libc::RENAME_EXCL) } != 0
+        {
+            return Err(io(from, std::io::Error::last_os_error()));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+        let from_wide = from
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let to_wide = to
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        if unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0
+        {
+            return Err(io(from, std::io::Error::last_os_error()));
+        }
+    }
+    #[cfg(all(
+        unix,
+        not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+    ))]
+    return Err(Error::Transaction(
+        "exclusive durable bundle publication is unsupported on this platform".into(),
+    ));
+    sync_parent(to)
+}
+
 #[cfg_attr(windows, allow(unsafe_code))]
 fn durable_rename(from: &Path, to: &Path) -> Result<()> {
     if from.parent() != to.parent() {
@@ -3227,6 +3479,19 @@ fn durable_rename(from: &Path, to: &Path) -> Result<()> {
         }
     }
     sync_parent(to)
+}
+
+fn durable_remove_empty_dir(path: &Path) -> Result<()> {
+    reject_absolute_reparse_components(path)?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| io(path, error))?;
+    if is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(Error::Validation(format!(
+            "refusing to remove a special temporary bundle: {}",
+            path.display()
+        )));
+    }
+    fs::remove_dir(path).map_err(|error| io(path, error))?;
+    sync_parent(path)
 }
 
 fn durable_remove_any(path: &Path) -> Result<()> {

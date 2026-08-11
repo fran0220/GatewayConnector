@@ -1046,6 +1046,7 @@ fn transaction_artifacts(root: &Path) -> Vec<PathBuf> {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name == "active.json"
                 || name.starts_with("bundle-")
+                || (name.starts_with(".gateway-bundle-") && name.ends_with(".tmp"))
                 || name.starts_with(".gateway-stage-")
                 || name.starts_with(".gateway-displaced-")
                 || (name.starts_with(".connector-") && name.ends_with(".tmp"))
@@ -1080,6 +1081,9 @@ fn projection_crash_child() {
 #[test]
 fn subprocess_crashes_recover_every_projection_commit_boundary() {
     let mut prepared_boundaries = vec![
+        "bundle-created".to_owned(),
+        "manifest-temporary-durable".to_owned(),
+        "manifest-in-temporary-bundle".to_owned(),
         "manifest-durable".to_owned(),
         "prepared-durable".to_owned(),
         "mutations-complete".to_owned(),
@@ -1173,6 +1177,142 @@ fn subprocess_crashes_recover_every_projection_commit_boundary() {
             transaction_artifacts(temp.path())
         );
     }
+}
+
+#[test]
+fn unpublished_bundle_recovery_cleans_only_unambiguous_preparation_artifacts() {
+    for failpoint in ["bundle-created", "manifest-temporary-durable"] {
+        let temp = tempdir().unwrap();
+        let original = initialize_crash_tree(temp.path());
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("projection_crash_child")
+            .arg("--nocapture")
+            .env("GATEWAY_CONNECTOR_CRASH_CHILD_ROOT", temp.path())
+            .env("GATEWAY_CONNECTOR_TEST_FAILPOINT", failpoint)
+            .status()
+            .unwrap();
+        assert!(!status.success(), "failpoint did not abort: {failpoint}");
+        assert!(
+            transaction_artifacts(temp.path()).iter().any(|path| path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".gateway-bundle-")),
+            "expected unpublished bundle at {failpoint}"
+        );
+
+        Connector::new(temp.path().join("state"))
+            .recover("platform-a", &Secret::new("crash-secret").unwrap())
+            .unwrap();
+        assert_eq!(
+            fs::read(temp.path().join("codex/config.toml")).unwrap(),
+            original
+        );
+        assert!(transaction_artifacts(temp.path()).is_empty());
+    }
+}
+
+#[test]
+fn ambiguous_or_tampered_unpublished_bundles_fail_closed() {
+    for scenario in ["multiple", "tampered", "unexpected-sibling"] {
+        let temp = tempdir().unwrap();
+        let transactions = temp
+            .path()
+            .join("state/projection-coordinator/transactions");
+        fs::create_dir_all(&transactions).unwrap();
+        let first = transactions.join(format!(".gateway-bundle-{}.tmp", uuid::Uuid::new_v4()));
+        fs::create_dir(&first).unwrap();
+        if scenario == "multiple" {
+            fs::create_dir(
+                transactions.join(format!(".gateway-bundle-{}.tmp", uuid::Uuid::new_v4())),
+            )
+            .unwrap();
+        } else if scenario == "tampered" {
+            fs::write(first.join("manifest.enc"), b"not a journal").unwrap();
+        } else {
+            fs::write(
+                first.join(format!(".connector-{}.tmp", uuid::Uuid::new_v4())),
+                b"partial journal",
+            )
+            .unwrap();
+            fs::write(first.join("unexpected"), b"preserve").unwrap();
+        }
+
+        let error = Connector::new(temp.path().join("state"))
+            .recover("platform-a", &Secret::new("crash-secret").unwrap())
+            .unwrap_err()
+            .to_string();
+        if scenario == "multiple" {
+            assert!(error.contains("ambiguous"), "{error}");
+        } else if scenario == "tampered" {
+            assert!(error.contains("invalid stored temporary"), "{error}");
+        } else {
+            assert!(error.contains("unexpected or multiple"), "{error}");
+            assert_eq!(fs::read(first.join("unexpected")).unwrap(), b"preserve");
+        }
+        assert!(first.exists(), "{scenario} artifact was silently removed");
+        assert!(!transaction_artifacts(temp.path()).is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unpublished_bundle_cleanup_rejects_a_symlinked_bundle() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempdir().unwrap();
+    let transactions = temp
+        .path()
+        .join("state/projection-coordinator/transactions");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&transactions).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("preserve"), b"outside").unwrap();
+    let bundle = transactions.join(format!(".gateway-bundle-{}.tmp", uuid::Uuid::new_v4()));
+    symlink(&outside, &bundle).unwrap();
+
+    let error = Connector::new(temp.path().join("state"))
+        .recover("platform-a", &Secret::new("crash-secret").unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not a plain directory"), "{error}");
+    assert_eq!(fs::read(outside.join("preserve")).unwrap(), b"outside");
+    assert!(
+        fs::symlink_metadata(bundle)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn unpublished_bundle_cleanup_rejects_a_junction_bundle() {
+    let temp = tempdir().unwrap();
+    let transactions = temp
+        .path()
+        .join("state/projection-coordinator/transactions");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&transactions).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("preserve"), b"outside").unwrap();
+    let bundle = transactions.join(format!(".gateway-bundle-{}.tmp", uuid::Uuid::new_v4()));
+    let output = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(bundle.to_string_lossy().replace('/', "\\"))
+        .arg(outside.to_string_lossy().replace('/', "\\"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "mklink /J failed: {output:?}");
+
+    let error = Connector::new(temp.path().join("state"))
+        .recover("platform-a", &Secret::new("crash-secret").unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not a plain directory"), "{error}");
+    assert_eq!(fs::read(outside.join("preserve")).unwrap(), b"outside");
+    assert!(bundle.exists());
 }
 
 #[test]
