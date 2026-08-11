@@ -20,9 +20,18 @@ use gateway_connector_core::{
     CredentialKind, CredentialRef, ProfileId, Protocol,
 };
 use sha2::{Digest, Sha256};
-use tiny_http::{Header, Response, Server, StatusCode};
+use tiny_http::{Header, Request, Response, Server, StatusCode};
 use url::Url;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+
+const MOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn recv_request(server: &Server, context: &str) -> Request {
+    server
+        .recv_timeout(MOCK_REQUEST_TIMEOUT)
+        .unwrap_or_else(|error| panic!("{context}: {error}"))
+        .unwrap_or_else(|| panic!("timed out waiting for {context}"))
+}
 
 #[derive(Debug, Default)]
 struct RequestCapture {
@@ -39,7 +48,7 @@ fn spawn_response(
     let capture = Arc::new(Mutex::new(RequestCapture::default()));
     let thread_capture = Arc::clone(&capture);
     let handle = thread::spawn(move || {
-        let mut request = server.recv().expect("receive request");
+        let mut request = recv_request(&server, "mock response request");
         let authorization = request
             .headers()
             .iter()
@@ -66,7 +75,7 @@ fn spawn_direct(body: &'static str, requests: usize) -> (String, thread::JoinHan
     let address = format!("http://{}", server.server_addr());
     let handle = thread::spawn(move || {
         for index in 0..requests {
-            let request = server.recv().expect("receive request");
+            let request = recv_request(&server, "direct Gateway request");
             let response = if index == 0 {
                 Response::from_string("").with_status_code(StatusCode(404))
             } else {
@@ -458,7 +467,7 @@ fn refuses_cross_origin_redirect_without_contacting_target() {
     let source_url = format!("http://{}", source.server_addr());
     let source_handle =
         thread::spawn(move || {
-            let request = source.recv().expect("source request");
+            let request = recv_request(&source, "redirect source request");
             request
                 .respond(Response::empty(StatusCode(302)).with_header(
                     Header::from_bytes("Location", target_url).expect("location header"),
@@ -546,7 +555,7 @@ fn provisioned_connection_uses_manifest_catalog_and_bearer_boundary() {
             "/api/connector/provisioning",
             "/skill.zip",
         ] {
-            let request = server.recv().expect("enhanced request");
+            let request = recv_request(&server, "enhanced connection request");
             let authorization = request
                 .headers()
                 .iter()
@@ -879,7 +888,7 @@ fn platform_pin_is_enforced_during_probe() {
         &[&origin],
     );
     let handle = thread::spawn(move || {
-        let request = server.recv().expect("manifest request");
+        let request = recv_request(&server, "platform manifest request");
         request
             .respond(Response::from_string(body).with_status_code(StatusCode(200)))
             .expect("manifest response");
@@ -933,7 +942,7 @@ fn cross_origin_provisioning_requires_allowlist_and_never_forwards_redirects() {
     .expect("allowlisted cross-origin provisioning");
     let provisioning_body = provisioning_body();
     let handle = thread::spawn(move || {
-        let request = provisioning.recv().expect("provisioning request");
+        let request = recv_request(&provisioning, "cross-origin provisioning request");
         let authorization = request
             .headers()
             .iter()
@@ -969,7 +978,7 @@ fn cross_origin_provisioning_requires_allowlist_and_never_forwards_redirects() {
     .expect("redirect manifest");
     let redirect_handle =
         thread::spawn(move || {
-            let request = redirect_source.recv().expect("redirect request");
+            let request = recv_request(&redirect_source, "provisioning redirect request");
             request
                 .respond(Response::empty(StatusCode(302)).with_header(
                     Header::from_bytes("Location", target_url).expect("location header"),
@@ -1003,7 +1012,7 @@ fn resume_rechecks_saved_platform_identity() {
         &[&origin],
     );
     let handle = thread::spawn(move || {
-        let request = server.recv().expect("manifest request");
+        let request = recv_request(&server, "resume manifest request");
         request
             .respond(Response::from_string(body).with_status_code(StatusCode(200)))
             .expect("manifest response");
@@ -1088,7 +1097,7 @@ fn browser_login_keeps_failed_vault_credentials_retryable() {
             "/token",
             "/api/connector/provisioning",
         ] {
-            let mut request = server.recv().expect("enhanced request");
+            let mut request = recv_request(&server, "browser credential retry request");
             let authorization = request
                 .headers()
                 .iter()
@@ -1177,7 +1186,7 @@ fn browser_token_is_pending_when_profile_creation_fails_after_redemption() {
     let manifest = browser_manifest_body("pinned-platform", &origin);
     let handle = thread::spawn(move || {
         for expected_path in ["/.well-known/gateway-connector", "/token"] {
-            let request = server.recv().expect("enhanced request");
+            let request = recv_request(&server, "browser profile failure request");
             assert_eq!(request.url(), expected_path);
             let body = if expected_path == "/token" {
                 r#"{"access_token":"pending-after-create","token_type":"Bearer"}"#
@@ -1222,7 +1231,7 @@ fn browser_offer_is_fully_validated_before_redeeming_a_code() {
     let origin = format!("http://{}", server.server_addr());
     let manifest = browser_manifest_body("pinned-platform", &origin);
     let handle = thread::spawn(move || {
-        let request = server.recv().expect("manifest request");
+        let request = recv_request(&server, "browser offer manifest request");
         request
             .respond(Response::from_string(manifest).with_status_code(StatusCode(200)))
             .expect("manifest response");
@@ -1271,7 +1280,7 @@ fn failed_browser_credential_can_be_remotely_revoked_and_discarded() {
             "/token",
             "/api/connector/revoke",
         ] {
-            let request = server.recv().expect("enhanced request");
+            let request = recv_request(&server, "browser credential revocation request");
             let authorization = request
                 .headers()
                 .iter()
