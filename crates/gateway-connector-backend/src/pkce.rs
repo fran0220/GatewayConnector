@@ -221,7 +221,16 @@ pub enum PkceError {
 mod tests {
     use super::*;
     use std::{collections::BTreeMap, net::TcpStream, sync::Mutex, thread};
-    use tiny_http::{Header, Response, Server, StatusCode};
+    use tiny_http::{Header, Request, Response, Server, StatusCode};
+
+    const MOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+    fn recv_request(server: &Server, context: &str) -> Request {
+        server
+            .recv_timeout(MOCK_REQUEST_TIMEOUT)
+            .unwrap_or_else(|error| panic!("{context}: {error}"))
+            .unwrap_or_else(|| panic!("timed out waiting for {context}"))
+    }
 
     #[derive(Debug, Clone, Copy)]
     enum Callback {
@@ -310,7 +319,7 @@ mod tests {
         let server = Server::http("127.0.0.1:0").expect("token server");
         let url = Url::parse(&format!("http://{}/token", server.server_addr())).expect("token URL");
         let handle = thread::spawn(move || {
-            let mut request = server.recv().expect("token request");
+            let mut request = recv_request(&server, "PKCE token request");
             assert_eq!(request.method().as_str(), "POST");
             assert_eq!(request.url(), "/token");
             let mut request_body = String::new();

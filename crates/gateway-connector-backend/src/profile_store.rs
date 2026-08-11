@@ -315,9 +315,25 @@ mod tests {
     use gateway_connector_core::{CanonicalBaseUrl, Protocol};
     use std::sync::{Arc, Barrier};
 
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        #[cfg(target_os = "macos")]
+        {
+            let root = std::fs::canonicalize(std::env::temp_dir())?;
+            tempfile::Builder::new()
+                .prefix("gateway-connector-")
+                .tempdir_in(root)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            tempfile::Builder::new()
+                .prefix("gateway-connector-")
+                .tempdir()
+        }
+    }
+
     #[test]
     fn json_store_persists_only_profile_data() {
-        let directory = tempfile::tempdir().expect("temp directory");
+        let directory = tempdir().expect("temp directory");
         let path = directory.path().join("profiles.json");
         let store = JsonProfileStore::new(&path);
         let profile = ConnectionProfile::new(
@@ -335,7 +351,7 @@ mod tests {
 
     #[test]
     fn separate_store_instances_atomically_enforce_one_profile() {
-        let directory = tempfile::tempdir().expect("temp directory");
+        let directory = tempdir().expect("temp directory");
         let path = directory.path().join("profiles.json");
         let profiles = ["One", "Two"].map(|name| {
             ConnectionProfile::new(
@@ -378,7 +394,7 @@ mod tests {
     fn rejects_symlinked_parent_profile_and_lock_paths() {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().expect("temp directory");
+        let directory = tempdir().expect("temp directory");
         let real = directory.path().join("real");
         fs::create_dir(&real).expect("real directory");
         let linked = directory.path().join("linked");
@@ -406,7 +422,7 @@ mod tests {
 
     #[test]
     fn unique_temporary_files_do_not_clobber_an_existing_candidate() {
-        let directory = tempfile::tempdir().expect("temp directory");
+        let directory = tempdir().expect("temp directory");
         let path = directory.path().join("profiles.json");
         let stale = directory.path().join("profiles.tmp");
         fs::write(&stale, b"do not overwrite").expect("stale temporary");

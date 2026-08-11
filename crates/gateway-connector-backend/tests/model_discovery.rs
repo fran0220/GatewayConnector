@@ -33,6 +33,22 @@ fn recv_request(server: &Server, context: &str) -> Request {
         .unwrap_or_else(|| panic!("timed out waiting for {context}"))
 }
 
+fn tempdir() -> std::io::Result<tempfile::TempDir> {
+    #[cfg(target_os = "macos")]
+    {
+        let root = fs::canonicalize(std::env::temp_dir())?;
+        tempfile::Builder::new()
+            .prefix("gateway-connector-")
+            .tempdir_in(root)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        tempfile::Builder::new()
+            .prefix("gateway-connector-")
+            .tempdir()
+    }
+}
+
 #[derive(Debug, Default)]
 struct RequestCapture {
     path: String,
@@ -576,8 +592,8 @@ fn provisioned_connection_uses_manifest_catalog_and_bearer_boundary() {
     });
     let credentials = Arc::new(InMemoryCredentialStore::default());
     let profiles = Arc::new(InMemoryProfileStore::default());
-    let state = tempfile::tempdir().expect("catalog state");
-    let home = tempfile::tempdir().expect("Agent home");
+    let state = tempdir().expect("catalog state");
+    let home = tempdir().expect("Agent home");
     for root in [".claude", ".codex", ".gemini", ".grok", ".config/opencode"] {
         fs::create_dir_all(home.path().join(root)).expect("Agent root");
     }
@@ -704,8 +720,8 @@ fn provisioned_connection_uses_manifest_catalog_and_bearer_boundary() {
 fn direct_projection_uses_discovered_models_without_inventing_services() {
     let credentials = Arc::new(InMemoryCredentialStore::default());
     let profiles = Arc::new(InMemoryProfileStore::default());
-    let state = tempfile::tempdir().expect("projection state");
-    let home = tempfile::tempdir().expect("Agent home");
+    let state = tempdir().expect("projection state");
+    let home = tempdir().expect("Agent home");
     fs::create_dir(home.path().join(".codex")).expect("Codex root");
     let backend = ConnectorBackend::new(credentials.clone(), profiles.clone())
         .and_then(|backend| {
@@ -777,8 +793,8 @@ fn direct_projection_uses_discovered_models_without_inventing_services() {
 fn direct_projection_requires_saved_explicit_capability_decisions() {
     let credentials = Arc::new(InMemoryCredentialStore::default());
     let profiles = Arc::new(InMemoryProfileStore::default());
-    let state = tempfile::tempdir().expect("projection state");
-    let home = tempfile::tempdir().expect("Agent home");
+    let state = tempdir().expect("projection state");
+    let home = tempdir().expect("Agent home");
     fs::create_dir(home.path().join(".codex")).expect("Codex root");
     let backend = ConnectorBackend::new(credentials.clone(), profiles.clone())
         .and_then(|backend| {

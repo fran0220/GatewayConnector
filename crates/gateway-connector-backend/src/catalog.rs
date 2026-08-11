@@ -688,9 +688,34 @@ mod tests {
         thread,
         time::Duration,
     };
-    use tiny_http::{Header, Response, Server, StatusCode};
+    use tiny_http::{Header, Request, Response, Server, StatusCode};
     use url::Url;
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+
+    const MOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        #[cfg(target_os = "macos")]
+        {
+            let root = std::fs::canonicalize(std::env::temp_dir())?;
+            tempfile::Builder::new()
+                .prefix("gateway-connector-")
+                .tempdir_in(root)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            tempfile::Builder::new()
+                .prefix("gateway-connector-")
+                .tempdir()
+        }
+    }
+
+    fn recv_request(server: &Server, context: &str) -> Request {
+        server
+            .recv_timeout(MOCK_REQUEST_TIMEOUT)
+            .unwrap_or_else(|error| panic!("{context}: {error}"))
+            .unwrap_or_else(|| panic!("timed out waiting for {context}"))
+    }
 
     fn skill_zip(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
@@ -767,9 +792,7 @@ mod tests {
         let response = archive.clone();
         let handle = thread::spawn(move || {
             for _ in 0..2 {
-                server
-                    .recv()
-                    .expect("archive request")
+                recv_request(&server, "aggregate budget archive request")
                     .respond(Response::from_data(response.clone()))
                     .expect("archive response");
             }
@@ -778,7 +801,7 @@ mod tests {
             skill("one", &format!("{origin}/one.zip"), &archive, "none"),
             skill("two", &format!("{origin}/two.zip"), &archive, "none"),
         ];
-        let state = tempfile::tempdir().expect("catalog state");
+        let state = tempdir().expect("catalog state");
         let published = state
             .path()
             .join("synchronized-skills/test-platform/old/SKILL.md");
@@ -895,7 +918,7 @@ mod tests {
             ),
             ("missing-root", skill_zip(&[("README.md", b"no", 0o644)])),
         ];
-        let temp = tempfile::tempdir().expect("temp directory");
+        let temp = tempdir().expect("temp directory");
         for (name, bytes) in cases {
             let target = temp.path().join(name);
             let error = extract_zip(&bytes, &target).expect_err("unsafe ZIP must fail");
@@ -910,7 +933,7 @@ mod tests {
     #[test]
     fn zip_validation_enforces_entry_and_expanded_budgets() {
         let bytes = skill_zip(&[("SKILL.md", b"four", 0o644), ("extra.txt", b"x", 0o644)]);
-        let temp = tempfile::tempdir().expect("temp directory");
+        let temp = tempdir().expect("temp directory");
         assert!(extract_zip_with_limits(&bytes, &temp.path().join("entries"), 1, 100).is_err());
         assert!(extract_zip_with_limits(&bytes, &temp.path().join("size"), 10, 3).is_err());
         let output = temp.path().join("valid");
@@ -930,7 +953,7 @@ mod tests {
         let private_response = private.clone();
         let handle = thread::spawn(move || {
             for _ in 0..2 {
-                let request = server.recv().expect("archive request");
+                let request = recv_request(&server, "catalog archive request");
                 let authorization = request
                     .headers()
                     .iter()
@@ -961,7 +984,7 @@ mod tests {
             ),
         ]);
         provisioning.validate_for(&manifest).expect("catalog");
-        let temp = tempfile::tempdir().expect("temp directory");
+        let temp = tempdir().expect("temp directory");
         let paths = SkillCatalog::new(temp.path().to_owned())
             .expect("catalog")
             .synchronize(
@@ -996,7 +1019,7 @@ mod tests {
         let target = Server::http("127.0.0.1:0").expect("target server");
         let target_url = format!("http://{}/leak", target.server_addr());
         let handle = thread::spawn(move || {
-            let request = source.recv().expect("source request");
+            let request = recv_request(&source, "archive redirect source request");
             assert_eq!(
                 request
                     .headers()
@@ -1019,7 +1042,7 @@ mod tests {
             &bytes,
             "connection_bearer",
         )]);
-        let temp = tempfile::tempdir().expect("temp directory");
+        let temp = tempdir().expect("temp directory");
         let old = temp
             .path()
             .join("synchronized-skills/test-platform/old/SKILL.md");
@@ -1053,7 +1076,7 @@ mod tests {
 
     #[test]
     fn empty_catalog_replaces_stale_state_and_startup_recovers_previous_tree() {
-        let temp = tempfile::tempdir().expect("temp directory");
+        let temp = tempdir().expect("temp directory");
         let parent = temp.path().join("synchronized-skills");
         fs::create_dir_all(&parent).expect("catalog parent");
         let recovery_root = parent.join("test.platform");
@@ -1097,7 +1120,7 @@ mod tests {
 
     #[test]
     fn transaction_namespace_does_not_overlap_other_platform_ids() {
-        let temp = tempfile::tempdir().expect("temp directory");
+        let temp = tempdir().expect("temp directory");
         let root = temp.path().join("foo");
         let other_platform = temp.path().join("foo.previous-other");
         fs::create_dir_all(&other_platform).expect("other platform");
@@ -1114,7 +1137,7 @@ mod tests {
 
     #[test]
     fn special_current_root_does_not_destroy_recovery_tree() {
-        let temp = tempfile::tempdir().expect("temp directory");
+        let temp = tempdir().expect("temp directory");
         let root = temp.path().join("platform");
         fs::write(&root, b"not a directory").expect("special root");
         let previous =
@@ -1136,7 +1159,7 @@ mod tests {
     fn catalog_state_symlink_fails_before_mutating_its_target() {
         use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = tempdir().expect("temporary directory");
         let state = temp.path().join("state");
         let outside = temp.path().join("outside");
         fs::create_dir_all(&state).expect("state");
@@ -1167,7 +1190,7 @@ mod tests {
     fn catalog_state_junction_fails_before_mutating_its_target() {
         use std::process::Command;
 
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = tempdir().expect("temporary directory");
         let state = temp.path().join("state");
         let outside = temp.path().join("outside");
         fs::create_dir_all(&state).expect("state");
@@ -1210,7 +1233,7 @@ mod tests {
         let response = bytes.clone();
         let handle = thread::spawn(move || {
             for _ in 0..2 {
-                let request = server.recv().expect("archive request");
+                let request = recv_request(&server, "archive integrity request");
                 request
                     .respond(Response::from_data(response.clone()))
                     .expect("response");
@@ -1218,7 +1241,8 @@ mod tests {
         });
         let mut record = skill("bad", &format!("{origin}/bad.zip"), &bytes, "none");
         record["archive"]["sha256"] = serde_json::Value::String("0".repeat(64));
-        let error = SkillCatalog::new(tempfile::tempdir().expect("temp").path().to_owned())
+        let digest_temp = tempdir().expect("digest temp directory");
+        let error = SkillCatalog::new(digest_temp.path().to_owned())
             .expect("catalog")
             .synchronize(
                 &manifest(&origin, &[&origin]),
@@ -1230,7 +1254,8 @@ mod tests {
 
         let mut record = skill("bad", &format!("{origin}/bad.zip"), &bytes, "none");
         record["archive"]["size_bytes"] = serde_json::json!(bytes.len() + 1);
-        let error = SkillCatalog::new(tempfile::tempdir().expect("temp").path().to_owned())
+        let size_temp = tempdir().expect("size temp directory");
+        let error = SkillCatalog::new(size_temp.path().to_owned())
             .expect("catalog")
             .synchronize(
                 &manifest(&origin, &[&origin]),
@@ -1270,7 +1295,7 @@ mod tests {
         let origin = format!("http://{}", server.server_addr());
         let port = Url::parse(&origin).expect("origin").port().expect("port");
         let handle = thread::spawn(move || {
-            let request = server.recv().expect("archive request");
+            let request = recv_request(&server, "archive userinfo redirect request");
             request
                 .respond(
                     Response::empty(StatusCode(302)).with_header(
@@ -1283,7 +1308,8 @@ mod tests {
                 )
                 .expect("redirect");
         });
-        let error = SkillCatalog::new(tempfile::tempdir().expect("temp").path().to_owned())
+        let temp = tempdir().expect("redirect temp directory");
+        let error = SkillCatalog::new(temp.path().to_owned())
             .expect("catalog")
             .synchronize(
                 &manifest(&origin, &[&origin]),
