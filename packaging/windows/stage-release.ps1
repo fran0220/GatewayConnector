@@ -29,8 +29,15 @@ try {
     if ($appPackage[0].version -ne $metadata.version) {
         throw "release metadata version $($metadata.version) does not match Cargo version $($appPackage[0].version)"
     }
-    if ($metadata.release_mode -ne 'unsigned-manual' -or $metadata.signed -ne $false -or $metadata.updater -ne $false) {
-        throw 'release metadata must describe an unsigned manual artifact with no updater'
+    if ($metadata.release_mode -ne 'unsigned-manual' -or $metadata.signed -ne $false -or
+        $metadata.notarized -ne $false -or $metadata.updater -ne $false -or
+        $metadata.release_feed -ne $false) {
+        throw 'release metadata must describe an unsigned manual artifact with no notarization, updater, or feed'
+    }
+    $desktopTargets = @($metadata.desktop_release_targets)
+    if ($desktopTargets.Count -ne 2 -or $desktopTargets[0] -cne 'macos' -or
+        $desktopTargets[1] -cne 'windows' -or $metadata.browser_target -ne $false) {
+        throw 'release metadata must describe only the native macOS and Windows desktop targets'
     }
     if ($metadata.windows_target -ne 'windows-x64' -or
         $metadata.windows_rust_target -ne 'x86_64-pc-windows-msvc') {

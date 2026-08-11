@@ -102,6 +102,10 @@ authorization URL with these query parameters:
 - `code_challenge_method=S256`
 - `state`: a random anti-forgery value
 
+This is a native desktop authentication flow, not a browser/WebAssembly
+GatewayConnector target. The neutral project currently ships desktop release
+contracts only for macOS and Windows.
+
 The callback must return the same `state` and either `code` or `error`. The
 client posts JSON to `token_url`:
 

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Best-effort Linux Amp-orb developer bootstrap only. Linux desktop is not a
+# supported release target or CI gate; authoritative release evidence comes
+# from the native macOS and Windows jobs.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 

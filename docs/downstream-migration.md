@@ -27,8 +27,8 @@ gateway-connector-core = {
 ```
 
 Commit `Cargo.lock` in each application wrapper. Revision bumps should be a
-single reviewable dependency update after the neutral Linux gate and wrapper
-acceptance pass.
+single reviewable dependency update after the neutral macOS authoritative gate,
+Windows native/release gate, and wrapper acceptance pass.
 
 ## Extraction sequence
 
@@ -61,6 +61,8 @@ acceptance pass.
 - Treat top-level provisioning models as Agent-selectable; Model Plaza remains
   display-only.
 - Do not introduce a local relay, custom session JWT, or alternate crypto.
+- Treat macOS and Windows as the neutral desktop release targets. Linux remains
+  deferred/non-gating, and there is no neutral browser application target.
 
 If a wrapper needs a behavior change, implement and test it here first, bump
 the exact revision in each downstream independently, and retain wrapper-only

@@ -12,37 +12,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  linux:
-    name: Linux behavior gate
-    runs-on: ubuntu-24.04
+  macos:
+    name: macOS authoritative gate
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install Rust 1.97
+        shell: bash
         run: |
           rustup toolchain install 1.97.0 --profile minimal --component clippy --component rustfmt
           rustup default 1.97.0
-      - name: Install GPUI system libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang cmake libdbus-1-dev libfontconfig1-dev libwayland-dev \
-            libx11-xcb-dev libxkbcommon-x11-dev libvulkan1
       - run: cargo fmt --all -- --check
-      - run: cargo test --workspace
+      - name: Full native workspace tests
+        run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo check -p gateway-connector-app --features gpui-app
+      - name: Stage unsigned macOS release package
+        run: ./packaging/macos/stage-release.sh
+      - name: Assert macOS bundle and package contract
+        run: ./packaging/macos/assert-release.sh
 
-  desktop-compile:
-    name: ${{ matrix.name }} GPUI compile
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows
-            os: windows-2025
-          - name: macOS
-            os: macos-15
-    runs-on: ${{ matrix.os }}
+  windows:
+    name: Windows native and release gate
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install Rust 1.97
@@ -54,17 +46,13 @@ jobs:
       - name: Native isolated-layout tests
         run: cargo test -p gateway-connector-app --lib
       - name: Native Windows catalog path tests
-        if: runner.os == 'Windows'
         run: cargo test -p gateway-connector-backend --lib
       - name: Native Windows all-feature clippy
-        if: runner.os == 'Windows'
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo check -p gateway-connector-app --features gpui-app
       - name: Stage unsigned Windows release package
-        if: runner.os == 'Windows'
         shell: pwsh
         run: ./packaging/windows/stage-release.ps1
       - name: Assert Windows PE resources and package contract
-        if: runner.os == 'Windows'
         shell: pwsh
         run: ./packaging/windows/test-release-assertions.ps1

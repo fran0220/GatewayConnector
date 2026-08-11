@@ -1,4 +1,4 @@
-# Neutral Windows icon
+# Neutral desktop icon
 
 `icon-source.png` is an original neutral connector glyph created specifically
 for the GatewayConnector project. It is not derived from a downstream or
@@ -8,4 +8,5 @@ container generated from that image and contains 16, 20, 24, 32, 40, 48, 64,
 
 Both files are distributed under the repository's Apache-2.0 license. The
 Windows build embeds `icon.ico` directly and performs no network download or
-image generation.
+image generation. The macOS staging script uses the same source PNG and native
+`sips`/`iconutil` tools to create the `.app` icon without downloading assets.

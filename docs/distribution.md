@@ -69,6 +69,17 @@ state identity. Every wrapper uses
 `ProjectDirs("dev", "GatewayConnector", "ProjectionCoordinator")` so ownership
 leases remain interoperable. Do not fork or namespace that format.
 
+## Neutral target policy
+
+The neutral desktop release targets are macOS and Windows. The repository's
+current unsigned manual contracts produce a native macOS arm64 `.app.tar.gz`
+and Windows x64 `.zip`; neither is signed, notarized, or connected to an
+updater/feed. Linux desktop is deferred, unsupported, and non-gating. The
+portable core/backend code and best-effort Linux orb setup remain available for
+development, but they are not release evidence. GatewayConnector has no
+browser/WebAssembly application target; schema-v2 browser PKCE is only an
+authentication flow launched by the native desktop client.
+
 ## What stays downstream
 
 A wrapper may provide its own binary entry point, assets, localized product
