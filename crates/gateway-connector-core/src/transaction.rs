@@ -1098,9 +1098,16 @@ fn validate_receipt_paths(state_dir: &Path, receipt: &Receipt) -> Result<()> {
 }
 
 fn reject_absolute_reparse_components(path: &Path) -> Result<()> {
+    use std::path::Component;
+
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        // A Windows drive/UNC prefix is not independently openable. Check it
+        // once the following RootDir component has formed the volume root.
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) if is_reparse(&metadata) => {
                 return Err(Error::Validation(format!(

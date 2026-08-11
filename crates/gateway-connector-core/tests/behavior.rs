@@ -9,11 +9,26 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
 };
-use tempfile::tempdir;
+use tempfile::{Builder, TempDir};
+
+fn tempdir() -> io::Result<TempDir> {
+    #[cfg(target_os = "macos")]
+    {
+        // macOS reports its default temporary root through the `/var`
+        // compatibility symlink. Projection roots are deliberately required
+        // to be canonical, so build test trees under its resolved spelling.
+        let root = fs::canonicalize(std::env::temp_dir())?;
+        Builder::new().prefix("gateway-connector-").tempdir_in(root)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Builder::new().prefix("gateway-connector-").tempdir()
+    }
+}
 
 fn contracts() -> (ConnectionManifest, Provisioning) {
     let manifest=ConnectionManifest::parse(br#"{"success":true,"data":{"schema_version":2,"platform":{"id":"platform-a","name":"Platform A"},"authentication":{"type":"browser_pkce","authorize_url":"https://id.example/auth","token_url":"https://id.example/token"},"gateway":{"base_url":"https://gw.example","protocols":["openai"]},"provisioning_url":"https://gw.example/provision","connection_bearer_origins":["https://gw.example"],"supported_agents":["claude","codex","gemini","grokbuild","opencode"]}}"#).unwrap();
@@ -1010,8 +1025,8 @@ fn projection_rejects_a_junction_destination_ancestor() {
     let link = temp.path().join("codex/skills");
     let output = Command::new("cmd")
         .args(["/C", "mklink", "/J"])
-        .arg(&link)
-        .arg(&outside)
+        .arg(link.to_string_lossy().replace('/', "\\"))
+        .arg(outside.to_string_lossy().replace('/', "\\"))
         .output()
         .unwrap();
     assert!(output.status.success(), "mklink /J failed: {output:?}");

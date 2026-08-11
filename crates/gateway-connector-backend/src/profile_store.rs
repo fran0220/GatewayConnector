@@ -120,9 +120,14 @@ impl JsonProfileStore {
 }
 
 fn reject_reparse_components(path: &Path) -> Result<(), StoreError> {
+    use std::path::Component;
+
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component);
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) if is_reparse(&metadata) => {
                 return Err(StoreError::Io(std::io::Error::new(
