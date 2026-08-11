@@ -50,4 +50,5 @@ jobs:
         run: |
           rustup toolchain install 1.97.0 --profile minimal
           rustup default 1.97.0
+      - run: cargo test -p gateway-connector-core
       - run: cargo check -p gateway-connector-app --features gpui-app

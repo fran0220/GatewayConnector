@@ -347,6 +347,7 @@ impl ConnectorView {
                 .spawn(async move {
                     let mut raw_key = raw_key;
                     if raw_key.trim().is_empty() {
+                        raw_key.zeroize();
                         return match backend.probe(&base_url) {
                             Ok(ProbeResult::Provisioned {
                                 manifest_url,
@@ -495,8 +496,14 @@ impl ConnectorView {
                     .iter()
                     .any(|option| option.id.as_ref() == selected)
             {
-                let in_catalog = connection.models.iter().any(|model| &model.id == selected);
-                let option = if in_catalog {
+                let catalog_model = connection.models.iter().find(|model| &model.id == selected);
+                let option = if catalog_model
+                    .is_some_and(|model| model.capability == ModelCapability::NonChat)
+                {
+                    SelectOption::new(selected.clone(), format!("{selected} (unavailable)"))
+                        .description("Saved choice is explicitly non-chat and cannot be projected")
+                        .disabled(true)
+                } else if catalog_model.is_some() {
                     SelectOption::new(selected.clone(), format!("{selected} (selected)"))
                         .description("Selected model is hidden by the current filter")
                 } else {
@@ -628,16 +635,13 @@ impl ConnectorView {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                match result {
-                    (profile, installs, managed) => {
-                        if matches!(
-                            &this.state,
-                            AppState::Connected { connection, .. }
-                                if connection.profile.id == profile.id
-                        ) {
-                            this.state.set_projection_status(installs, managed);
-                        }
-                    }
+                let (profile, installs, managed) = result;
+                if matches!(
+                    &this.state,
+                    AppState::Connected { connection, .. }
+                        if connection.profile.id == profile.id
+                ) {
+                    this.state.set_projection_status(installs, managed);
                 }
                 cx.notify();
             })

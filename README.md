@@ -57,6 +57,9 @@ disconnect, preserves unrelated JSON/JSONC/TOML/env configuration, rejects
 symlink and ownership collisions, requires a fresh preview before apply, and
 coordinates singleton Agent files across distributions through the shared
 `ProjectDirs("dev", "GatewayConnector", "ProjectionCoordinator")` contract.
+JSON/JSONC changes are surgical: unrelated comments and formatting survive
+apply and disconnect, while duplicate keys or unsupported ambiguous syntax
+fail closed without rewriting the file.
 
 ## Security boundary
 
@@ -81,6 +84,11 @@ coordinates singleton Agent files across distributions through the shared
   cross-origin redirect is rejected before contacting the target, so the
   bearer cannot leak.
 - Model and manifest responses are limited to 2 MiB.
+- Direct `/v1/models` records use a three-state chat capability: positive,
+  negative, or unknown. GatewayConnector never infers chat capability merely
+  because a record appears in the catalog and never auto-selects an unknown
+  model. Explicitly non-chat records are excluded; an unknown record requires
+  an explicit picker choice whose confirmation is persisted on that profile.
 - Manifest discovery is optional and unauthenticated. Generic gateways need
   only the OpenAI-compatible `/v1/models` endpoint. Well-known 404 is direct
   mode; an injected explicit manifest is required and does not silently fall
@@ -95,15 +103,51 @@ coordinates singleton Agent files across distributions through the shared
   bounded and cannot cross origins. Exact declared size and lowercase SHA-256
   are required before ZIP extraction. Traversal, symlink/special entries,
   duplicate or non-portable paths, overlapping data, and expansion beyond the
-  configured budget are rejected before transactional publication. Direct
-  mode downloads and projects no MCP or Skills.
+  single catalog-wide 256-entry/256-MiB budget are rejected before
+  transactional publication. The same checked budget is decremented during
+  extraction rather than reset per archive. Direct mode downloads and
+  projects no MCP or Skills.
 - Official downstream builds can disable custom Gateway URLs and pin both the
   platform identity and manifest endpoint through `Distribution`; generic
   builds remain user-configurable. Neutral defaults contain no branded URLs,
   OAuth IDs, assets, account assumptions, or updater metadata.
 - Profile creation is singleton and guarded by both an in-process connection
   lock and an inter-process profile-file lock. Profile writes use private
-  temporary files and replace atomically on Linux, macOS, and Windows.
+  unique `create_new` temporary files, no-follow/reparse checks, durable file
+  flushes, parent-directory sync on Unix, and write-through replacement on
+  Windows.
+- Projection apply and disconnect share one coordinator-global lock and a
+  `Clean → Prepared → Committed → Clean` write-ahead journal. Before the first
+  Agent, Skill, ownership, or receipt mutation, GatewayConnector encrypts and
+  authenticates prior/intended snapshot descriptors plus parent transitions,
+  flushes a bundle that embeds a duplicate authenticated transaction header,
+  and durably publishes the same header as the active pointer. The embedded
+  copy makes a missing active pointer recoverable rather than grounds for
+  deleting an orphan bundle; missing/tampered manifests, wrong credentials,
+  and mismatched platforms preserve all artifacts and fail closed. Complete
+  Skill trees are built and flushed in sibling staging directories; existing
+  destinations are retained under authenticated displaced names until every
+  destination—including coordinator and receipt—has been installed. Only
+  then is the commit marker flushed. Startup, preview, apply, status, and
+  disconnect recover Prepared transactions by renaming exact prior snapshots
+  back and recover Committed transactions by verifying intent before cleanup.
+  Subprocess-abort tests exercise every parent, stage, displacement,
+  installation, commit, and cleanup boundary for both apply and disconnect.
+- Every projection path is checked at planning, under the shared lock, and
+  immediately around mutation. Canonical containment, stable parent file IDs,
+  component metadata, no-follow file opens, and Windows reparse checks reject
+  lexical aliases, symlinks, junctions, and parent replacement. Directory
+  operations remain path-based, so the security model assumes no hostile
+  same-user process wins the final sub-operation race between a successful
+  component check and the matching filesystem call. Such races fail closed
+  when observed; moving every directory operation to platform-specific
+  descriptor-relative APIs is future hardening rather than a wire/schema
+  change.
+- Unix persists rename/remove ordering by syncing parent directories. Windows
+  flushes created files and uses `MOVEFILE_WRITE_THROUGH`; Windows does not
+  expose a documented POSIX-equivalent parent-directory fsync through these
+  APIs, so recovery tolerates either side of a rename becoming visible after
+  power loss.
 - There is no local relay, embedded Agent runtime, custom cryptography, or
   hard-coded MCP/Skill catalog.
 

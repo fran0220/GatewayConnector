@@ -659,6 +659,58 @@ mod tests {
         assert!(aggregate_error.to_string().contains("expands beyond"));
     }
 
+    #[test]
+    fn aggregate_budget_failure_preserves_published_catalog_without_staging() {
+        let expanded = vec![b'x'; 64];
+        let archive = skill_zip(&[("SKILL.md", &expanded, 0o644)]);
+        let server = Server::http("127.0.0.1:0").expect("archive server");
+        let origin = format!("http://{}", server.server_addr());
+        let response = archive.clone();
+        let handle = thread::spawn(move || {
+            for _ in 0..2 {
+                server
+                    .recv()
+                    .expect("archive request")
+                    .respond(Response::from_data(response.clone()))
+                    .expect("archive response");
+            }
+        });
+        let records = vec![
+            skill("one", &format!("{origin}/one.zip"), &archive, "none"),
+            skill("two", &format!("{origin}/two.zip"), &archive, "none"),
+        ];
+        let state = tempfile::tempdir().expect("catalog state");
+        let published = state
+            .path()
+            .join("synchronized-skills/test-platform/old/SKILL.md");
+        fs::create_dir_all(published.parent().expect("published parent")).expect("published root");
+        fs::write(&published, b"published").expect("published Skill");
+
+        let error = SkillCatalog::new(state.path().to_owned())
+            .expect("catalog")
+            .synchronize_with_limits(
+                &manifest(&origin, &[&origin]),
+                &provisioning(records),
+                &ApiKey::new("unused-token").expect("token"),
+                10,
+                100,
+            )
+            .expect_err("aggregate budget");
+        handle.join().expect("archive server");
+        assert!(error.to_string().contains("expands beyond"), "{error}");
+        assert_eq!(fs::read(&published).expect("published Skill"), b"published");
+        let catalog_parent = state.path().join("synchronized-skills");
+        assert!(
+            fs::read_dir(catalog_parent)
+                .expect("catalog parent")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("staged-"))
+        );
+    }
+
     fn manifest(origin: &str, bearer_origins: &[&str]) -> ConnectionManifest {
         ConnectionManifest::parse(
             serde_json::json!({"success":true,"data":{
