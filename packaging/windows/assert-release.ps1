@@ -71,21 +71,21 @@ namespace GatewayConnector {
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool FreeLibrary(IntPtr module);
 
-        public static int[] Inspect(string path, int type) {
+        public static int[] Inspect(string path, int type, ushort expectedLanguage) {
             const uint LOAD_LIBRARY_AS_DATAFILE = 0x00000002;
             const uint LOAD_LIBRARY_AS_IMAGE_RESOURCE = 0x00000020;
             IntPtr module = LoadLibraryExW(path, IntPtr.Zero, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
             if (module == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
             try {
                 int count = 0;
-                int nonNeutralLanguages = 0;
+                int unexpectedLanguages = 0;
                 int callbackError = 0;
                 EnumResNameProc callback = (currentModule, currentType, currentName, ignoredParameter) => {
                     count++;
                     bool sawLanguage = false;
                     EnumResLangProc languageCallback = (ignoredModule, ignoredType, ignoredName, language, ignoredLanguageParameter) => {
                         sawLanguage = true;
-                        if (language != 0) nonNeutralLanguages++;
+                        if (language != expectedLanguage) unexpectedLanguages++;
                         return true;
                     };
                     bool languageOk = EnumResourceLanguagesW(currentModule, currentType, currentName, languageCallback, IntPtr.Zero);
@@ -106,7 +106,7 @@ namespace GatewayConnector {
                 GC.KeepAlive(callback);
                 if (callbackError != 0) throw new Win32Exception(callbackError);
                 if (!ok && error != 1813) throw new Win32Exception(error);
-                return new int[] { count, nonNeutralLanguages };
+                return new int[] { count, unexpectedLanguages };
             } finally {
                 FreeLibrary(module);
             }
@@ -116,9 +116,10 @@ namespace GatewayConnector {
 '@
 }
 
-$iconResources = [GatewayConnector.ReleaseResourceInspector]::Inspect($ExecutablePath, 3)
-$groupIconResources = [GatewayConnector.ReleaseResourceInspector]::Inspect($ExecutablePath, 14)
-$versionResources = [GatewayConnector.ReleaseResourceInspector]::Inspect($ExecutablePath, 16)
+$resourceLanguage = [uint16]0x0409
+$iconResources = [GatewayConnector.ReleaseResourceInspector]::Inspect($ExecutablePath, 3, $resourceLanguage)
+$groupIconResources = [GatewayConnector.ReleaseResourceInspector]::Inspect($ExecutablePath, 14, $resourceLanguage)
+$versionResources = [GatewayConnector.ReleaseResourceInspector]::Inspect($ExecutablePath, 16, $resourceLanguage)
 $iconCount = $iconResources[0]
 $groupIconCount = $groupIconResources[0]
 $versionCount = $versionResources[0]
@@ -126,7 +127,7 @@ if ($iconCount -ne $metadata.windows_icon_images -or $groupIconCount -ne 1 -or $
     throw "required PE resource counts differ: RT_ICON=$iconCount RT_GROUP_ICON=$groupIconCount RT_VERSION=$versionCount"
 }
 if ($iconResources[1] -ne 0 -or $groupIconResources[1] -ne 0 -or $versionResources[1] -ne 0) {
-    throw 'icon and version resources must use the neutral Windows language identifier'
+    throw 'icon and version resources must use the expected Windows language identifier 0x0409'
 }
 
 $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($ExecutablePath)
@@ -212,6 +213,7 @@ if ($ArchivePath) {
         icon = $iconCount
         group_icon = $groupIconCount
         version = $versionCount
+        language = ('0x{0:X4}' -f $resourceLanguage)
     }
     product_name = $version.ProductName
     file_description = $version.FileDescription

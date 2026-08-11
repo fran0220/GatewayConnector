@@ -28,6 +28,7 @@ fn main() {
     let packed_version = packed_version(version);
     let mut resource = winresource::WindowsResource::new();
     resource
+        .set_language(0x0409)
         .set_icon(ICON_PATH)
         .set("ProductName", field(&metadata, "product_name"))
         .set("FileDescription", field(&metadata, "file_description"))

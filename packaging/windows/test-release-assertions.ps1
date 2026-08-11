@@ -12,6 +12,7 @@ $reportText = & (Join-Path $PSScriptRoot 'assert-release.ps1') -ExecutablePath $
 $report = $reportText | ConvertFrom-Json
 if ($report.subsystem -ne 2 -or $report.resources.icon -lt 1 -or
     $report.resources.group_icon -ne 1 -or $report.resources.version -ne 1 -or
+    $report.resources.language -cne '0x0409' -or
     $report.machine -cne '0x8664' -or $report.optional_header -cne '0x20B' -or
     $report.authenticode -cne 'NotSigned' -or $report.certificate_table_size -ne 0 -or
     $report.internal_name -cne $metadata.binary_name) {
