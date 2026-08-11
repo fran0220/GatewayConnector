@@ -15,6 +15,7 @@ jobs:
   macos:
     name: macOS authoritative gate
     runs-on: macos-15
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install Rust 1.97
