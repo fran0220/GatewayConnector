@@ -12,8 +12,8 @@ use std::{
 use gateway_connector_backend::{
     ApiKey, BackendError, Browser, ConnectRequest, ConnectionResult, ConnectorBackend,
     CredentialStore, DiscoveryError, Distribution, GatewayClient, InMemoryCredentialStore,
-    InMemoryProfileStore, ManifestLocation, ModelCapability, ModelDescriptor, PkceError,
-    ProfileStore, StoreError, SystemBrowser, VaultError,
+    InMemoryProfileStore, ModelCapability, ModelDescriptor, PkceError, ProfileStore, StoreError,
+    SystemBrowser, VaultError,
 };
 use gateway_connector_core::{
     AgentId, CanonicalBaseUrl, ConnectionManifest, ConnectionMode, ConnectionProfile,
@@ -90,17 +90,31 @@ fn spawn_direct(body: &'static str, requests: usize) -> (String, thread::JoinHan
     let server = Server::http("127.0.0.1:0").expect("start mock server");
     let address = format!("http://{}", server.server_addr());
     let handle = thread::spawn(move || {
-        for index in 0..requests {
+        for _ in 0..requests {
             let request = recv_request(&server, "direct Gateway request");
-            let response = if index == 0 {
-                Response::from_string("").with_status_code(StatusCode(404))
-            } else {
-                Response::from_string(body).with_status_code(StatusCode(200))
-            };
-            request.respond(response).expect("send response");
+            assert_eq!(request.url(), "/v1/models");
+            request
+                .respond(Response::from_string(body).with_status_code(StatusCode(200)))
+                .expect("send response");
         }
     });
     (address, handle)
+}
+
+fn leak_str(value: String) -> &'static str {
+    Box::leak(value.into_boxed_str())
+}
+
+fn distribution_with_manifest(
+    base: Distribution,
+    manifest_url: &'static str,
+    expected_platform_id: Option<&'static str>,
+) -> &'static Distribution {
+    Box::leak(Box::new(Distribution {
+        expected_platform_id,
+        manifest_url: Some(manifest_url),
+        ..base
+    }))
 }
 
 fn manifest_body(
@@ -307,7 +321,7 @@ impl CredentialStore for FailOnceCredentialStore {
     }
 }
 
-const PINNED_DISTRIBUTION: Distribution = Distribution {
+const PINNED_DISTRIBUTION_BASE: Distribution = Distribution {
     product_id: "test-connector",
     product_name: "Test Connector",
     expected_platform_id: Some("pinned-platform"),
@@ -318,7 +332,6 @@ const PINNED_DISTRIBUTION: Distribution = Distribution {
     qualifier: "dev",
     organization: "test-connector",
     application: "test-connector",
-    keyring_service: "test-connector",
     bundle_id: "dev.test-connector",
     supported_locales: &["en"],
     asset_identity: None,
@@ -326,6 +339,14 @@ const PINNED_DISTRIBUTION: Distribution = Distribution {
     pkce_client_id: "test-connector",
     device_name: "Test Connector",
 };
+
+fn pinned_distribution(manifest_url: &'static str) -> &'static Distribution {
+    distribution_with_manifest(
+        PINNED_DISTRIBUTION_BASE,
+        manifest_url,
+        Some("pinned-platform"),
+    )
+}
 
 const LOCKED_DISTRIBUTION: Distribution = Distribution {
     product_id: "locked-connector",
@@ -338,7 +359,6 @@ const LOCKED_DISTRIBUTION: Distribution = Distribution {
     qualifier: "dev",
     organization: "locked-connector",
     application: "locked-connector",
-    keyring_service: "locked-connector",
     bundle_id: "dev.locked-connector",
     supported_locales: &["en"],
     asset_identity: None,
@@ -515,20 +535,21 @@ fn manifest_discovery_is_exact_origin_and_unauthenticated() {
     );
     let client = GatewayClient::new().expect("client");
     let base_url = CanonicalBaseUrl::parse(&base).expect("base URL");
+    let manifest_url =
+        Url::parse(&format!("{base}/connector-manifest.json")).expect("manifest URL");
     let manifest = client
-        .discover_manifest(&base_url, ManifestLocation::WellKnown)
-        .expect("discover manifest")
-        .expect("manifest");
+        .discover_manifest(&base_url, manifest_url)
+        .expect("discover manifest");
     handle.join().expect("mock server");
     assert_eq!(manifest.document.schema_version, 2);
     let capture = capture.lock().expect("capture lock");
-    assert_eq!(capture.path, "/.well-known/gateway-connector");
+    assert_eq!(capture.path, "/connector-manifest.json");
     assert!(capture.authorization.is_none());
 
     let credentialed =
         Url::parse(&base.replace("http://", "http://user:password@")).expect("credentialed URL");
     let error = client
-        .discover_manifest(&base_url, ManifestLocation::Explicit(credentialed))
+        .discover_manifest(&base_url, credentialed)
         .expect_err("URL credentials must be rejected");
     assert!(matches!(error, DiscoveryError::ManifestUrlCredentials));
 }
@@ -541,7 +562,7 @@ fn explicit_manifest_404_does_not_fall_back_to_direct_mode() {
     let explicit =
         Url::parse(&format!("{base}/connector-manifest.json")).expect("explicit manifest URL");
     let error = client
-        .discover_manifest(&base_url, ManifestLocation::Explicit(explicit))
+        .discover_manifest(&base_url, explicit)
         .expect_err("an explicit manifest is a required contract");
     handle.join().expect("mock server");
     assert!(matches!(error, DiscoveryError::ExplicitManifestNotFound));
@@ -552,9 +573,37 @@ fn explicit_manifest_404_does_not_fall_back_to_direct_mode() {
 }
 
 #[test]
+fn generic_probe_is_direct_and_never_fetches_a_manifest() {
+    let server = Server::http("127.0.0.1:0").expect("unused server");
+    let origin = format!("http://{}", server.server_addr());
+    let handle = thread::spawn(move || {
+        assert!(
+            server
+                .recv_timeout(Duration::from_millis(250))
+                .expect("timeout")
+                .is_none()
+        );
+    });
+    let backend = ConnectorBackend::new(
+        Arc::new(InMemoryCredentialStore::default()),
+        Arc::new(InMemoryProfileStore::default()),
+    )
+    .expect("backend");
+    let probe = backend.probe(&origin).expect("generic probe");
+    handle.join().expect("server must stay quiet");
+    assert!(matches!(probe, gateway_connector_backend::ProbeResult::Direct { .. }));
+}
+
+#[test]
 fn provisioned_connection_uses_manifest_catalog_and_bearer_boundary() {
     let server = Server::http("127.0.0.1:0").expect("enhanced server");
     let origin = format!("http://{}", server.server_addr());
+    let manifest_url = leak_str(format!("{origin}/connector-manifest.json"));
+    let distribution = distribution_with_manifest(
+        PINNED_DISTRIBUTION_BASE,
+        manifest_url,
+        None,
+    );
     let manifest = manifest_body(
         "test-platform",
         &origin,
@@ -567,7 +616,7 @@ fn provisioned_connection_uses_manifest_catalog_and_bearer_boundary() {
     let handle = thread::spawn(move || {
         let mut captures = Vec::new();
         for expected_path in [
-            "/.well-known/gateway-connector",
+            "/connector-manifest.json",
             "/api/connector/provisioning",
             "/skill.zip",
         ] {
@@ -597,28 +646,33 @@ fn provisioned_connection_uses_manifest_catalog_and_bearer_boundary() {
     for root in [".claude", ".codex", ".gemini", ".grok", ".config/opencode"] {
         fs::create_dir_all(home.path().join(root)).expect("Agent root");
     }
-    let backend = ConnectorBackend::new(credentials.clone(), profiles)
-        .and_then(|backend| {
-            backend.with_runtime_directories(
-                state.path(),
-                state.path().join("shared-coordinator"),
-                home.path(),
-            )
-        })
-        .and_then(|backend| {
-            backend.with_agent_root_overrides(
-                [
-                    (AgentId::Claude, home.path().join(".claude")),
-                    (AgentId::Codex, home.path().join(".codex")),
-                    (AgentId::Gemini, home.path().join(".gemini")),
-                    (AgentId::Grokbuild, home.path().join(".grok")),
-                    (AgentId::Opencode, home.path().join(".config/opencode")),
-                ]
-                .into_iter()
-                .collect(),
-            )
-        })
-        .expect("backend");
+    let backend = ConnectorBackend::with_dependencies(
+        credentials.clone(),
+        profiles,
+        distribution,
+        Arc::new(SystemBrowser),
+    )
+    .and_then(|backend| {
+        backend.with_runtime_directories(
+            state.path(),
+            state.path().join("shared-coordinator"),
+            home.path(),
+        )
+    })
+    .and_then(|backend| {
+        backend.with_agent_root_overrides(
+            [
+                (AgentId::Claude, home.path().join(".claude")),
+                (AgentId::Codex, home.path().join(".codex")),
+                (AgentId::Gemini, home.path().join(".gemini")),
+                (AgentId::Grokbuild, home.path().join(".grok")),
+                (AgentId::Opencode, home.path().join(".config/opencode")),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    })
+    .expect("backend");
     let connected = backend
         .connect(ConnectRequest {
             display_name: "Enhanced".to_owned(),
@@ -897,6 +951,8 @@ fn direct_projection_requires_saved_explicit_capability_decisions() {
 fn platform_pin_is_enforced_during_probe() {
     let server = Server::http("127.0.0.1:0").expect("manifest server");
     let origin = format!("http://{}", server.server_addr());
+    let manifest_url = leak_str(format!("{origin}/connector-manifest.json"));
+    let distribution = pinned_distribution(manifest_url);
     let body = manifest_body(
         "other-platform",
         &origin,
@@ -905,6 +961,7 @@ fn platform_pin_is_enforced_during_probe() {
     );
     let handle = thread::spawn(move || {
         let request = recv_request(&server, "platform manifest request");
+        assert_eq!(request.url(), "/connector-manifest.json");
         request
             .respond(Response::from_string(body).with_status_code(StatusCode(200)))
             .expect("manifest response");
@@ -912,7 +969,7 @@ fn platform_pin_is_enforced_during_probe() {
     let backend = ConnectorBackend::with_dependencies(
         Arc::new(InMemoryCredentialStore::default()),
         Arc::new(InMemoryProfileStore::default()),
-        &PINNED_DISTRIBUTION,
+        distribution,
         Arc::new(SystemBrowser),
     )
     .expect("backend");
@@ -1021,6 +1078,8 @@ fn cross_origin_provisioning_requires_allowlist_and_never_forwards_redirects() {
 fn resume_rechecks_saved_platform_identity() {
     let server = Server::http("127.0.0.1:0").expect("manifest server");
     let origin = format!("http://{}", server.server_addr());
+    let manifest_url =
+        Url::parse(&format!("{origin}/connector-manifest.json")).expect("manifest URL");
     let body = manifest_body(
         "changed-platform",
         &origin,
@@ -1029,6 +1088,7 @@ fn resume_rechecks_saved_platform_identity() {
     );
     let handle = thread::spawn(move || {
         let request = recv_request(&server, "resume manifest request");
+        assert_eq!(request.url(), "/connector-manifest.json");
         request
             .respond(Response::from_string(body).with_status_code(StatusCode(200)))
             .expect("manifest response");
@@ -1040,7 +1100,7 @@ fn resume_rechecks_saved_platform_identity() {
         ConnectionMode::Provisioned,
         CredentialKind::AccessToken,
         "saved-platform",
-        None,
+        Some(manifest_url),
     )
     .expect("profile");
     let credentials = Arc::new(InMemoryCredentialStore::default());
@@ -1060,56 +1120,17 @@ fn resume_rechecks_saved_platform_identity() {
 }
 
 #[test]
-fn vault_binding_rejects_tampered_profile_destination_before_network_access() {
-    let (base, handle) = spawn_direct(r#"{"data":[{"id":"model-a"}]}"#, 2);
-    let credentials = Arc::new(InMemoryCredentialStore::default());
-    let profiles = Arc::new(InMemoryProfileStore::default());
-    let backend = ConnectorBackend::new(credentials, profiles).expect("backend");
-    let connected = backend
-        .connect(ConnectRequest {
-            display_name: "Bound".to_owned(),
-            base_url: base,
-            api_key: ApiKey::new("bound-secret").expect("key"),
-            protocol: Protocol::Auto,
-        })
-        .expect("connect");
-    handle.join().expect("gateway server");
-
-    let attacker = Server::http("127.0.0.1:0").expect("attacker server");
-    let attacker_url = format!("http://{}", attacker.server_addr());
-    let tampered = ConnectionProfile::reconfigured(
-        connected.profile.clone(),
-        connected.profile.display_name,
-        CanonicalBaseUrl::parse(&attacker_url).expect("attacker URL"),
-        Protocol::Auto,
-    )
-    .expect("otherwise valid tampered profile");
-    assert_eq!(tampered.id, connected.profile.id);
-    assert_eq!(tampered.credential, connected.profile.credential);
-    let error = backend
-        .resume(tampered)
-        .expect_err("vault binding must reject destination tampering");
-    assert!(matches!(
-        error,
-        BackendError::Vault(VaultError::BindingMismatch)
-    ));
-    assert!(
-        attacker
-            .recv_timeout(Duration::from_millis(250))
-            .is_ok_and(|request| request.is_none())
-    );
-}
-
-#[test]
 fn browser_login_keeps_failed_vault_credentials_retryable() {
     let server = Server::http("127.0.0.1:0").expect("enhanced server");
     let origin = format!("http://{}", server.server_addr());
+    let manifest_url = leak_str(format!("{origin}/connector-manifest.json"));
+    let distribution = pinned_distribution(manifest_url);
     let manifest = browser_manifest_body("pinned-platform", &origin);
     let provisioning = provisioning_body();
     let handle = thread::spawn(move || {
         let mut captures = Vec::new();
         for expected_path in [
-            "/.well-known/gateway-connector",
+            "/connector-manifest.json",
             "/token",
             "/api/connector/provisioning",
         ] {
@@ -1148,7 +1169,7 @@ fn browser_login_keeps_failed_vault_credentials_retryable() {
     let backend = ConnectorBackend::with_dependencies(
         credentials.clone(),
         profiles,
-        &PINNED_DISTRIBUTION,
+        distribution,
         Arc::new(AutoCallbackBrowser),
     )
     .expect("backend");
@@ -1199,9 +1220,11 @@ fn browser_login_keeps_failed_vault_credentials_retryable() {
 fn browser_token_is_pending_when_profile_creation_fails_after_redemption() {
     let server = Server::http("127.0.0.1:0").expect("enhanced server");
     let origin = format!("http://{}", server.server_addr());
+    let manifest_url = leak_str(format!("{origin}/connector-manifest.json"));
+    let distribution = pinned_distribution(manifest_url);
     let manifest = browser_manifest_body("pinned-platform", &origin);
     let handle = thread::spawn(move || {
-        for expected_path in ["/.well-known/gateway-connector", "/token"] {
+        for expected_path in ["/connector-manifest.json", "/token"] {
             let request = recv_request(&server, "browser profile failure request");
             assert_eq!(request.url(), expected_path);
             let body = if expected_path == "/token" {
@@ -1217,7 +1240,7 @@ fn browser_token_is_pending_when_profile_creation_fails_after_redemption() {
     let backend = ConnectorBackend::with_dependencies(
         Arc::new(InMemoryCredentialStore::default()),
         Arc::new(FailingCreateProfileStore),
-        &PINNED_DISTRIBUTION,
+        distribution,
         Arc::new(AutoCallbackBrowser),
     )
     .expect("backend");
@@ -1245,9 +1268,12 @@ fn browser_token_is_pending_when_profile_creation_fails_after_redemption() {
 fn browser_offer_is_fully_validated_before_redeeming_a_code() {
     let server = Server::http("127.0.0.1:0").expect("enhanced server");
     let origin = format!("http://{}", server.server_addr());
+    let manifest_url = leak_str(format!("{origin}/connector-manifest.json"));
+    let distribution = pinned_distribution(manifest_url);
     let manifest = browser_manifest_body("pinned-platform", &origin);
     let handle = thread::spawn(move || {
         let request = recv_request(&server, "browser offer manifest request");
+        assert_eq!(request.url(), "/connector-manifest.json");
         request
             .respond(Response::from_string(manifest).with_status_code(StatusCode(200)))
             .expect("manifest response");
@@ -1259,7 +1285,7 @@ fn browser_offer_is_fully_validated_before_redeeming_a_code() {
     let backend = ConnectorBackend::with_dependencies(
         Arc::new(InMemoryCredentialStore::default()),
         Arc::new(InMemoryProfileStore::default()),
-        &PINNED_DISTRIBUTION,
+        distribution,
         Arc::new(AutoCallbackBrowser),
     )
     .expect("backend");
@@ -1288,11 +1314,13 @@ fn browser_offer_is_fully_validated_before_redeeming_a_code() {
 fn failed_browser_credential_can_be_remotely_revoked_and_discarded() {
     let server = Server::http("127.0.0.1:0").expect("enhanced server");
     let origin = format!("http://{}", server.server_addr());
+    let manifest_url = leak_str(format!("{origin}/connector-manifest.json"));
+    let distribution = pinned_distribution(manifest_url);
     let manifest = browser_manifest_body("pinned-platform", &origin);
     let handle = thread::spawn(move || {
         let mut captures = Vec::new();
         for expected_path in [
-            "/.well-known/gateway-connector",
+            "/connector-manifest.json",
             "/token",
             "/api/connector/revoke",
         ] {
@@ -1323,7 +1351,7 @@ fn failed_browser_credential_can_be_remotely_revoked_and_discarded() {
     let backend = ConnectorBackend::with_dependencies(
         Arc::new(FailingCredentialStore),
         Arc::new(InMemoryProfileStore::default()),
-        &PINNED_DISTRIBUTION,
+        distribution,
         Arc::new(AutoCallbackBrowser),
     )
     .expect("backend");
@@ -1357,30 +1385,35 @@ fn failed_browser_credential_can_be_remotely_revoked_and_discarded() {
 }
 
 #[test]
-fn backend_uses_in_memory_vault_and_persists_reference_only() {
-    let (base, handle) = spawn_direct(r#"{"data":[{"id":"model-a"}]}"#, 2);
-    let credentials = Arc::new(InMemoryCredentialStore::default());
-    let profiles = Arc::new(InMemoryProfileStore::default());
+fn backend_persists_credential_secret_in_profile_config() {
+    let (base, handle) = spawn_direct(r#"{"data":[{"id":"model-a"}]}"#, 1);
+    let profiles: Arc<dyn ProfileStore> = Arc::new(InMemoryProfileStore::default());
+    let credentials = Arc::new(gateway_connector_backend::ProfileCredentialStore::new(
+        Arc::clone(&profiles),
+    ));
     let backend = ConnectorBackend::new(credentials, profiles).expect("backend");
     let connected = backend
         .connect(ConnectRequest {
             display_name: "Local test".to_owned(),
             base_url: base,
-            api_key: ApiKey::new("not-persisted").expect("key"),
+            api_key: ApiKey::new("config-secret").expect("key"),
             protocol: Protocol::Auto,
         })
         .expect("connect");
     handle.join().expect("mock server");
     assert_eq!(connected.models[0].id, "model-a");
     assert!(connected.synchronized_skills.is_empty());
-    let json = serde_json::to_string(&backend.profiles().expect("profiles")).expect("profile JSON");
-    assert!(!json.contains("not-persisted"));
+    let stored = backend.profiles().expect("profiles");
+    assert_eq!(stored[0].credential_secret, "config-secret");
+    let json = serde_json::to_string(&stored).expect("profile JSON");
+    assert!(json.contains("config-secret"));
     assert!(json.contains("profile:"));
+    assert!(!format!("{:?}", stored[0]).contains("config-secret"));
 }
 
 #[test]
 fn saved_connection_resumes_with_the_same_profile_id() {
-    let (base, handle) = spawn_direct(r#"{"data":[{"id":"model-a"}]}"#, 3);
+    let (base, handle) = spawn_direct(r#"{"data":[{"id":"model-a"}]}"#, 2);
     let credentials = Arc::new(InMemoryCredentialStore::default());
     let profiles = Arc::new(InMemoryProfileStore::default());
     let backend = ConnectorBackend::new(credentials, profiles).expect("backend");
@@ -1403,7 +1436,7 @@ fn saved_connection_resumes_with_the_same_profile_id() {
 
 #[test]
 fn connect_never_silently_overwrites_an_active_profile() {
-    let (base, handle) = spawn_direct(r#"{"data":[{"id":"model-a"}]}"#, 2);
+    let (base, handle) = spawn_direct(r#"{"data":[{"id":"model-a"}]}"#, 1);
     let credentials = Arc::new(InMemoryCredentialStore::default());
     let profiles = Arc::new(InMemoryProfileStore::default());
     let backend = ConnectorBackend::new(credentials, profiles).expect("backend");
@@ -1450,7 +1483,7 @@ impl CredentialStore for FailingCredentialStore {
 
 #[test]
 fn failed_credential_commit_rolls_back_new_profile() {
-    let (base, handle) = spawn_direct(r#"{"data":[{"id":"model-a"}]}"#, 2);
+    let (base, handle) = spawn_direct(r#"{"data":[{"id":"model-a"}]}"#, 1);
     let backend = ConnectorBackend::new(
         Arc::new(FailingCredentialStore),
         Arc::new(InMemoryProfileStore::default()),
@@ -1470,7 +1503,7 @@ fn failed_credential_commit_rolls_back_new_profile() {
 
 #[test]
 fn ambiguous_credential_commit_is_deleted_before_profile_rollback() {
-    let (base, handle) = spawn_direct(r#"{"data":[{"id":"model-a"}]}"#, 2);
+    let (base, handle) = spawn_direct(r#"{"data":[{"id":"model-a"}]}"#, 1);
     let credentials = Arc::new(CommitThenErrorCredentialStore::default());
     let backend = ConnectorBackend::new(
         credentials.clone(),

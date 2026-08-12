@@ -7,10 +7,10 @@ release process; none of those concerns belong in this repository.
 
 The generic path requires only an HTTPS Gateway base URL and API key. It tests
 the connection with authenticated `GET` model discovery, then lets the user
-select a protocol and model for each of five supported Agents. An enhanced
-Gateway may optionally advertise schema-v2 browser PKCE and provisioning from
-the exact-origin `/.well-known/gateway-connector` document. A missing
-well-known document is normal and falls back to the generic path.
+select a protocol and model for each of five supported Agents. It never probes
+for a platform manifest. Enhanced schema-v2 browser PKCE and provisioning are
+compile-time only: a branded distribution pins `manifest_url` (and usually a
+platform identity) and is separate product work from the generic first-run form.
 
 The Gateway URL may be an origin, a nested prefix, an API base ending in
 `/v1`, or the full `/v1/models` endpoint. Resolution is deterministic and does
@@ -46,10 +46,10 @@ gateway-connector-core
 
 gateway-connector-backend
   Exact-origin HTTP and OpenAI-compatible model discovery
-  Optional schema-v2 well-known/explicit manifest and provisioning flow
+  Optional schema-v2 explicit-manifest and provisioning flow (downstream only)
   Standard browser PKCE with access-token-only persistence
   Transactional, integrity-checked online Skill synchronization
-  OS credential-store abstraction + in-memory test vault
+  Local profile config for credentials (no OS keychain) + test in-memory store
   Thin compile-time Distribution boundary for neutral/downstream identity
 
 gateway-connector-app
@@ -73,17 +73,12 @@ fail closed without rewriting the file.
 ## Security boundary
 
 - Profiles persist a stable UUID, canonical URL, connection mode/platform,
-  display name, per-Agent choices, and an opaque credential reference. They
-  never contain a plaintext API key or access token. Legacy schema-1 direct
-  profiles migrate to schema 2 on load, and every credential reference is
-  bound to its profile UUID. The vault envelope also binds the credential to
-  the canonical Gateway, mode, platform, credential kind, and manifest
-  location, so editing profile JSON cannot redirect an existing bearer.
-- API keys and PKCE access tokens are stored through `CredentialStore`; the
-  desktop binary uses the OS credential store and tests use
-  `InMemoryCredentialStore`. Refresh tokens and provider account blobs are not
-  retained. Failed vault commits keep a newly minted credential reachable for
-  explicit retry or confirmed remote revocation.
+  display name, per-Agent choices, a stable local credential id, and the
+  API key or access token in the app profile config file (`profiles.json`).
+  Legacy schema-1 direct profiles migrate to schema 2 on load. Refresh tokens
+  and provider account blobs are not retained. Failed credential commits keep
+  a newly minted credential reachable for explicit retry or confirmed remote
+  revocation.
 - Remote gateways require HTTPS. Plain HTTP is allowed only for literal
   loopback development hosts, and loopback HTTP always bypasses ambient proxy
   configuration so a local bearer cannot be exposed to a forward proxy.
@@ -98,11 +93,11 @@ fail closed without rewriting the file.
   because a record appears in the catalog and never auto-selects an unknown
   model. Explicitly non-chat records are excluded; an unknown record requires
   an explicit picker choice whose confirmation is persisted on that profile.
-- Manifest discovery is optional and unauthenticated. Generic gateways need
-  only the OpenAI-compatible `/v1/models` endpoint. Well-known 404 is direct
-  mode; an injected explicit manifest is required and does not silently fall
-  back on 404. Provisioning receives a bearer only when its exact origin is in
-  the manifest allowlist, and its top-level chat model catalog—not Model
+- Generic connections never fetch a platform manifest. Enhanced mode exists only
+  when a distribution injects an explicit `manifest_url`; that document is a
+  required unauthenticated same-origin contract and does not fall back to
+  direct mode on 404. Provisioning receives a bearer only when its exact origin
+  is in the manifest allowlist, and its top-level chat model catalog—not Model
   Plaza—is the Agent selector source.
 - Browser authentication is standard S256 PKCE over a loopback callback. The
   authorization code exchange does not follow redirects and accepts only a
@@ -135,13 +130,12 @@ fail closed without rewriting the file.
   identity; non-empty unmarked, malformed, symlinked, junction, reparse, and
   special-component roots fail closed. All mutable connector state and fixed
   Claude/Codex/Gemini/Grok Build/OpenCode fixture roots are derived beneath
-  that one root. Credentials still use the native OS vault, under a stable
-  root-specific service and the existing profile-specific account, so
-  disconnect removes only that isolated profile credential. Isolated mode is
-  portable acceptance isolation against accidental real-state access, not a
-  security sandbox against another same-user process. Normal no-argument
-  startup retains the shared neutral ProjectionCoordinator and installed-Agent
-  discovery unchanged.
+  that one root. Credentials for isolated mode live in that root's
+  `profiles.json` with the rest of connector config. Isolated mode is portable
+  acceptance isolation against accidental real-state access, not a security
+  sandbox against another same-user process. Normal no-argument startup retains
+  the shared neutral ProjectionCoordinator and installed-Agent discovery
+  unchanged.
 - Profile creation is singleton and guarded by both an in-process connection
   lock and an inter-process profile-file lock. Profile writes use private
   unique `create_new` temporary files, no-follow/reparse checks, durable file
@@ -240,10 +234,9 @@ guards immediately around staging, recovery, and mutation.
 
 1. Enter a Gateway base URL, API key, and initial protocol.
 2. **Connect / Test** canonicalizes the URL and resolves its model endpoint as
-   shown above, without changing the configured origin.
-   If the exact-origin manifest advertises browser PKCE, the app instead shows
-   an explicit browser-login gate; the API-key field may be left blank for
-   that flow.
+   shown above, without changing the configured origin. The generic binary then
+   authenticates `GET /v1/models`. Branded distributions that pin a manifest may
+   instead present a browser-login gate when that manifest advertises PKCE.
 3. A successful OpenAI-style `{ "data": [...] }` response is normalized,
    deduplicated, sorted, and shown in one model picker per Agent.
 4. The authenticated shell shows the canonical Gateway and discovered model
@@ -266,9 +259,9 @@ guards immediately around staging, recovery, and mutation.
    The full Model Plaza catalog is searchable but is never used for Agent
    selectors.
 8. Settings persist English/Simplified Chinese and system/light/dark appearance
-   outside profile JSON. A later launch reloads the profile, retrieves the key
-   from the OS vault, and refreshes `/v1/models` while preserving the stable
-   profile ID and valid Agent selections.
+   outside profile JSON. A later launch reloads the profile (including the key
+   from local profile config) and refreshes `/v1/models` while preserving the
+   stable profile ID and valid Agent selections.
 
 ## Release and CI policy
 
@@ -327,9 +320,8 @@ $acceptanceRoot = Join-Path $env:TEMP 'GatewayConnector-Acceptance'
 
 The banner must show the canonical `$acceptanceRoot`. Connection, model
 discovery, preview, apply, verify, resume, and disconnect then operate only on
-the five fixture Agent roots beneath it. The OS credential vault deliberately
-remains native so credential persistence and cleanup receive real acceptance
-coverage.
+the five fixture Agent roots beneath it. Credentials are stored in that root's
+profile config so persistence and cleanup stay fully under the acceptance tree.
 
 Branded packaging, OAuth client IDs, account/billing schemas, brand assets,
 product URLs, signing, update feeds, and automated release infrastructure

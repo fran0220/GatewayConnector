@@ -13,8 +13,8 @@ use thiserror::Error;
 
 use crate::{
     ApiKey, Browser, CredentialStore, DiscoveryError, Distribution, DistributionError,
-    GENERIC_DISTRIBUTION, GatewayClient, ManifestLocation, ModelCapability, ModelDescriptor,
-    ProfileStore, StoreError, SystemBrowser, VaultError,
+    GENERIC_DISTRIBUTION, GatewayClient, ModelCapability, ModelDescriptor, ProfileStore,
+    StoreError, SystemBrowser, VaultError,
 };
 
 #[derive(Debug)]
@@ -377,19 +377,19 @@ impl ConnectorBackend {
                 return Err(BackendError::CustomGatewayUrlNotAllowed);
             }
         }
-        let explicit_manifest = self
+        // Enhanced mode is compile-time only: a distribution must pin
+        // `manifest_url`. The generic binary never probes well-known or any
+        // other discovery path and stays on direct OpenAI-compatible mode.
+        let Some(manifest_url) = self
             .distribution
             .manifest_url
             .map(url::Url::parse)
             .transpose()
-            .map_err(|_| BackendError::InvalidDistributionManifest)?;
-        let location = match explicit_manifest.clone() {
-            Some(value) => ManifestLocation::Explicit(value),
-            None => ManifestLocation::WellKnown,
-        };
-        let Some(found) = self.client.discover_manifest(&base_url, location)? else {
+            .map_err(|_| BackendError::InvalidDistributionManifest)?
+        else {
             return Ok(ProbeResult::Direct { base_url });
         };
+        let found = self.client.discover_manifest(&base_url, manifest_url.clone())?;
         if let Some(expected) = self.distribution.expected_platform_id
             && found.document.platform.id != expected
         {
@@ -400,7 +400,7 @@ impl ConnectorBackend {
         }
         Ok(ProbeResult::Provisioned {
             base_url,
-            manifest_url: explicit_manifest.unwrap_or(found.url),
+            manifest_url,
             manifest: Box::new(found.document),
         })
     }
@@ -626,16 +626,13 @@ impl ConnectorBackend {
                 })
             }
             ConnectionMode::Provisioned => {
+                let manifest_url = profile
+                    .manifest_url
+                    .clone()
+                    .ok_or(BackendError::ManifestDisappeared)?;
                 let found = self
                     .client
-                    .discover_manifest(
-                        &profile.base_url,
-                        profile
-                            .manifest_url
-                            .clone()
-                            .map_or(ManifestLocation::WellKnown, ManifestLocation::Explicit),
-                    )?
-                    .ok_or(BackendError::ManifestDisappeared)?;
+                    .discover_manifest(&profile.base_url, manifest_url)?;
                 self.validate_platform(&profile, &found.document)?;
                 let provisioning = self.client.fetch_provisioning(&found.document, &api_key)?;
                 let models = models_from_provisioning(&provisioning);

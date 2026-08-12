@@ -35,7 +35,7 @@ Windows native/release gate, and wrapper acceptance pass.
 1. Freeze connector behavior in the wrapper and record the currently owned
    Agent roots, coordinator state, and disconnect behavior.
 2. Add one compile-time `Distribution` value using wrapper-owned product IDs,
-   URLs, platform pin, keyring/bundle identity, locales, `AssetIdentity`, and
+   URLs, platform pin, bundle identity, locales, `AssetIdentity`, and
    release metadata. Keep `allow_isolated_root: false`.
 3. Replace the copied connector client entry point with
    `gateway_connector_app::gpui_app::run_with_assets(&DISTRIBUTION, assets)`.

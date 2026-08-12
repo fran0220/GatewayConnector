@@ -18,7 +18,6 @@ pub static DISTRIBUTION: Distribution = Distribution {
     qualifier: "com",
     organization: "example",
     application: "connector",
-    keyring_service: "com.example.connector",
     bundle_id: "com.example.connector",
     supported_locales: &["en", "zh-CN"],
     asset_identity: Some(AssetIdentity {
@@ -43,7 +42,7 @@ before vault, profile, or network access and uses it for:
 
 - product and platform identity;
 - custom-URL policy, default Gateway, and optional explicit manifest;
-- `ProjectDirs` state identity and OS keyring service;
+- `ProjectDirs` state identity for local profile/config paths;
 - window title and supported neutral locales;
 - browser-PKCE client/device values;
 - optional compile-time shell-icon and release metadata for the wrapper/packager.
@@ -99,7 +98,7 @@ authentication flow launched by the native desktop client.
 ## What stays downstream
 
 A wrapper may provide its own binary entry point, assets, localized product
-name, bundle/keyring identity, platform pin, packaging, signing, and release
+name, bundle identity, platform pin, packaging, signing, and release
 metadata. It must not copy the connector engine or change persisted projection,
 coordinator, or ownership-receipt formats.
 

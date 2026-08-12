@@ -70,16 +70,16 @@ impl Locale {
             "Not connected" => "未连接",
             "Loading saved connection" => "正在加载已保存的连接",
             "Connect a Gateway" => "连接网关",
-            "Enter any OpenAI-compatible Gateway. A platform manifest is optional." => {
-                "输入任意兼容 OpenAI 的网关。平台清单为可选项。"
+            "Enter any OpenAI-compatible Gateway URL and API key." => {
+                "输入任意兼容 OpenAI 的网关 URL 与 API 密钥。"
             }
             "Gateway base URL" => "网关基础 URL",
             "Root or nested prefix; /v1 and /v1/models forms are also accepted. HTTPS except loopback." => {
                 "可输入根路径或嵌套前缀，也支持 /v1 和 /v1/models。除回环地址外须使用 HTTPS。"
             }
             "API key" => "API 密钥",
-            "Stored in the operating-system credential vault. Leave blank when the platform advertises browser login." => {
-                "仅存入操作系统凭据库。平台提供浏览器登录时可留空。"
+            "Stored in this app's local profile config. Leave blank when the platform advertises browser login." => {
+                "保存在本应用本地配置中。平台提供浏览器登录时可留空。"
             }
             "Default protocol" => "默认协议",
             "Connect / Test" => "连接 / 测试",
@@ -162,8 +162,8 @@ impl Locale {
             "Light" => "浅色",
             "Dark" => "深色",
             "Security facts" => "安全说明",
-            "Credentials stay in the OS vault. Bearers are sent only to exact allowlisted origins. Agent changes require a fresh preview." => {
-                "凭据仅存于操作系统凭据库。Bearer 仅发送到精确允许的来源。Agent 更改必须先生成最新预览。"
+            "Credentials stay in this app's local profile config. Bearers are sent only to exact allowlisted origins. Agent changes require a fresh preview." => {
+                "凭据保存在本应用本地配置中。Bearer 仅发送到精确允许的来源。Agent 更改必须先生成最新预览。"
             }
             "Isolated mode" => "隔离模式",
             "Managing fixture Agents under this path; installed Agents are not being modified:" => {

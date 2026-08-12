@@ -9,7 +9,7 @@ use directories::{ProjectDirs, UserDirs};
 use gateway_connector_backend::{
     ApiKey, BackendError, BrowserLoginOffer, ConnectRequest, ConnectRequestWithoutCredential,
     ConnectionResult, ConnectorBackend, Distribution, JsonProfileStore, ModelCapability,
-    OsCredentialStore, ProbeResult, SystemBrowser,
+    ProbeResult, ProfileCredentialStore, ProfileStore, SystemBrowser,
 };
 use gateway_connector_core::{AgentId, CanonicalBaseUrl, ChangeKind, ConnectionProfile, Protocol};
 use gpui::{
@@ -1015,7 +1015,7 @@ impl ConnectorView {
                     )
                     .child(div().text_color(cx.theme().colors.text_muted).child(
                         locale.text(
-                            "Enter any OpenAI-compatible Gateway. A platform manifest is optional.",
+                            "Enter any OpenAI-compatible Gateway URL and API key.",
                         ),
                     ))
                     .child(
@@ -1037,7 +1037,7 @@ impl ConnectorView {
                         )
                             .control("connector.api-key")
                             .description(
-                                locale.text("Stored in the operating-system credential vault. Leave blank when the platform advertises browser login."),
+                                locale.text("Stored in this app's local profile config. Leave blank when the platform advertises browser login."),
                             )
                             .child(self.api_key.clone()),
                     )
@@ -1098,7 +1098,7 @@ impl ConnectorView {
                         div()
                             .text_color(cx.theme().colors.text_muted)
                             .child(format!(
-                                "{} advertises standard browser PKCE. GatewayConnector will keep only the returned access token in the OS vault.",
+                                "{} advertises standard browser PKCE. GatewayConnector will keep only the returned access token in the local profile config.",
                                 offer.manifest.platform.name
                             )),
                     )
@@ -1533,7 +1533,7 @@ impl ConnectorView {
             .child(page_title(locale.text("Security facts")))
             .child(
                 Callout::new(
-                    locale.text("Credentials stay in the OS vault. Bearers are sent only to exact allowlisted origins. Agent changes require a fresh preview."),
+                    locale.text("Credentials stay in this app's local profile config. Bearers are sent only to exact allowlisted origins. Agent changes require a fresh preview."),
                     Tone::Info,
                 )
                 .id("connector.security-facts"),
@@ -2144,12 +2144,13 @@ fn run_launch_with_assets(
                 .expect("the operating system provides a home directory")
                 .home_dir()
                 .to_owned();
+            let profiles: Arc<dyn ProfileStore> = Arc::new(JsonProfileStore::new(
+                directories.data_local_dir().join("profiles.json"),
+            ));
             let backend = Arc::new(
                 ConnectorBackend::with_dependencies(
-                    Arc::new(OsCredentialStore::new(distribution.keyring_service)),
-                    Arc::new(JsonProfileStore::new(
-                        directories.data_local_dir().join("profiles.json"),
-                    )),
+                    Arc::new(ProfileCredentialStore::new(Arc::clone(&profiles))),
+                    profiles,
                     distribution,
                     Arc::new(SystemBrowser),
                 )
@@ -2176,12 +2177,12 @@ fn run_launch_with_assets(
                 "GatewayConnector Isolated mode: {}",
                 layout.root().display()
             );
+            let profiles: Arc<dyn ProfileStore> =
+                Arc::new(JsonProfileStore::new(layout.profiles_file()));
             let backend = Arc::new(
                 ConnectorBackend::with_dependencies(
-                    Arc::new(OsCredentialStore::new(
-                        layout.keyring_service(distribution.keyring_service),
-                    )),
-                    Arc::new(JsonProfileStore::new(layout.profiles_file())),
+                    Arc::new(ProfileCredentialStore::new(Arc::clone(&profiles))),
+                    profiles,
                     distribution,
                     Arc::new(SystemBrowser),
                 )

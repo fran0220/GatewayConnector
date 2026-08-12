@@ -153,20 +153,6 @@ impl IsolatedLayout {
         FixedAgentRoots::new(self.agent_roots.clone())
     }
 
-    pub fn keyring_service(&self, normal_service: &str) -> String {
-        let mut hash = Sha256::new();
-        hash.update(b"GatewayConnector isolated keyring service v1\0");
-        hash.update((normal_service.len() as u64).to_be_bytes());
-        hash.update(normal_service.as_bytes());
-        hash.update(self.root_id);
-        hash.update(self.path_digest);
-        let digest = hash.finalize();
-        format!(
-            "gateway-connector.isolated.v1.{}",
-            encode_hex(&digest[..16])
-        )
-    }
-
     pub fn revalidate(&self) -> Result<(), IsolatedRootError> {
         validate_existing_components(&self.root)?;
         let marker = read_and_validate_marker(&self.root)?;
@@ -795,12 +781,12 @@ mod tests {
     };
 
     use gateway_connector_backend::{
-        ApiKey, ConnectRequest, ConnectorBackend, CredentialStore, GENERIC_DISTRIBUTION,
-        InMemoryCredentialStore, JsonProfileStore, SystemBrowser,
+        ApiKey, ConnectRequest, ConnectorBackend, CredentialStore, Distribution,
+        GENERIC_DISTRIBUTION, InMemoryCredentialStore, JsonProfileStore, SystemBrowser,
     };
     use gateway_connector_core::{AgentId, Protocol};
     use sha2::{Digest, Sha256};
-    use tiny_http::{Response, Server, StatusCode};
+    use tiny_http::{Response, Server};
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
     use super::*;
@@ -874,9 +860,6 @@ mod tests {
         let first = IsolatedLayout::prepare(requested.clone()).expect("initialize layout");
         assert!(first.root().is_absolute());
         assert!(first.root().join(MARKER_NAME).is_file());
-        let service = first.keyring_service(GENERIC_DISTRIBUTION.keyring_service);
-        assert!(service.starts_with("gateway-connector.isolated.v1."));
-        assert_ne!(service, GENERIC_DISTRIBUTION.keyring_service);
 
         for path in first.agent_roots.iter().chain([
             &first.profiles_file,
@@ -898,23 +881,17 @@ mod tests {
 
         let second = IsolatedLayout::prepare(requested).expect("reopen layout");
         assert_eq!(second.root_id, first.root_id);
-        assert_eq!(
-            second.keyring_service(GENERIC_DISTRIBUTION.keyring_service),
-            service
-        );
+        assert_eq!(second.profiles_file(), first.profiles_file());
     }
 
     #[test]
-    fn two_roots_never_share_vault_or_coordinator_identity() {
+    fn two_roots_never_share_profile_or_coordinator_paths() {
         let parent = tempfile::tempdir().expect("temporary parent");
         let first = IsolatedLayout::prepare(test_path(&parent, "one")).expect("first");
         let second = IsolatedLayout::prepare(test_path(&parent, "two")).expect("second");
         assert_ne!(first.root_id, second.root_id);
         assert_ne!(first.coordinator_dir(), second.coordinator_dir());
-        assert_ne!(
-            first.keyring_service(GENERIC_DISTRIBUTION.keyring_service),
-            second.keyring_service(GENERIC_DISTRIBUTION.keyring_service)
-        );
+        assert_ne!(first.profiles_file(), second.profiles_file());
     }
 
     #[test]
@@ -1333,9 +1310,10 @@ mod tests {
         let before = snapshot_tree(&outside);
         let layout = IsolatedLayout::prepare(test_path(&parent, "isolated")).expect("layout");
         let credentials = Arc::new(InMemoryCredentialStore::default());
-        let (base_url, server) = enhanced_server();
+        let (base_url, distribution, server) = enhanced_server();
 
-        let backend = isolated_backend(&layout, Arc::clone(&credentials));
+        let backend =
+            isolated_backend_with_distribution(&layout, Arc::clone(&credentials), distribution);
         let connected = backend
             .connect(ConnectRequest {
                 display_name: "Isolated Provisioned Test".into(),
@@ -1380,7 +1358,8 @@ mod tests {
         );
         drop(backend);
 
-        let resumed_backend = isolated_backend(&layout, Arc::clone(&credentials));
+        let resumed_backend =
+            isolated_backend_with_distribution(&layout, Arc::clone(&credentials), distribution);
         let resumed = resumed_backend
             .resume_saved()
             .expect("resume")
@@ -1412,11 +1391,19 @@ mod tests {
         layout: &IsolatedLayout,
         credentials: Arc<InMemoryCredentialStore>,
     ) -> ConnectorBackend {
+        isolated_backend_with_distribution(layout, credentials, &GENERIC_DISTRIBUTION)
+    }
+
+    fn isolated_backend_with_distribution(
+        layout: &IsolatedLayout,
+        credentials: Arc<InMemoryCredentialStore>,
+        distribution: &'static Distribution,
+    ) -> ConnectorBackend {
         let credentials: Arc<dyn CredentialStore> = credentials;
         ConnectorBackend::with_dependencies(
             credentials,
             Arc::new(JsonProfileStore::new(layout.profiles_file())),
-            &GENERIC_DISTRIBUTION,
+            distribution,
             Arc::new(SystemBrowser),
         )
         .and_then(|backend| {
@@ -1433,40 +1420,36 @@ mod tests {
         let server = Server::http("127.0.0.1:0").expect("mock server");
         let base_url = format!("http://{}", server.server_addr());
         let handle = thread::spawn(move || {
-            for index in 0..3 {
+            // connect + resume each hit /v1/models once.
+            for _ in 0..2 {
                 let request = server.recv().expect("request");
-                if index == 0 {
-                    assert_eq!(request.url(), "/.well-known/gateway-connector");
-                    assert!(
-                        request
-                            .headers()
-                            .iter()
-                            .all(|header| { !header.field.equiv("authorization") })
-                    );
-                    request
-                        .respond(Response::empty(StatusCode(404)))
-                        .expect("well-known response");
-                } else {
-                    assert_eq!(request.url(), "/v1/models");
-                    assert!(request.headers().iter().any(|header| {
-                        header.field.equiv("authorization")
-                            && header.value.as_str() == "Bearer isolated-secret"
-                    }));
-                    request
-                        .respond(Response::from_string(
-                            r#"{"data":[{"id":"chat-model","chat_capable":true}]}"#,
-                        ))
-                        .expect("models response");
-                }
+                assert_eq!(request.url(), "/v1/models");
+                assert!(request.headers().iter().any(|header| {
+                    header.field.equiv("authorization")
+                        && header.value.as_str() == "Bearer isolated-secret"
+                }));
+                request
+                    .respond(Response::from_string(
+                        r#"{"data":[{"id":"chat-model","chat_capable":true}]}"#,
+                    ))
+                    .expect("models response");
             }
         });
         (base_url, handle)
     }
 
-    fn enhanced_server() -> (String, thread::JoinHandle<()>) {
+    fn enhanced_server() -> (String, &'static Distribution, thread::JoinHandle<()>) {
         let archive = skill_zip(b"# Isolated Skill\n");
         let server = Server::http("127.0.0.1:0").expect("mock server");
         let base_url = format!("http://{}", server.server_addr());
+        let manifest_url =
+            Box::leak(format!("{base_url}/connector-manifest.json").into_boxed_str());
+        let distribution = Box::leak(Box::new(Distribution {
+            expected_platform_id: Some("isolated-test"),
+            manifest_url: Some(manifest_url),
+            allow_isolated_root: true,
+            ..GENERIC_DISTRIBUTION
+        }));
         let manifest = serde_json::json!({
             "success": true,
             "data": {
@@ -1510,7 +1493,7 @@ mod tests {
             for _ in 0..6 {
                 let request = server.recv().expect("request");
                 let response = match request.url() {
-                    "/.well-known/gateway-connector" => Response::from_string(manifest.clone()),
+                    "/connector-manifest.json" => Response::from_string(manifest.clone()),
                     "/provisioning" => Response::from_string(provisioning.clone()),
                     "/skill.zip" => Response::from_data(archive.clone()),
                     path => panic!("unexpected enhanced-mode path: {path}"),
@@ -1518,7 +1501,7 @@ mod tests {
                 request.respond(response).expect("response");
             }
         });
-        (base_url, handle)
+        (base_url, distribution, handle)
     }
 
     fn skill_zip(contents: &[u8]) -> Vec<u8> {

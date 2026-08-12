@@ -37,16 +37,17 @@ it does not scan speculative endpoints.
 
 ## Manifest discovery
 
-Unless a distribution injects an explicit URL, the only manifest probe is an
-unauthenticated exact-origin request to:
+The generic binary never discovers a platform manifest. Direct mode is the only
+generic path: authenticated model listing against the configured Gateway.
 
-```text
-<configured-origin>/.well-known/gateway-connector
-```
+Enhanced mode is compile-time. A branded distribution must inject
+`Distribution.manifest_url`. The client then performs one unauthenticated
+exact-origin request to that explicit URL. The manifest is a required contract:
+`404` and invalid documents are errors and do not fall back to direct mode.
+Manifest redirects are bounded to the configured Gateway origin. The request
+never contains the connection bearer.
 
-A well-known `404` selects direct mode. Other errors are reported. An explicit
-manifest is required: its `404` is an error. Manifest redirects are bounded to
-the configured origin. The request never contains the connection bearer.
+There is no runtime `/.well-known/gateway-connector` probe.
 
 The response envelope and schema-v2 document are:
 
@@ -118,8 +119,8 @@ client posts JSON to `token_url`:
 ```
 
 The token endpoint must not redirect and must return a Bearer
-`access_token`. GatewayConnector stores only that access token in the OS vault;
-it does not persist refresh tokens or account payloads.
+`access_token`. GatewayConnector stores only that access token in the local
+profile config file; it does not persist refresh tokens or account payloads.
 
 ## Provisioning
 

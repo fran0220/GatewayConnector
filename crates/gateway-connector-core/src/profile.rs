@@ -141,7 +141,8 @@ impl fmt::Display for ProfileId {
     }
 }
 
-/// Opaque account name used to retrieve a secret from a credential vault.
+/// Stable local credential id for a profile (`profile:<uuid>`).
+/// Secrets are stored on the profile document itself, not in an OS keychain.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct CredentialRef(String);
@@ -229,12 +230,6 @@ impl CanonicalBaseUrl {
         }
     }
 
-    pub fn well_known_endpoint(&self) -> Url {
-        let mut endpoint = self.0.clone();
-        endpoint.set_path("/.well-known/gateway-connector");
-        endpoint
-    }
-
     pub fn suggested_display_name(&self) -> String {
         self.0
             .host()
@@ -282,7 +277,7 @@ impl<'de> Deserialize<'de> for CanonicalBaseUrl {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "UncheckedConnectionProfile")]
 pub struct ConnectionProfile {
     pub schema_version: u32,
@@ -290,6 +285,9 @@ pub struct ConnectionProfile {
     pub display_name: String,
     pub base_url: CanonicalBaseUrl,
     pub credential: CredentialRef,
+    /// API key or access token stored in the app profile config file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub credential_secret: String,
     pub mode: ConnectionMode,
     pub credential_kind: CredentialKind,
     pub platform_id: String,
@@ -299,6 +297,26 @@ pub struct ConnectionProfile {
     /// Direct-discovery models whose unknown capability the user explicitly accepted.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub confirmed_direct_models: BTreeSet<String>,
+}
+
+impl fmt::Debug for ConnectionProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectionProfile")
+            .field("schema_version", &self.schema_version)
+            .field("id", &self.id)
+            .field("display_name", &self.display_name)
+            .field("base_url", &self.base_url)
+            .field("credential", &self.credential)
+            .field("credential_secret", &"[REDACTED]")
+            .field("mode", &self.mode)
+            .field("credential_kind", &self.credential_kind)
+            .field("platform_id", &self.platform_id)
+            .field("manifest_url", &self.manifest_url)
+            .field("agents", &self.agents)
+            .field("confirmed_direct_models", &self.confirmed_direct_models)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,6 +362,7 @@ impl ConnectionProfile {
             display_name,
             base_url,
             credential,
+            credential_secret: String::new(),
             mode: ConnectionMode::Direct,
             credential_kind: CredentialKind::ApiKey,
             platform_id: "gateway-connector".into(),
@@ -485,6 +504,8 @@ struct UncheckedConnectionProfile {
     base_url: CanonicalBaseUrl,
     credential: CredentialRef,
     #[serde(default)]
+    credential_secret: String,
+    #[serde(default)]
     mode: Option<ConnectionMode>,
     #[serde(default)]
     credential_kind: Option<CredentialKind>,
@@ -513,6 +534,11 @@ impl TryFrom<UncheckedConnectionProfile> for ConnectionProfile {
             display_name: unchecked.display_name,
             base_url: unchecked.base_url,
             credential: unchecked.credential,
+            credential_secret: if legacy {
+                String::new()
+            } else {
+                unchecked.credential_secret
+            },
             mode: if legacy {
                 ConnectionMode::Direct
             } else {
@@ -665,10 +691,6 @@ mod tests {
             nested.endpoint("/v1/models").as_str(),
             "https://example.com/gateway/v1/models"
         );
-        assert_eq!(
-            nested.well_known_endpoint().as_str(),
-            "https://example.com/.well-known/gateway-connector"
-        );
     }
 
     #[test]
@@ -715,16 +737,19 @@ mod tests {
     }
 
     #[test]
-    fn persisted_profile_contains_a_reference_not_a_secret() {
-        let profile = ConnectionProfile::new(
+    fn persisted_profile_can_include_credential_secret_redacted_in_debug() {
+        let mut profile = ConnectionProfile::new(
             "Example",
             CanonicalBaseUrl::parse("https://gateway.example").expect("valid URL"),
             Protocol::Auto,
         )
         .expect("valid profile");
+        profile.credential_secret = "sk-example".into();
         let json = serde_json::to_string_pretty(&profile).expect("serialize profile");
         assert!(json.contains("profile:"));
         assert!(json.contains("credential_kind"));
+        assert!(json.contains("sk-example"));
+        assert!(!format!("{profile:?}").contains("sk-example"));
         assert_eq!(profile.agents.len(), 5);
 
         let decoded: ConnectionProfile = serde_json::from_str(&json).expect("deserialize profile");

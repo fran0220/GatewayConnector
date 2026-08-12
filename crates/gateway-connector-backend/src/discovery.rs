@@ -36,12 +36,6 @@ pub struct ModelDescriptor {
 }
 
 #[derive(Debug, Clone)]
-pub enum ManifestLocation {
-    WellKnown,
-    Explicit(Url),
-}
-
-#[derive(Debug, Clone)]
 pub struct DiscoveredManifest {
     pub url: Url,
     pub document: ConnectionManifest,
@@ -99,30 +93,22 @@ impl GatewayClient {
         normalize_models(response.data)
     }
 
+    /// Fetches a compile-time distribution manifest. Manifest URLs are required
+    /// contracts for branded platforms; the generic binary never probes for one.
     pub fn discover_manifest(
         &self,
         base_url: &CanonicalBaseUrl,
-        location: ManifestLocation,
-    ) -> Result<Option<DiscoveredManifest>, DiscoveryError> {
-        let explicit = matches!(location, ManifestLocation::Explicit(_));
-        let endpoint = match location {
-            ManifestLocation::WellKnown => base_url.well_known_endpoint(),
-            ManifestLocation::Explicit(url) => {
-                if has_userinfo(&url) {
-                    return Err(DiscoveryError::ManifestUrlCredentials);
-                }
-                if url.origin() != base_url.origin() {
-                    return Err(DiscoveryError::ManifestOriginMismatch(url));
-                }
-                url
-            }
-        };
-        let response = self.get_following_exact_origin(endpoint, base_url, None)?;
+        manifest_url: Url,
+    ) -> Result<DiscoveredManifest, DiscoveryError> {
+        if has_userinfo(&manifest_url) {
+            return Err(DiscoveryError::ManifestUrlCredentials);
+        }
+        if manifest_url.origin() != base_url.origin() {
+            return Err(DiscoveryError::ManifestOriginMismatch(manifest_url));
+        }
+        let response = self.get_following_exact_origin(manifest_url, base_url, None)?;
         if response.status() == StatusCode::NOT_FOUND {
-            if explicit {
-                return Err(DiscoveryError::ExplicitManifestNotFound);
-            }
-            return Ok(None);
+            return Err(DiscoveryError::ExplicitManifestNotFound);
         }
         if !response.status().is_success() {
             return Err(DiscoveryError::ManifestHttpStatus(
@@ -136,10 +122,10 @@ impl GatewayClient {
                 message: source.to_string(),
             }
         })?;
-        Ok(Some(DiscoveredManifest {
+        Ok(DiscoveredManifest {
             url: final_url,
             document,
-        }))
+        })
     }
 
     pub fn fetch_provisioning(

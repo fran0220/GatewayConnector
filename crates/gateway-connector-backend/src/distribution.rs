@@ -18,7 +18,6 @@ pub struct Distribution {
     pub qualifier: &'static str,
     pub organization: &'static str,
     pub application: &'static str,
-    pub keyring_service: &'static str,
     pub bundle_id: &'static str,
     pub supported_locales: &'static [&'static str],
     /// Optional wrapper-owned icon rendered by the shared connected shell.
@@ -40,7 +39,6 @@ pub const GENERIC_DISTRIBUTION: Distribution = Distribution {
     qualifier: "dev",
     organization: "gateway-connector",
     application: "gateway-connector",
-    keyring_service: "gateway-connector",
     bundle_id: "dev.gateway-connector",
     supported_locales: &["en", "zh-CN"],
     asset_identity: None,
@@ -56,7 +54,6 @@ impl Distribution {
             ("qualifier", self.qualifier),
             ("organization", self.organization),
             ("application", self.application),
-            ("keyring_service", self.keyring_service),
             ("bundle_id", self.bundle_id),
             ("pkce_client_id", self.pkce_client_id),
         ] {
@@ -154,7 +151,19 @@ pub struct ReleaseMetadata {
 
 fn secure_url(value: &str) -> Result<Url, ()> {
     let url = Url::parse(value).map_err(|_| ())?;
-    if url.scheme() != "https"
+    // Production distributions use HTTPS. Loopback HTTP is allowed so native
+    // acceptance tests can pin an explicit manifest on a local mock server.
+    let scheme_ok = match url.scheme() {
+        "https" => true,
+        "http" => match url.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            None => false,
+        },
+        _ => false,
+    };
+    if !scheme_ok
         || url.host().is_none()
         || !url.username().is_empty()
         || url.password().is_some()

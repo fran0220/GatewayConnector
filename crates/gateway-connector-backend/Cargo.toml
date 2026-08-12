@@ -1,6 +1,6 @@
 [package]
 name = "gateway-connector-backend"
-description = "Secure GatewayConnector discovery, vault, and profile backend"
+description = "GatewayConnector discovery, local profile config, and projection backend"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,6 @@ repository.workspace = true
 [dependencies]
 gateway-connector-core.workspace = true
 fs2.workspace = true
-keyring.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

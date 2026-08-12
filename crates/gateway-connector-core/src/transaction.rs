@@ -691,6 +691,9 @@ impl Connector {
         execute_ops(&self.coordinator_dir, platform, &key, ops)
     }
     pub fn managed_agents(&self, platform: &str, bearer: &Secret) -> Result<BTreeSet<AgentId>> {
+        // Fresh installs have no prior apply; create the connector state root so
+        // ownership queries can report "not managed" instead of failing closed.
+        ensure_plain_dir(&self.state_dir)?;
         self.recover(platform, bearer)?;
         let Some(receipt) = self.load_receipt(platform, &receipt_key(bearer)?)? else {
             return Ok(BTreeSet::new());
@@ -721,7 +724,7 @@ impl Connector {
         ensure_plain_dir(&self.coordinator_dir)?;
         let locks = self.coordinator_dir.join("locks");
         ensure_plain_dir(&locks)?;
-        // Agent config paths are global even when receipt/keyring state is
+        // Agent config paths are global even when receipt/credential state is
         // platform-partitioned, so all platforms share one process lock.
         let path = locks.join("connector.lock");
         reject_absolute_reparse_components(&path)?;
