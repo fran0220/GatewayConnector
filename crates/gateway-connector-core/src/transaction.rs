@@ -407,8 +407,7 @@ impl Connector {
                 input.manifest,
                 input.provisioning,
                 input.bearer,
-                model,
-                selection.protocol,
+                selection,
                 &provider,
                 &projection_bases,
             )?;
@@ -2374,11 +2373,12 @@ fn project(
     m: &ConnectionManifest,
     p: &Provisioning,
     b: &Secret,
-    model: &str,
-    protocol: WireProtocol,
+    selection: &EffectiveAgentSelection,
     provider: &str,
     projection_bases: &BTreeMap<PathBuf, Vec<u8>>,
 ) -> Result<Vec<FileProjection>> {
+    let model = selection.model.as_str();
+    let protocol = selection.protocol;
     let native_base = gateway_api_base(&m.gateway.base_url, None);
     let v1_base = gateway_api_base(&m.gateway.base_url, Some("v1"));
     let v1beta_base = gateway_api_base(&m.gateway.base_url, Some("v1beta"));
