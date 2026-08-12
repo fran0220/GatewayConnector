@@ -838,7 +838,7 @@ mod tests {
             serde_json::json!({"success":true,"data":{
                 "schema_version":2,
                 "platform":{"id":"test-platform","name":"Test Platform"},
-                "gateway":{"base_url":origin,"protocols":["openai_chat"]},
+                "gateway":{"base_url":origin,"protocols":["openai_responses"]},
                 "provisioning_url":format!("{origin}/provisioning"),
                 "connection_bearer_origins":bearer_origins,
                 "supported_agents":["codex"]

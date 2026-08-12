@@ -15,9 +15,11 @@ pub use model::{
 };
 pub use profile::{
     AgentId, AgentSelection, CanonicalBaseUrl, ConnectionMode, ConnectionProfile, CredentialKind,
-    CredentialRef, ProfileError, ProfileId, Protocol,
+    CredentialRef, ProfileError, ProfileId, Protocol, WireProtocol,
 };
-pub use transaction::{ApplyInput, Change, ChangeKind, Connector, Plan, Verification};
+pub use transaction::{
+    ApplyInput, Change, ChangeKind, Connector, EffectiveAgentSelection, Plan, Verification,
+};
 
 use thiserror::Error;
 

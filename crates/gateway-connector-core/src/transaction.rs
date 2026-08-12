@@ -1,4 +1,7 @@
-use crate::{AgentId, AgentInstall, ConnectionManifest, Error, Provisioning, Result, Secret, io};
+use crate::{
+    AgentId, AgentInstall, ConnectionManifest, Error, Provisioning, Result, Secret, WireProtocol,
+    io,
+};
 use aes_gcm::{
     Aes256Gcm, KeyInit,
     aead::{Aead, AeadCore, OsRng},
@@ -27,9 +30,15 @@ pub struct ApplyInput<'a> {
     pub manifest: &'a ConnectionManifest,
     pub provisioning: &'a Provisioning,
     pub bearer: &'a Secret,
-    pub selected_models: BTreeMap<AgentId, String>,
+    pub agents: BTreeMap<AgentId, EffectiveAgentSelection>,
     pub installs: Vec<AgentInstall>,
     pub synchronized_skills: BTreeMap<String, PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveAgentSelection {
+    pub model: String,
+    pub protocol: WireProtocol,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +226,18 @@ impl Connector {
                 ))
             })?;
         }
+        let projected_agents = installs
+            .iter()
+            .filter(|install| {
+                install.detected && input.manifest.supported_agents.contains(&install.agent)
+            })
+            .map(|install| install.agent)
+            .collect::<BTreeSet<_>>();
+        if input.agents.keys().copied().collect::<BTreeSet<_>>() != projected_agents {
+            return Err(Error::Validation(
+                "effective Agent selections do not exactly match detected supported Agents".into(),
+            ));
+        }
         let platform = &input.manifest.platform.id;
         let provider = owned(platform, "provider", "default");
         let mut ops = Vec::new();
@@ -346,10 +367,31 @@ impl Connector {
             }
             let boundary = install_boundary(install)?;
             validate_agent_destinations(install, boundary)?;
-            let model = input
-                .selected_models
-                .get(&install.agent)
-                .unwrap_or(&input.provisioning.default_model);
+            let selection = &input.agents[&install.agent];
+            let model = &selection.model;
+            if !install
+                .agent
+                .supported_wire_protocols()
+                .contains(&selection.protocol)
+            {
+                return Err(Error::Validation(format!(
+                    "{} does not support the {} protocol",
+                    install.agent.display_name(),
+                    selection.protocol
+                )));
+            }
+            if !input
+                .manifest
+                .gateway
+                .protocols
+                .contains(&selection.protocol)
+            {
+                return Err(Error::Validation(format!(
+                    "Gateway does not advertise {} selected for {}",
+                    selection.protocol,
+                    install.agent.display_name()
+                )));
+            }
             if !input
                 .provisioning
                 .models
@@ -366,6 +408,7 @@ impl Connector {
                 input.provisioning,
                 input.bearer,
                 model,
+                selection.protocol,
                 &provider,
                 &projection_bases,
             )?;
@@ -2332,11 +2375,13 @@ fn project(
     p: &Provisioning,
     b: &Secret,
     model: &str,
+    protocol: WireProtocol,
     provider: &str,
     projection_bases: &BTreeMap<PathBuf, Vec<u8>>,
 ) -> Result<Vec<FileProjection>> {
-    let base = m.gateway.base_url.as_str().trim_end_matches('/');
-    let openai_base = openai_api_base(&m.gateway.base_url);
+    let native_base = gateway_api_base(&m.gateway.base_url, None);
+    let v1_base = gateway_api_base(&m.gateway.base_url, Some("v1"));
+    let v1beta_base = gateway_api_base(&m.gateway.base_url, Some("v1beta"));
     let mut out = Vec::new();
     let mcps: Vec<_> = p
         .mcp_servers
@@ -2345,6 +2390,7 @@ fn project(
         .collect();
     match i.agent {
         AgentId::Claude => {
+            debug_assert_eq!(protocol, WireProtocol::Anthropic);
             let current_settings = i.root.join("settings.json");
             let legacy_settings = i.root.join("claude.json");
             let settings = if !current_settings.exists() && legacy_settings.exists() {
@@ -2355,7 +2401,7 @@ fn project(
             let mut v = read_json_projection(&settings, false, projection_bases)?;
             let env = obj(&mut v, "env")?;
             for (k, val) in [
-                ("ANTHROPIC_BASE_URL", base),
+                ("ANTHROPIC_BASE_URL", native_base.as_str()),
                 ("ANTHROPIC_AUTH_TOKEN", b.expose()),
                 ("ANTHROPIC_MODEL", model),
             ] {
@@ -2380,13 +2426,15 @@ fn project(
             out.push(file(path, v, vec!["mcpServers".into()])?)
         }
         AgentId::Gemini => {
+            debug_assert_eq!(protocol, WireProtocol::Gemini);
             let ep = i.root.join(".env");
             let text = read_text_projection(&ep, projection_bases)?;
             let env = merge_env(
                 &text,
                 &[
-                    ("GOOGLE_GEMINI_BASE_URL", base),
+                    ("GOOGLE_GEMINI_BASE_URL", native_base.as_str()),
                     ("GEMINI_API_KEY", b.expose()),
+                    ("GEMINI_API_KEY_AUTH_MECHANISM", "bearer"),
                     ("GEMINI_MODEL", model),
                 ],
             );
@@ -2429,11 +2477,29 @@ fn project(
                 .filter(|model| model.chat_capable)
                 .map(|x| (x.id.clone(), json!({"name":x.id})))
                 .collect();
+            let (npm, options) = match protocol {
+                WireProtocol::OpenaiChat => (
+                    "@ai-sdk/openai-compatible",
+                    json!({"baseURL":v1_base,"apiKey":b.expose()}),
+                ),
+                WireProtocol::OpenaiResponses => (
+                    "@ai-sdk/openai",
+                    json!({"baseURL":v1_base,"apiKey":b.expose()}),
+                ),
+                WireProtocol::Anthropic => (
+                    "@ai-sdk/anthropic",
+                    json!({"baseURL":v1_base,"authToken":b.expose()}),
+                ),
+                WireProtocol::Gemini => (
+                    "@ai-sdk/google",
+                    json!({"baseURL":v1beta_base,"apiKey":b.expose()}),
+                ),
+            };
             v["model"] = json!(format!("{provider}/{model}"));
             insert_json_owned(
                 obj(&mut v, "provider")?,
                 provider.into(),
-                json!({"npm":"@ai-sdk/openai-compatible","options":{"baseURL":openai_base.as_str(),"apiKey":b.expose()},"models":catalog}),
+                json!({"npm":npm,"options":options,"models":catalog}),
                 &path,
             )?;
             let map = obj(&mut v, "mcp")?;
@@ -2451,13 +2517,14 @@ fn project(
             let path = i.root.join("config.toml");
             let mut d = read_toml_projection(&path, projection_bases)?;
             if i.agent == AgentId::Codex {
+                debug_assert_eq!(protocol, WireProtocol::OpenaiResponses);
                 d["model"] = value(model);
                 d["model_provider"] = value(provider);
                 ensure_table(&mut d, "model_providers");
                 reject_toml_collision(&d, "model_providers", provider, &path)?;
                 let mut t = Table::new();
                 t["name"] = value(&m.platform.name);
-                t["base_url"] = value(openai_base.as_str());
+                t["base_url"] = value(v1_base.as_str());
                 t["wire_api"] = value("responses");
                 t["experimental_bearer_token"] = value(b.expose());
                 d["model_providers"][provider] = Item::Table(t);
@@ -2468,10 +2535,20 @@ fn project(
                 reject_toml_collision(&d, "model", provider, &path)?;
                 let mut t = Table::new();
                 t["model"] = value(model);
-                t["base_url"] = value(openai_base.as_str());
+                t["base_url"] = value(v1_base.as_str());
                 t["name"] = value(&m.platform.name);
                 t["api_key"] = value(b.expose());
-                t["api_backend"] = value("responses");
+                t["auth_scheme"] = value("bearer");
+                t["api_backend"] = value(match protocol {
+                    WireProtocol::OpenaiChat => "chat_completions",
+                    WireProtocol::OpenaiResponses => "responses",
+                    WireProtocol::Anthropic => "messages",
+                    WireProtocol::Gemini => {
+                        return Err(Error::Validation(
+                            "Grok Build does not support the Gemini protocol".into(),
+                        ));
+                    }
+                });
                 d["model"][provider] = Item::Table(t);
             }
             ensure_table(&mut d, "mcp_servers");
@@ -2498,17 +2575,22 @@ fn project(
     Ok(out)
 }
 
-fn openai_api_base(gateway: &url::Url) -> String {
+fn gateway_api_base(gateway: &url::Url, version: Option<&str>) -> String {
     let mut base = gateway.clone();
     let path = base.path().trim_end_matches('/');
-    let path = if path.ends_with("/v1/models") {
-        path.strip_suffix("/models")
-            .expect("suffix checked")
-            .to_owned()
-    } else if path.ends_with("/v1") {
-        path.to_owned()
+    let route_root = ["/v1/models", "/v1beta/models", "/v1", "/v1beta"]
+        .into_iter()
+        .find_map(|suffix| path.strip_suffix(suffix))
+        .unwrap_or(path)
+        .trim_end_matches('/');
+    let path = version.map_or_else(
+        || route_root.to_owned(),
+        |version| format!("{route_root}/{version}"),
+    );
+    let path = if path.is_empty() {
+        "/".to_owned()
     } else {
-        format!("{path}/v1")
+        path
     };
     base.set_path(&path);
     base.to_string().trim_end_matches('/').to_owned()
@@ -2517,28 +2599,48 @@ fn openai_api_base(gateway: &url::Url) -> String {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{durable_publish_bundle, edit_json, openai_api_base};
+    use super::{durable_publish_bundle, edit_json, gateway_api_base};
     use serde_json::json;
     use std::fs;
 
     #[test]
-    fn normalizes_openai_api_base_without_duplicate_v1() {
-        for (input, expected) in [
-            ("https://gateway.example", "https://gateway.example/v1"),
+    fn normalizes_protocol_api_bases_without_duplicate_versions() {
+        for (input, native, v1, v1beta) in [
+            (
+                "https://gateway.example",
+                "https://gateway.example",
+                "https://gateway.example/v1",
+                "https://gateway.example/v1beta",
+            ),
             (
                 "https://gateway.example/nested",
+                "https://gateway.example/nested",
                 "https://gateway.example/nested/v1",
+                "https://gateway.example/nested/v1beta",
             ),
-            ("https://gateway.example/v1", "https://gateway.example/v1"),
+            (
+                "https://gateway.example/v1",
+                "https://gateway.example",
+                "https://gateway.example/v1",
+                "https://gateway.example/v1beta",
+            ),
             (
                 "https://gateway.example/v1/models",
+                "https://gateway.example",
                 "https://gateway.example/v1",
+                "https://gateway.example/v1beta",
+            ),
+            (
+                "https://gateway.example/nested/v1beta/models",
+                "https://gateway.example/nested",
+                "https://gateway.example/nested/v1",
+                "https://gateway.example/nested/v1beta",
             ),
         ] {
-            assert_eq!(
-                openai_api_base(&input.parse().expect("test URL must parse")),
-                expected
-            );
+            let input = input.parse().expect("test URL must parse");
+            assert_eq!(gateway_api_base(&input, None), native);
+            assert_eq!(gateway_api_base(&input, Some("v1")), v1);
+            assert_eq!(gateway_api_base(&input, Some("v1beta")), v1beta);
         }
     }
 
@@ -2757,11 +2859,23 @@ fn owned(platform: &str, kind: &str, id: &str) -> String {
     format!("connector-{kind}-{:x}", hash.finalize())
 }
 fn lease_key(lease: &ProjectionLease) -> String {
+    let owned_path = if lease.agent == AgentId::Claude.as_str() {
+        if lease.root.file_name().and_then(|name| name.to_str()) == Some(".claude") {
+            lease
+                .root
+                .parent()
+                .unwrap_or(&lease.root)
+                .join(".claude.json")
+        } else {
+            lease.root.join(".claude.json")
+        }
+    } else {
+        lease.root.clone()
+    };
     format!(
         "{}:{}",
         lease.agent,
-        lease
-            .root
+        owned_path
             .to_string_lossy()
             .replace('\\', "/")
             .to_lowercase()

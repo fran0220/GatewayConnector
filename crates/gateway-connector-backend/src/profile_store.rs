@@ -312,7 +312,7 @@ pub enum StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gateway_connector_core::{CanonicalBaseUrl, Protocol};
+    use gateway_connector_core::CanonicalBaseUrl;
     use std::sync::{Arc, Barrier};
 
     fn tempdir() -> std::io::Result<tempfile::TempDir> {
@@ -339,7 +339,6 @@ mod tests {
         let profile = ConnectionProfile::new(
             "Gateway",
             CanonicalBaseUrl::parse("https://gateway.example").expect("valid URL"),
-            Protocol::Auto,
         )
         .expect("valid profile");
         store.save(&profile).expect("save profile");
@@ -357,7 +356,6 @@ mod tests {
             ConnectionProfile::new(
                 name,
                 CanonicalBaseUrl::parse("https://gateway.example").expect("valid URL"),
-                Protocol::Auto,
             )
             .expect("valid profile")
         });

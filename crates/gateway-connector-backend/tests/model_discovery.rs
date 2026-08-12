@@ -17,7 +17,7 @@ use gateway_connector_backend::{
 };
 use gateway_connector_core::{
     AgentId, CanonicalBaseUrl, ConnectionManifest, ConnectionMode, ConnectionProfile,
-    CredentialKind, CredentialRef, ProfileId, Protocol,
+    CredentialKind, CredentialRef, ProfileId,
 };
 use sha2::{Digest, Sha256};
 use tiny_http::{Header, Request, Response, Server, StatusCode};
@@ -128,7 +128,7 @@ fn manifest_body(
         "data": {
             "schema_version": 2,
             "platform": {"id": platform, "name": "Test Platform"},
-            "gateway": {"base_url": gateway, "protocols": ["openai_chat"]},
+            "gateway": {"base_url": gateway, "protocols": ["openai_chat", "openai_responses", "anthropic", "gemini"]},
             "provisioning_url": provisioning_url,
             "connection_bearer_origins": bearer_origins,
             "supported_agents": ["claude", "codex", "gemini", "grokbuild", "opencode"]
@@ -205,7 +205,7 @@ fn browser_manifest_body(platform: &str, origin: &str) -> String {
                 "authorize_url": format!("{origin}/authorize"),
                 "token_url": format!("{origin}/token")
             },
-            "gateway": {"base_url": origin, "protocols": ["openai_chat"]},
+            "gateway": {"base_url": origin, "protocols": ["openai_chat", "openai_responses", "anthropic", "gemini"]},
             "provisioning_url": format!("{origin}/api/connector/provisioning"),
             "connection_bearer_origins": [origin],
             "supported_agents": ["claude", "codex", "gemini", "grokbuild", "opencode"]
@@ -531,7 +531,7 @@ fn refuses_cross_origin_redirect_without_contacting_target() {
 fn manifest_discovery_is_exact_origin_and_unauthenticated() {
     let (base, capture, handle) = spawn_response(
         200,
-        r#"{"success":true,"data":{"schema_version":2,"platform":{"id":"test","name":"Test"},"gateway":{"base_url":"http://127.0.0.1","protocols":["openai"]},"provisioning_url":"http://127.0.0.1/provision","connection_bearer_origins":["http://127.0.0.1"],"supported_agents":["codex"]}}"#,
+        r#"{"success":true,"data":{"schema_version":2,"platform":{"id":"test","name":"Test"},"gateway":{"base_url":"http://127.0.0.1","protocols":["openai_responses"]},"provisioning_url":"http://127.0.0.1/provision","connection_bearer_origins":["http://127.0.0.1"],"supported_agents":["codex"]}}"#,
     );
     let client = GatewayClient::new().expect("client");
     let base_url = CanonicalBaseUrl::parse(&base).expect("base URL");
@@ -591,7 +591,10 @@ fn generic_probe_is_direct_and_never_fetches_a_manifest() {
     .expect("backend");
     let probe = backend.probe(&origin).expect("generic probe");
     handle.join().expect("server must stay quiet");
-    assert!(matches!(probe, gateway_connector_backend::ProbeResult::Direct { .. }));
+    assert!(matches!(
+        probe,
+        gateway_connector_backend::ProbeResult::Direct { .. }
+    ));
 }
 
 #[test]
@@ -599,11 +602,7 @@ fn provisioned_connection_uses_manifest_catalog_and_bearer_boundary() {
     let server = Server::http("127.0.0.1:0").expect("enhanced server");
     let origin = format!("http://{}", server.server_addr());
     let manifest_url = leak_str(format!("{origin}/connector-manifest.json"));
-    let distribution = distribution_with_manifest(
-        PINNED_DISTRIBUTION_BASE,
-        manifest_url,
-        None,
-    );
+    let distribution = distribution_with_manifest(PINNED_DISTRIBUTION_BASE, manifest_url, None);
     let manifest = manifest_body(
         "test-platform",
         &origin,
@@ -678,7 +677,6 @@ fn provisioned_connection_uses_manifest_catalog_and_bearer_boundary() {
             display_name: "Enhanced".to_owned(),
             base_url: origin,
             api_key: ApiKey::new("enhanced-key").expect("key"),
-            protocol: Protocol::Auto,
         })
         .expect("provisioned connection");
     let captures = handle.join().expect("enhanced server");
@@ -789,7 +787,6 @@ fn direct_projection_uses_discovered_models_without_inventing_services() {
     let mut profile = ConnectionProfile::new(
         "Direct Gateway",
         CanonicalBaseUrl::parse("https://gateway.example/proxy/v1/models").expect("URL"),
-        Protocol::OpenaiResponses,
     )
     .expect("profile");
     profile
@@ -862,7 +859,6 @@ fn direct_projection_requires_saved_explicit_capability_decisions() {
     let mut profile = ConnectionProfile::new(
         "Direct Gateway",
         CanonicalBaseUrl::parse("https://gateway.example").expect("URL"),
-        Protocol::OpenaiResponses,
     )
     .expect("profile");
     profiles.create(&profile).expect("persist profile");
@@ -1096,7 +1092,6 @@ fn resume_rechecks_saved_platform_identity() {
     let profile = ConnectionProfile::new_connection(
         "Saved platform",
         CanonicalBaseUrl::parse(&origin).expect("base URL"),
-        Protocol::Auto,
         ConnectionMode::Provisioned,
         CredentialKind::AccessToken,
         "saved-platform",
@@ -1178,7 +1173,6 @@ fn browser_login_keeps_failed_vault_credentials_retryable() {
             display_name: "Browser login".to_owned(),
             base_url: origin,
             api_key: ApiKey::new("unused-form-key").expect("key"),
-            protocol: Protocol::Auto,
         })
         .expect_err("browser login offer")
     {
@@ -1249,7 +1243,6 @@ fn browser_token_is_pending_when_profile_creation_fails_after_redemption() {
             display_name: "Browser login".to_owned(),
             base_url: origin,
             api_key: ApiKey::new("unused-form-key").expect("key"),
-            protocol: Protocol::Auto,
         })
         .expect_err("browser login offer")
     {
@@ -1294,7 +1287,6 @@ fn browser_offer_is_fully_validated_before_redeeming_a_code() {
             display_name: "Initially valid".to_owned(),
             base_url: origin,
             api_key: ApiKey::new("unused-form-key").expect("key"),
-            protocol: Protocol::Auto,
         })
         .expect_err("browser login offer")
     {
@@ -1360,7 +1352,6 @@ fn failed_browser_credential_can_be_remotely_revoked_and_discarded() {
             display_name: "Browser login".to_owned(),
             base_url: origin,
             api_key: ApiKey::new("unused-form-key").expect("key"),
-            protocol: Protocol::Auto,
         })
         .expect_err("browser login offer")
     {
@@ -1397,7 +1388,6 @@ fn backend_persists_credential_secret_in_profile_config() {
             display_name: "Local test".to_owned(),
             base_url: base,
             api_key: ApiKey::new("config-secret").expect("key"),
-            protocol: Protocol::Auto,
         })
         .expect("connect");
     handle.join().expect("mock server");
@@ -1422,7 +1412,6 @@ fn saved_connection_resumes_with_the_same_profile_id() {
             display_name: "Resume test".to_owned(),
             base_url: base,
             api_key: ApiKey::new("resume-key").expect("key"),
-            protocol: Protocol::Auto,
         })
         .expect("connect");
     let resumed = backend
@@ -1445,7 +1434,6 @@ fn connect_never_silently_overwrites_an_active_profile() {
             display_name: "First".to_owned(),
             base_url: base.clone(),
             api_key: ApiKey::new("first-key").expect("key"),
-            protocol: Protocol::Auto,
         })
         .expect("first connection");
     handle.join().expect("mock server");
@@ -1454,7 +1442,6 @@ fn connect_never_silently_overwrites_an_active_profile() {
             display_name: "Replacement".to_owned(),
             base_url: base,
             api_key: ApiKey::new("replacement-key").expect("key"),
-            protocol: Protocol::Anthropic,
         })
         .expect_err("active connection must not be overwritten");
     assert!(matches!(error, BackendError::AlreadyConnected));
@@ -1494,7 +1481,6 @@ fn failed_credential_commit_rolls_back_new_profile() {
             display_name: "Rollback test".to_owned(),
             base_url: base,
             api_key: ApiKey::new("cannot-store").expect("key"),
-            protocol: Protocol::Auto,
         })
         .expect_err("credential storage must fail");
     handle.join().expect("mock server");
@@ -1515,7 +1501,6 @@ fn ambiguous_credential_commit_is_deleted_before_profile_rollback() {
             display_name: "Ambiguous commit".to_owned(),
             base_url: base,
             api_key: ApiKey::new("ambiguous-secret").expect("key"),
-            protocol: Protocol::Auto,
         }),
         Err(BackendError::Vault(VaultError::Unavailable(_)))
     ));

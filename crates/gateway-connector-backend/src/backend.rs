@@ -6,8 +6,9 @@ use std::{
 
 use gateway_connector_core::{
     AgentId, AgentInstall, ApplyInput, CanonicalBaseUrl, ConnectionManifest, ConnectionMode,
-    ConnectionProfile, Connector, CredentialKind, Discovery, FixedAgentRoots, Gateway, Model, Plan,
-    Platform, ProfileError, Protocol, Provisioning, Secret, Verification,
+    ConnectionProfile, Connector, CredentialKind, Discovery, EffectiveAgentSelection,
+    FixedAgentRoots, Gateway, Model, Plan, Platform, ProfileError, Provisioning, Secret,
+    Verification,
 };
 use thiserror::Error;
 
@@ -22,7 +23,6 @@ pub struct ConnectRequest {
     pub display_name: String,
     pub base_url: String,
     pub api_key: ApiKey,
-    pub protocol: Protocol,
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +56,6 @@ pub struct BrowserLoginOffer {
 pub struct ConnectRequestWithoutCredential {
     pub display_name: String,
     pub base_url: String,
-    pub protocol: Protocol,
 }
 
 #[derive(Debug)]
@@ -290,24 +289,38 @@ impl ConnectorBackend {
         let secret = core_secret(&bearer)?;
         let installs = runtime.discovery.discover();
         let (manifest, provisioning) = self.projection_contracts(connection, &installs)?;
-        let selected_models = connection
-            .profile
-            .agents
+        let advertised = (connection.profile.mode == ConnectionMode::Provisioned).then(|| {
+            manifest
+                .gateway
+                .protocols
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+        });
+        let agents = installs
             .iter()
-            .filter_map(|(agent, selection)| {
-                selection
-                    .default_model
-                    .as_ref()
-                    .map(|model| (*agent, model.clone()))
+            .filter(|install| {
+                install.detected && manifest.supported_agents.contains(&install.agent)
             })
-            .collect();
+            .map(|install| {
+                let selection = &connection.profile.agents[&install.agent];
+                let model = selection
+                    .default_model
+                    .clone()
+                    .unwrap_or_else(|| provisioning.default_model.clone());
+                let protocol = install
+                    .agent
+                    .resolve_protocol(selection.protocol, advertised.as_ref())?;
+                Ok((install.agent, EffectiveAgentSelection { model, protocol }))
+            })
+            .collect::<Result<BTreeMap<_, _>, ProfileError>>()?;
         runtime
             .connector
             .plan(ApplyInput {
                 manifest: &manifest,
                 provisioning: &provisioning,
                 bearer: &secret,
-                selected_models,
+                agents,
                 installs,
                 synchronized_skills: connection.synchronized_skills.clone(),
             })
@@ -389,7 +402,9 @@ impl ConnectorBackend {
         else {
             return Ok(ProbeResult::Direct { base_url });
         };
-        let found = self.client.discover_manifest(&base_url, manifest_url.clone())?;
+        let found = self
+            .client
+            .discover_manifest(&base_url, manifest_url.clone())?;
         if let Some(expected) = self.distribution.expected_platform_id
             && found.document.platform.id != expected
         {
@@ -449,7 +464,6 @@ impl ConnectorBackend {
                             request: ConnectRequestWithoutCredential {
                                 display_name: request.display_name,
                                 base_url: request.base_url,
-                                protocol: request.protocol,
                             },
                             manifest_url,
                             manifest,
@@ -478,7 +492,6 @@ impl ConnectorBackend {
         let profile = ConnectionProfile::new_connection(
             request.display_name,
             base_url,
-            request.protocol,
             mode,
             CredentialKind::ApiKey,
             platform,
@@ -547,7 +560,6 @@ impl ConnectorBackend {
         let profile = ConnectionProfile::new_connection(
             offer.request.display_name,
             base,
-            offer.request.protocol,
             ConnectionMode::Provisioned,
             CredentialKind::AccessToken,
             offer.manifest.platform.id.clone(),
@@ -799,16 +811,16 @@ impl ConnectorBackend {
                     .map(|model| (model.id.as_str(), model))
                     .collect::<BTreeMap<_, _>>();
                 let mut explicitly_selected = Vec::new();
+                let mut supported_agents = Vec::new();
+                let mut protocols = BTreeSet::new();
                 for install in installs.iter().filter(|install| install.detected) {
-                    let model_id = connection.profile.agents[&install.agent]
-                        .default_model
-                        .as_deref()
-                        .ok_or_else(|| {
-                            BackendError::ProjectionContext(format!(
-                                "{} requires an explicit direct model selection",
-                                install.agent.display_name()
-                            ))
-                        })?;
+                    let selection = &connection.profile.agents[&install.agent];
+                    let model_id = selection.default_model.as_deref().ok_or_else(|| {
+                        BackendError::ProjectionContext(format!(
+                            "{} requires an explicit direct model selection",
+                            install.agent.display_name()
+                        ))
+                    })?;
                     let model = catalog.get(model_id).ok_or_else(|| {
                         BackendError::ProjectionContext(format!(
                             "selected direct model `{model_id}` is not in the discovered catalog"
@@ -833,16 +845,15 @@ impl ConnectorBackend {
                         }
                         ModelCapability::Unknown => {}
                     }
+                    protocols.insert(install.agent.resolve_protocol(selection.protocol, None)?);
+                    supported_agents.push(install.agent);
                     explicitly_selected.push(model_id.to_owned());
                 }
-                let protocols = connection
-                    .profile
-                    .agents
-                    .values()
-                    .map(|selection| selection.protocol.as_str().to_owned())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
+                if supported_agents.is_empty() {
+                    return Err(BackendError::ProjectionContext(
+                        "no detected Agent is available for direct projection".into(),
+                    ));
+                }
                 let manifest = ConnectionManifest::direct(
                     Platform {
                         id: connection.profile.platform_id.clone(),
@@ -850,10 +861,10 @@ impl ConnectorBackend {
                     },
                     Gateway {
                         base_url: connection.profile.base_url.as_url().clone(),
-                        protocols,
+                        protocols: protocols.into_iter().collect(),
                     },
                     connection.profile.base_url.as_url().clone(),
-                    AgentId::ALL.to_vec(),
+                    supported_agents,
                 )?;
                 let models = connection
                     .models
@@ -868,11 +879,10 @@ impl ConnectorBackend {
                         vendor: None,
                     })
                     .collect::<Vec<_>>();
-                let default_model = explicitly_selected.first().cloned().ok_or_else(|| {
-                    BackendError::ProjectionContext(
-                        "no detected Agent is available for direct projection".into(),
-                    )
-                })?;
+                let default_model = explicitly_selected
+                    .first()
+                    .cloned()
+                    .expect("a detected Agent supplied an explicit model");
                 Ok((manifest, Provisioning::direct(models, default_model)?))
             }
             ConnectionMode::Provisioned => {

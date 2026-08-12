@@ -48,6 +48,74 @@ impl AgentId {
             Self::Opencode => "OpenCode",
         }
     }
+
+    /// Persisted choices that this Agent can actually consume. `Auto` records
+    /// user intent; projection resolves it to one concrete wire protocol.
+    pub const fn supported_protocols(self) -> &'static [Protocol] {
+        match self {
+            Self::Claude => &[Protocol::Auto, Protocol::Anthropic],
+            Self::Codex => &[Protocol::Auto, Protocol::OpenaiResponses],
+            Self::Gemini => &[Protocol::Auto, Protocol::Gemini],
+            Self::Grokbuild => &[
+                Protocol::Auto,
+                Protocol::OpenaiChat,
+                Protocol::OpenaiResponses,
+                Protocol::Anthropic,
+            ],
+            Self::Opencode => &Protocol::ALL,
+        }
+    }
+
+    pub const fn supported_wire_protocols(self) -> &'static [WireProtocol] {
+        match self {
+            Self::Claude => &[WireProtocol::Anthropic],
+            Self::Codex => &[WireProtocol::OpenaiResponses],
+            Self::Gemini => &[WireProtocol::Gemini],
+            Self::Grokbuild => &[
+                WireProtocol::OpenaiChat,
+                WireProtocol::OpenaiResponses,
+                WireProtocol::Anthropic,
+            ],
+            Self::Opencode => &WireProtocol::ALL,
+        }
+    }
+
+    /// Stable preference order for `Auto`. Gateway manifest ordering never
+    /// changes the selected wire protocol.
+    pub const fn auto_protocols(self) -> &'static [WireProtocol] {
+        self.supported_wire_protocols()
+    }
+
+    pub fn resolve_protocol(
+        self,
+        selection: Protocol,
+        advertised: Option<&BTreeSet<WireProtocol>>,
+    ) -> Result<WireProtocol, ProfileError> {
+        if selection == Protocol::Auto {
+            return self
+                .auto_protocols()
+                .iter()
+                .copied()
+                .find(|protocol| advertised.is_none_or(|values| values.contains(protocol)))
+                .ok_or(ProfileError::NoCompatibleProtocol(self));
+        }
+        let protocol = selection
+            .wire_protocol()
+            .expect("a non-Auto protocol has a concrete representation");
+        if !self.supported_wire_protocols().contains(&protocol) {
+            return Err(ProfileError::UnsupportedAgentProtocol {
+                agent: self,
+                protocol,
+            });
+        }
+        if advertised.is_some_and(|values| !values.contains(&protocol)) {
+            return Err(ProfileError::ProtocolNotAdvertised {
+                agent: self,
+                protocol,
+            });
+        }
+        Ok(protocol)
+    }
 }
 
 /// Wire protocol selected for an Agent projection.
@@ -83,16 +151,81 @@ impl Protocol {
 
     pub const fn display_name(self) -> &'static str {
         match self {
-            Self::Auto => "Auto (OpenAI-compatible discovery)",
+            Self::Auto => "Auto (best protocol for this Agent)",
             Self::OpenaiChat => "OpenAI Chat Completions",
             Self::OpenaiResponses => "OpenAI Responses",
             Self::Anthropic => "Anthropic Messages",
             Self::Gemini => "Gemini",
         }
     }
+
+    pub const fn wire_protocol(self) -> Option<WireProtocol> {
+        match self {
+            Self::Auto => None,
+            Self::OpenaiChat => Some(WireProtocol::OpenaiChat),
+            Self::OpenaiResponses => Some(WireProtocol::OpenaiResponses),
+            Self::Anthropic => Some(WireProtocol::Anthropic),
+            Self::Gemini => Some(WireProtocol::Gemini),
+        }
+    }
 }
 
 impl FromStr for Protocol {
+    type Err = ProfileError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|protocol| protocol.as_str() == value)
+            .ok_or_else(|| ProfileError::UnknownProtocol(value.to_owned()))
+    }
+}
+
+/// A concrete protocol written to an Agent configuration. Unlike the
+/// persisted [`Protocol`], this type cannot represent unresolved `Auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireProtocol {
+    OpenaiChat,
+    OpenaiResponses,
+    Anthropic,
+    Gemini,
+}
+
+impl WireProtocol {
+    pub const ALL: [Self; 4] = [
+        Self::OpenaiChat,
+        Self::OpenaiResponses,
+        Self::Anthropic,
+        Self::Gemini,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenaiChat => "openai_chat",
+            Self::OpenaiResponses => "openai_responses",
+            Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
+        }
+    }
+
+    pub const fn protocol(self) -> Protocol {
+        match self {
+            Self::OpenaiChat => Protocol::OpenaiChat,
+            Self::OpenaiResponses => Protocol::OpenaiResponses,
+            Self::Anthropic => Protocol::Anthropic,
+            Self::Gemini => Protocol::Gemini,
+        }
+    }
+}
+
+impl fmt::Display for WireProtocol {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for WireProtocol {
     type Err = ProfileError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -111,11 +244,17 @@ pub struct AgentSelection {
 }
 
 impl AgentSelection {
-    pub fn new(protocol: Protocol) -> Self {
+    pub fn new() -> Self {
         Self {
-            protocol,
+            protocol: Protocol::Auto,
             default_model: None,
         }
+    }
+}
+
+impl Default for AgentSelection {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -336,12 +475,11 @@ pub enum CredentialKind {
 }
 
 impl ConnectionProfile {
-    pub const SCHEMA_VERSION: u32 = 2;
+    pub const SCHEMA_VERSION: u32 = 3;
 
     pub fn new(
         display_name: impl Into<String>,
         base_url: CanonicalBaseUrl,
-        protocol: Protocol,
     ) -> Result<Self, ProfileError> {
         let display_name = display_name.into().trim().to_owned();
         if display_name.is_empty()
@@ -354,7 +492,7 @@ impl ConnectionProfile {
         let credential = CredentialRef::for_profile(id);
         let agents = AgentId::ALL
             .into_iter()
-            .map(|agent| (agent, AgentSelection::new(protocol)))
+            .map(|agent| (agent, AgentSelection::new()))
             .collect();
         Ok(Self {
             schema_version: Self::SCHEMA_VERSION,
@@ -375,13 +513,12 @@ impl ConnectionProfile {
     pub fn new_connection(
         display_name: impl Into<String>,
         base_url: CanonicalBaseUrl,
-        protocol: Protocol,
         mode: ConnectionMode,
         credential_kind: CredentialKind,
         platform_id: impl Into<String>,
         manifest_url: Option<Url>,
     ) -> Result<Self, ProfileError> {
-        let mut value = Self::new(display_name, base_url, protocol)?;
+        let mut value = Self::new(display_name, base_url)?;
         value.mode = mode;
         value.credential_kind = credential_kind;
         value.platform_id = platform_id.into();
@@ -394,14 +531,13 @@ impl ConnectionProfile {
         mut existing: Self,
         display_name: impl Into<String>,
         base_url: CanonicalBaseUrl,
-        protocol: Protocol,
     ) -> Result<Self, ProfileError> {
         let display_name = validated_display_name(display_name.into())?;
         existing.schema_version = Self::SCHEMA_VERSION;
         existing.display_name = display_name;
         existing.base_url = base_url;
         for selection in existing.agents.values_mut() {
-            selection.protocol = protocol;
+            selection.protocol = Protocol::Auto;
             selection.default_model = None;
         }
         existing.confirmed_direct_models.clear();
@@ -432,13 +568,12 @@ impl ConnectionProfile {
         mut existing: Self,
         display_name: impl Into<String>,
         base_url: CanonicalBaseUrl,
-        protocol: Protocol,
         mode: ConnectionMode,
         credential_kind: CredentialKind,
         platform_id: impl Into<String>,
         manifest_url: Option<Url>,
     ) -> Result<Self, ProfileError> {
-        existing = Self::reconfigured(existing, display_name, base_url, protocol)?;
+        existing = Self::reconfigured(existing, display_name, base_url)?;
         existing.mode = mode;
         existing.credential_kind = credential_kind;
         existing.platform_id = platform_id.into();
@@ -479,7 +614,16 @@ impl ConnectionProfile {
         {
             return Err(ProfileError::InvalidAgentSelections);
         }
-        for selection in self.agents.values() {
+        for (agent, selection) in &self.agents {
+            if !agent.supported_protocols().contains(&selection.protocol) {
+                return Err(ProfileError::UnsupportedAgentProtocol {
+                    agent: *agent,
+                    protocol: selection
+                        .protocol
+                        .wire_protocol()
+                        .expect("Auto is supported by every Agent"),
+                });
+            }
             if let Some(model) = &selection.default_model
                 && validate_model_id(model).is_err()
             {
@@ -522,12 +666,26 @@ impl TryFrom<UncheckedConnectionProfile> for ConnectionProfile {
     type Error = ProfileError;
 
     fn try_from(unchecked: UncheckedConnectionProfile) -> Result<Self, Self::Error> {
-        if !matches!(unchecked.schema_version, 1 | Self::SCHEMA_VERSION) {
+        if !matches!(unchecked.schema_version, 1 | 2 | Self::SCHEMA_VERSION) {
             return Err(ProfileError::UnsupportedSchemaVersion(
                 unchecked.schema_version,
             ));
         }
         let legacy = unchecked.schema_version == 1;
+        let mut agents = unchecked.agents;
+        if unchecked.schema_version < Self::SCHEMA_VERSION {
+            // Protocol selections in schema 1/2 were persisted but ignored by
+            // projection. Preserve the wire behavior users actually had.
+            for (agent, selection) in &mut agents {
+                selection.protocol = match agent {
+                    AgentId::Claude => Protocol::Anthropic,
+                    AgentId::Codex => Protocol::OpenaiResponses,
+                    AgentId::Gemini => Protocol::Gemini,
+                    AgentId::Grokbuild => Protocol::OpenaiResponses,
+                    AgentId::Opencode => Protocol::OpenaiChat,
+                };
+            }
+        }
         let profile = Self {
             schema_version: Self::SCHEMA_VERSION,
             id: unchecked.id,
@@ -561,7 +719,7 @@ impl TryFrom<UncheckedConnectionProfile> for ConnectionProfile {
                     .ok_or(ProfileError::MissingSchemaTwoField("platform_id"))?
             },
             manifest_url: if legacy { None } else { unchecked.manifest_url },
-            agents: unchecked.agents,
+            agents,
             confirmed_direct_models: unchecked.confirmed_direct_models,
         };
         profile.validate()?;
@@ -650,7 +808,7 @@ pub enum ProfileError {
     InvalidDisplayName,
     #[error("profile schema version {0} is unsupported")]
     UnsupportedSchemaVersion(u32),
-    #[error("schema-2 profile is missing required field `{0}`")]
+    #[error("connection profile is missing required field `{0}`")]
     MissingSchemaTwoField(&'static str),
     #[error("a profile must contain exactly one selection for each supported Agent")]
     InvalidAgentSelections,
@@ -670,6 +828,18 @@ pub enum ProfileError {
     InvalidManifestUrl,
     #[error("unknown protocol `{0}`")]
     UnknownProtocol(String),
+    #[error("{agent:?} does not support the {protocol} protocol")]
+    UnsupportedAgentProtocol {
+        agent: AgentId,
+        protocol: WireProtocol,
+    },
+    #[error("the Gateway does not advertise {protocol} required by {agent:?}")]
+    ProtocolNotAdvertised {
+        agent: AgentId,
+        protocol: WireProtocol,
+    },
+    #[error("the Gateway does not advertise any protocol supported by {0:?}")]
+    NoCompatibleProtocol(AgentId),
 }
 
 #[cfg(test)]
@@ -741,7 +911,6 @@ mod tests {
         let mut profile = ConnectionProfile::new(
             "Example",
             CanonicalBaseUrl::parse("https://gateway.example").expect("valid URL"),
-            Protocol::Auto,
         )
         .expect("valid profile");
         profile.credential_secret = "sk-example".into();
@@ -761,10 +930,10 @@ mod tests {
         let mut profile = ConnectionProfile::new(
             "Example",
             CanonicalBaseUrl::parse("https://gateway.example").expect("valid URL"),
-            Protocol::Auto,
         )
         .expect("valid profile");
         let mut old_schema_two = serde_json::to_value(&profile).expect("serialize profile");
+        old_schema_two["schema_version"] = serde_json::json!(2);
         old_schema_two
             .as_object_mut()
             .expect("profile object")
@@ -784,7 +953,6 @@ mod tests {
             decoded,
             "Other",
             CanonicalBaseUrl::parse("https://other.example").expect("valid URL"),
-            Protocol::Auto,
         )
         .expect("reconfigure");
         assert!(reconfigured.confirmed_direct_models.is_empty());
@@ -795,7 +963,7 @@ mod tests {
         let id = ProfileId::new();
         let mut agents = BTreeMap::new();
         for agent in AgentId::ALL {
-            agents.insert(agent, AgentSelection::new(Protocol::Auto));
+            agents.insert(agent, AgentSelection::new());
         }
         let legacy = serde_json::json!({
             "schema_version": 1,
@@ -813,23 +981,22 @@ mod tests {
         assert_eq!(profile.mode, ConnectionMode::Direct);
         assert_eq!(profile.credential_kind, CredentialKind::ApiKey);
         let current = serde_json::to_string(&profile).expect("serialize current profile");
-        assert!(current.contains("\"schema_version\":2"));
+        assert!(current.contains("\"schema_version\":3"));
         assert!(!current.contains("secret"));
     }
 
     #[test]
-    fn schema_two_requires_all_connection_security_fields() {
+    fn current_schema_requires_all_connection_security_fields() {
         let profile = ConnectionProfile::new(
             "Current",
             CanonicalBaseUrl::parse("https://gateway.example").expect("valid URL"),
-            Protocol::Auto,
         )
         .expect("valid profile");
         for field in ["mode", "credential_kind", "platform_id"] {
             let mut json = serde_json::to_value(&profile).expect("serialize profile");
             json.as_object_mut().expect("profile object").remove(field);
             let error = serde_json::from_value::<ConnectionProfile>(json)
-                .expect_err("schema-2 field is required");
+                .expect_err("connection field is required");
             assert!(error.to_string().contains(field), "{error}");
         }
     }
@@ -839,7 +1006,6 @@ mod tests {
         let profile = ConnectionProfile::new(
             "Example",
             CanonicalBaseUrl::parse("https://gateway.example").expect("valid URL"),
-            Protocol::Auto,
         )
         .expect("valid profile");
         let mut json = serde_json::to_value(profile).expect("serialize profile");
@@ -856,7 +1022,6 @@ mod tests {
         let profile = ConnectionProfile::new(
             "First",
             CanonicalBaseUrl::parse("https://one.example").expect("valid URL"),
-            Protocol::Auto,
         )
         .expect("valid profile");
         let id = profile.id;
@@ -865,7 +1030,6 @@ mod tests {
             profile,
             "Second",
             CanonicalBaseUrl::parse("https://two.example").expect("valid URL"),
-            Protocol::Anthropic,
         )
         .expect("reconfigure profile");
         assert_eq!(reconfigured.id, id);
@@ -879,5 +1043,84 @@ mod tests {
         let error = serde_json::from_value::<ConnectionProfile>(json)
             .expect_err("incomplete profiles must be rejected");
         assert!(error.to_string().contains("exactly one selection"));
+    }
+
+    #[test]
+    fn agent_protocol_matrix_and_auto_resolution_are_explicit() {
+        let all = WireProtocol::ALL.into_iter().collect::<BTreeSet<_>>();
+        for (agent, expected) in [
+            (AgentId::Claude, WireProtocol::Anthropic),
+            (AgentId::Codex, WireProtocol::OpenaiResponses),
+            (AgentId::Gemini, WireProtocol::Gemini),
+            (AgentId::Grokbuild, WireProtocol::OpenaiChat),
+            (AgentId::Opencode, WireProtocol::OpenaiChat),
+        ] {
+            assert_eq!(
+                agent
+                    .resolve_protocol(Protocol::Auto, Some(&all))
+                    .expect("compatible protocol"),
+                expected
+            );
+            assert_eq!(
+                agent
+                    .resolve_protocol(Protocol::Auto, None)
+                    .expect("deterministic direct protocol"),
+                expected
+            );
+        }
+        assert_eq!(
+            AgentId::Grokbuild
+                .resolve_protocol(
+                    Protocol::Auto,
+                    Some(&BTreeSet::from([
+                        WireProtocol::OpenaiResponses,
+                        WireProtocol::Anthropic,
+                    ]))
+                )
+                .expect("first compatible advertised protocol"),
+            WireProtocol::OpenaiResponses
+        );
+        assert!(matches!(
+            AgentId::Codex.resolve_protocol(Protocol::OpenaiChat, None),
+            Err(ProfileError::UnsupportedAgentProtocol { .. })
+        ));
+        assert!(matches!(
+            AgentId::Grokbuild.resolve_protocol(
+                Protocol::Anthropic,
+                Some(&BTreeSet::from([WireProtocol::OpenaiChat]))
+            ),
+            Err(ProfileError::ProtocolNotAdvertised { .. })
+        ));
+    }
+
+    #[test]
+    fn schema_two_migration_preserves_previously_effective_protocols() {
+        let profile = ConnectionProfile::new(
+            "Legacy",
+            CanonicalBaseUrl::parse("https://gateway.example").expect("valid URL"),
+        )
+        .expect("profile");
+        let mut json = serde_json::to_value(profile).expect("serialize profile");
+        json["schema_version"] = serde_json::json!(2);
+        for selection in json["agents"]
+            .as_object_mut()
+            .expect("Agent selections")
+            .values_mut()
+        {
+            selection["protocol"] = serde_json::json!("gemini");
+        }
+
+        let migrated: ConnectionProfile =
+            serde_json::from_value(json).expect("schema-2 profile migrates");
+        assert_eq!(
+            AgentId::ALL.map(|agent| migrated.agents[&agent].protocol),
+            [
+                Protocol::Anthropic,
+                Protocol::OpenaiResponses,
+                Protocol::Gemini,
+                Protocol::OpenaiResponses,
+                Protocol::OpenaiChat,
+            ]
+        );
     }
 }

@@ -250,7 +250,25 @@ impl AppState {
         }
     }
 
-    pub fn update_protocol(&mut self, agent: AgentId, protocol: Protocol) {
+    pub fn update_protocol(&mut self, agent: AgentId, protocol: Protocol) -> Result<(), String> {
+        if !agent.supported_protocols().contains(&protocol) {
+            return Err(format!(
+                "{} does not support {}",
+                agent.display_name(),
+                protocol.display_name()
+            ));
+        }
+        if let Self::Connected { connection, .. } = self
+            && let Some(manifest) = &connection.manifest
+            && protocol
+                .wire_protocol()
+                .is_some_and(|wire| !manifest.gateway.protocols.contains(&wire))
+        {
+            return Err(format!(
+                "The Gateway does not advertise {}",
+                protocol.display_name()
+            ));
+        }
         if let Self::Connected {
             connection,
             managed_agents,
@@ -262,6 +280,7 @@ impl AppState {
             selection.protocol = protocol;
             *projection = projection_after_edit(managed_agents);
         }
+        Ok(())
     }
 
     pub fn update_model(&mut self, agent: AgentId, model: String) {
@@ -455,7 +474,6 @@ mod tests {
         let profile = ConnectionProfile::new(
             "Test",
             CanonicalBaseUrl::parse("https://example.com").expect("URL"),
-            Protocol::Auto,
         )
         .expect("profile");
         let mut state = AppState::connected(ConnectionResult {
@@ -467,12 +485,71 @@ mod tests {
         });
         let preview = PlanFixture::plan();
         state.set_preview(preview);
-        state.update_protocol(AgentId::Codex, Protocol::OpenaiResponses);
+        state
+            .update_protocol(AgentId::Codex, Protocol::OpenaiResponses)
+            .expect("Codex protocol");
         state.update_model(AgentId::Codex, "model-a".to_owned());
         let AppState::Connected { projection, .. } = state else {
             panic!("connected state")
         };
         assert!(matches!(projection, ProjectionLifecycle::NotPreviewed));
+    }
+
+    #[test]
+    fn incompatible_agent_protocol_is_rejected_without_mutating_state() {
+        let mut state = connected_fixture(Vec::new());
+        assert!(
+            state
+                .update_protocol(AgentId::Codex, Protocol::OpenaiChat)
+                .is_err()
+        );
+        let AppState::Connected { connection, .. } = state else {
+            panic!("connected")
+        };
+        assert_eq!(
+            connection.profile.agents[&AgentId::Codex].protocol,
+            Protocol::Auto
+        );
+    }
+
+    #[test]
+    fn unadvertised_protocol_is_rejected_without_mutating_state() {
+        use gateway_connector_core::{ConnectionManifest, Gateway, Platform, WireProtocol};
+
+        let mut state = connected_fixture(Vec::new());
+        let AppState::Connected { connection, .. } = &mut state else {
+            panic!("connected")
+        };
+        connection.manifest = Some(
+            ConnectionManifest::direct(
+                Platform {
+                    id: "test".into(),
+                    name: "Test".into(),
+                },
+                Gateway {
+                    base_url: "https://example.com".parse().expect("URL"),
+                    protocols: vec![WireProtocol::OpenaiResponses],
+                },
+                "https://example.com/provisioning"
+                    .parse()
+                    .expect("provisioning URL"),
+                vec![AgentId::Codex],
+            )
+            .expect("manifest"),
+        );
+
+        assert!(
+            state
+                .update_protocol(AgentId::Opencode, Protocol::Anthropic)
+                .is_err()
+        );
+        let AppState::Connected { connection, .. } = state else {
+            panic!("connected")
+        };
+        assert_eq!(
+            connection.profile.agents[&AgentId::Opencode].protocol,
+            Protocol::Auto
+        );
     }
 
     #[test]
@@ -562,7 +639,9 @@ mod tests {
         assert_eq!(state.mcp_evidence(), McpEvidence::AvailableFromPlatform);
 
         state.set_preview(PlanFixture::plan());
-        state.update_protocol(AgentId::Codex, Protocol::OpenaiResponses);
+        state
+            .update_protocol(AgentId::Codex, Protocol::OpenaiResponses)
+            .expect("Codex protocol");
         assert_eq!(
             projection_semantic(&state),
             ProjectionSemantic::ManagedExisting
@@ -681,7 +760,6 @@ mod tests {
         let profile = ConnectionProfile::new(
             "Test",
             CanonicalBaseUrl::parse("https://example.com").expect("URL"),
-            Protocol::Auto,
         )
         .expect("profile");
         AppState::connected(ConnectionResult {
@@ -709,8 +787,8 @@ mod tests {
     impl PlanFixture {
         fn plan() -> Plan {
             use gateway_connector_core::{
-                AgentInstall, ApplyInput, ConnectionManifest, Connector, Gateway, Model, Platform,
-                Provisioning, Secret,
+                AgentInstall, ApplyInput, ConnectionManifest, Connector, EffectiveAgentSelection,
+                Gateway, Model, Platform, Provisioning, Secret, WireProtocol,
             };
             let temp = tempfile::tempdir().expect("temp");
             let temp_root = std::fs::canonicalize(temp.path()).expect("canonical temp root");
@@ -723,7 +801,7 @@ mod tests {
                 },
                 Gateway {
                     base_url: "https://gateway.example".parse().expect("URL"),
-                    protocols: vec!["openai_responses".into()],
+                    protocols: vec![WireProtocol::OpenaiResponses],
                 },
                 "https://gateway.example".parse().expect("URL"),
                 vec![AgentId::Codex],
@@ -746,7 +824,15 @@ mod tests {
                     manifest: &manifest,
                     provisioning: &provisioning,
                     bearer: &Secret::new("secret").expect("secret"),
-                    selected_models: Default::default(),
+                    agents: [(
+                        AgentId::Codex,
+                        EffectiveAgentSelection {
+                            model: "model-a".into(),
+                            protocol: WireProtocol::OpenaiResponses,
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
                     installs: vec![AgentInstall {
                         agent: AgentId::Codex,
                         root,

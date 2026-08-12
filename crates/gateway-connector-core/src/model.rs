@@ -1,4 +1,4 @@
-use crate::{AgentId, Error, Result};
+use crate::{AgentId, Error, Result, WireProtocol};
 use serde::Deserialize;
 use std::{collections::BTreeSet, fmt};
 use url::Url;
@@ -52,7 +52,7 @@ pub struct Authentication {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Gateway {
     pub base_url: Url,
-    pub protocols: Vec<String>,
+    pub protocols: Vec<WireProtocol>,
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConnectionManifest {
@@ -113,6 +113,16 @@ impl ConnectionManifest {
             secure(&authentication.token_url)?;
         }
         secure(&self.gateway.base_url)?;
+        if self.gateway.base_url.cannot_be_a_base()
+            || self.gateway.base_url.query().is_some()
+            || !self.gateway.base_url.username().is_empty()
+            || self.gateway.base_url.password().is_some()
+        {
+            return Err(Error::Validation(
+                "gateway base URL must be a hierarchical endpoint without userinfo, query, or fragment"
+                    .into(),
+            ));
+        }
         secure(&self.provisioning_url)?;
         if self.connection_bearer_origins.is_empty() {
             return Err(Error::Validation(
@@ -157,6 +167,34 @@ impl ConnectionManifest {
             self.supported_agents.iter().map(|a| a.as_str()),
             "supported agent",
         )?;
+        if self.gateway.protocols.is_empty() {
+            return Err(Error::Validation("gateway protocols is empty".into()));
+        }
+        unique(
+            self.gateway
+                .protocols
+                .iter()
+                .map(|protocol| protocol.as_str()),
+            "gateway protocol",
+        )?;
+        let protocols = self
+            .gateway
+            .protocols
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for agent in &self.supported_agents {
+            if !agent
+                .supported_wire_protocols()
+                .iter()
+                .any(|protocol| protocols.contains(protocol))
+            {
+                return Err(Error::Validation(format!(
+                    "gateway advertises no protocol supported by {}",
+                    agent.display_name()
+                )));
+            }
+        }
         Ok(())
     }
 }

@@ -75,7 +75,9 @@ fail closed without rewriting the file.
 - Profiles persist a stable UUID, canonical URL, connection mode/platform,
   display name, per-Agent choices, a stable local credential id, and the
   API key or access token in the app profile config file (`profiles.json`).
-  Legacy schema-1 direct profiles migrate to schema 2 on load. Refresh tokens
+  Legacy schema-1/2 profiles migrate to schema 3 on load. The migration pins
+  each Agent to its previously effective wire protocol instead of activating
+  protocol values that older projectors persisted but ignored. Refresh tokens
   and provider account blobs are not retained. Failed credential commits keep
   a newly minted credential reachable for explicit retry or confirmed remote
   revocation.
@@ -232,7 +234,7 @@ guards immediately around staging, recovery, and mutation.
 
 ## Demonstrated phase-1 flow
 
-1. Enter a Gateway base URL, API key, and initial protocol.
+1. Enter a Gateway base URL and API key.
 2. **Connect / Test** canonicalizes the URL and resolves its model endpoint as
    shown above, without changing the configured origin. The generic binary then
    authenticates `GET /v1/models`. Branded distributions that pin a manifest may
@@ -242,9 +244,10 @@ guards immediately around staging, recovery, and mutation.
 4. The authenticated shell shows the canonical Gateway and discovered model
    count. The catalog can be refreshed and filtered by model ID/provider; a
    saved choice missing from a refreshed catalog remains visibly unavailable.
-   “Use for all Agents” sets a shared protocol/model before per-Agent
-   overrides. Changes are serialized through an ordered save queue and
-   persisted without the credential; save failures stay visible.
+   “Use for all Agents” sets only a shared model. Protocol is always selected
+   independently from the capabilities of each Agent and, in enhanced mode,
+   the protocols advertised by the Gateway. Changes are serialized through an
+   ordered save queue; save failures stay visible.
 5. Five distinct Agent pages show each canonical root, detection state,
    ownership, protocol, and model. **Preview changes** builds a fresh read-only
    plan and lists every managed path without changing Agent files. Apply stays
@@ -262,6 +265,22 @@ guards immediately around staging, recovery, and mutation.
    outside profile JSON. A later launch reloads the profile (including the key
    from local profile config) and refreshes `/v1/models` while preserving the
    stable profile ID and valid Agent selections.
+
+The concrete protocol matrix is intentionally asymmetric:
+
+| Agent | Supported wire protocols | `Auto` preference |
+| --- | --- | --- |
+| Claude Code | Anthropic Messages | Anthropic Messages |
+| Codex CLI | OpenAI Responses | OpenAI Responses |
+| Gemini CLI | Gemini native API | Gemini native API |
+| Grok Build | OpenAI Chat, OpenAI Responses, Anthropic Messages | first advertised in that order |
+| OpenCode | OpenAI Chat, OpenAI Responses, Anthropic Messages, Gemini | first advertised in that order |
+
+Direct mode discovers model IDs through the OpenAI-style `/v1/models`
+contract, but does not infer protocol support from that response. The configured
+Gateway must expose the native endpoint required by each selected Agent. `Auto`
+therefore resolves deterministically from the matrix above; it never probes or
+guesses protocol support.
 
 ## Release and CI policy
 

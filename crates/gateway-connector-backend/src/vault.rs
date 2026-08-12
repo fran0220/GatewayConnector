@@ -63,7 +63,9 @@ impl ProfileCredentialStore {
 
     fn load_profile(&self, profile_id: ProfileId) -> Result<Option<ConnectionProfile>, VaultError> {
         let profiles = self.profiles.load().map_err(VaultError::from)?;
-        Ok(profiles.into_iter().find(|profile| profile.id == profile_id))
+        Ok(profiles
+            .into_iter()
+            .find(|profile| profile.id == profile_id))
     }
 }
 
@@ -159,7 +161,7 @@ pub enum VaultError {
 mod tests {
     use super::*;
     use crate::InMemoryProfileStore;
-    use gateway_connector_core::{CanonicalBaseUrl, Protocol};
+    use gateway_connector_core::CanonicalBaseUrl;
     use std::sync::Arc;
 
     #[test]
@@ -169,7 +171,6 @@ mod tests {
         let profile = ConnectionProfile::new(
             "Test",
             CanonicalBaseUrl::parse("https://gateway.example").expect("base URL"),
-            Protocol::Auto,
         )
         .expect("profile");
         profiles.create(&profile).expect("create profile");
@@ -200,7 +201,6 @@ mod tests {
         let profile = ConnectionProfile::new(
             "Test",
             CanonicalBaseUrl::parse("https://gateway.example").expect("base URL"),
-            Protocol::Auto,
         )
         .expect("profile");
         let key = ApiKey::new("very-secret").expect("valid key");

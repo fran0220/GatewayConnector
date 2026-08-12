@@ -70,8 +70,8 @@ impl Locale {
             "Not connected" => "未连接",
             "Loading saved connection" => "正在加载已保存的连接",
             "Connect a Gateway" => "连接网关",
-            "Enter any OpenAI-compatible Gateway URL and API key." => {
-                "输入任意兼容 OpenAI 的网关 URL 与 API 密钥。"
+            "Enter a Gateway URL with OpenAI-style model discovery and the native Agent APIs you intend to use." => {
+                "输入支持 OpenAI 风格模型发现及所需 Agent 原生 API 的网关 URL。"
             }
             "Gateway base URL" => "网关基础 URL",
             "Root or nested prefix; /v1 and /v1/models forms are also accepted. HTTPS except loopback." => {
@@ -81,7 +81,6 @@ impl Locale {
             "Stored in this app's local profile config. Leave blank when the platform advertises browser login." => {
                 "保存在本应用本地配置中。平台提供浏览器登录时可留空。"
             }
-            "Default protocol" => "默认协议",
             "Connect / Test" => "连接 / 测试",
             "Testing connection" => "正在测试连接",
             "Browser login available" => "可使用浏览器登录",
@@ -99,8 +98,8 @@ impl Locale {
                 "按模型 ID 或提供方筛选所有 Agent；不可用的已保存选项仍会显示。"
             }
             "Use for all Agents" => "用于所有 Agent",
-            "Choose a shared default, then override any Agent on its page." => {
-                "先选择共享默认值，再到各 Agent 页面单独覆盖。"
+            "Choose a shared model, then override any Agent on its page. Protocols are configured per Agent." => {
+                "先选择共享模型，再到各 Agent 页面单独覆盖。协议须按 Agent 分别配置。"
             }
             "Connection overview" => "连接概览",
             "Agent default" => "Agent 默认值",

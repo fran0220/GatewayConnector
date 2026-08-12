@@ -1070,12 +1070,16 @@ mod tests {
                 display_name: "Isolated Test".into(),
                 base_url,
                 api_key: ApiKey::new("isolated-secret").expect("credential"),
-                protocol: Protocol::OpenaiChat,
             })
             .expect("connect");
         assert!(connection.synchronized_skills.is_empty());
-        for selection in connection.profile.agents.values_mut() {
-            selection.protocol = Protocol::OpenaiChat;
+        for (agent, selection) in &mut connection.profile.agents {
+            selection.protocol = match agent {
+                AgentId::Claude => Protocol::Anthropic,
+                AgentId::Codex => Protocol::OpenaiResponses,
+                AgentId::Gemini => Protocol::Gemini,
+                AgentId::Grokbuild | AgentId::Opencode => Protocol::OpenaiChat,
+            };
             selection.default_model = Some("chat-model".into());
         }
         backend
@@ -1319,7 +1323,6 @@ mod tests {
                 display_name: "Isolated Provisioned Test".into(),
                 base_url,
                 api_key: ApiKey::new("isolated-secret").expect("credential"),
-                protocol: Protocol::OpenaiChat,
             })
             .expect("connect");
         assert_eq!(connected.synchronized_skills.len(), 1);
@@ -1455,7 +1458,7 @@ mod tests {
             "data": {
                 "schema_version": 2,
                 "platform": {"id": "isolated-test", "name": "Isolated Test"},
-                "gateway": {"base_url": base_url, "protocols": ["openai_chat"]},
+                "gateway": {"base_url": base_url, "protocols": ["openai_chat", "openai_responses", "anthropic", "gemini"]},
                 "provisioning_url": format!("{base_url}/provisioning"),
                 "connection_bearer_origins": [base_url, "https://services.example"],
                 "supported_agents": ["claude", "codex", "gemini", "grokbuild", "opencode"]

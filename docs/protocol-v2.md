@@ -32,8 +32,8 @@ response is the normal OpenAI list shape:
 
 `id` is required. Unknown per-model fields are retained as metadata. The client
 trims IDs, merges duplicate IDs without discarding useful optional metadata,
-and sorts by ID. `auto` means this conservative OpenAI-compatible discovery;
-it does not scan speculative endpoints.
+and sorts by ID. Discovery is always this conservative OpenAI-compatible
+request; it does not scan speculative endpoints or infer other wire protocols.
 
 ## Manifest discovery
 
@@ -88,8 +88,26 @@ The response envelope and schema-v2 document are:
 `authentication` is optional. URLs must use HTTPS, except literal loopback HTTP
 for development. Each `connection_bearer_origins` entry must be an origin—no
 path, query, fragment, or userinfo—and must include both the Gateway and
-provisioning origins. Supported protocol IDs are `auto`, `openai_chat`,
-`openai_responses`, `anthropic`, and `gemini`.
+provisioning origins. Manifest `gateway.protocols` accepts only concrete wire
+protocol IDs: `openai_chat`, `openai_responses`, `anthropic`, and `gemini`.
+`auto` is a local per-Agent profile preference, never a manifest capability.
+Every advertised Agent must have at least one compatible advertised wire
+protocol.
+
+The local Agent capability matrix is:
+
+| Agent | Compatible wire protocols |
+| --- | --- |
+| Claude Code | `anthropic` |
+| Codex CLI | `openai_responses` |
+| Gemini CLI | `gemini` |
+| Grok Build | `openai_chat`, `openai_responses`, `anthropic` |
+| OpenCode | all four concrete protocols |
+
+For `auto`, the client intersects this matrix with manifest capabilities in
+the listed order. In direct mode there is no protocol capability document, so
+the same order resolves deterministically without inferring support from the
+OpenAI-style model-list response.
 
 ## Browser PKCE
 

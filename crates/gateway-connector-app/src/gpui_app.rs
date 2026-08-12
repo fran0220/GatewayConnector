@@ -74,9 +74,7 @@ struct ConnectorView {
     model_query: String,
     plaza_search: Entity<TextInput>,
     plaza_query: String,
-    initial_protocol: Entity<Select>,
     all_model: Entity<Select>,
-    all_protocol: Entity<Select>,
     model_selects: Vec<(AgentId, Entity<Select>)>,
     protocol_selects: Vec<(AgentId, Entity<Select>)>,
     save_in_flight: bool,
@@ -129,8 +127,6 @@ impl ConnectorView {
                 .placeholder("API key, or leave blank for advertised browser login")
                 .secret(true)
         });
-        let initial_protocol =
-            cx.new(|cx| protocol_select("connector.initial-protocol", window, cx));
         let model_search = cx.new(|cx| {
             TextInput::new("connector.model-search", window, cx)
                 .name(locale.text("Search model catalog"))
@@ -146,7 +142,6 @@ impl ConnectorView {
                 .name("All Agent models")
                 .placeholder("Choose one model for all Agents")
         });
-        let all_protocol = cx.new(|cx| protocol_select("connector.all.protocol", window, cx));
         let mut model_selects = Vec::new();
         let mut protocol_selects = Vec::new();
         for agent in AgentId::ALL {
@@ -160,7 +155,10 @@ impl ConnectorView {
                 }),
             ));
             let protocol_id = format!("connector.{}.protocol", agent.as_str());
-            protocol_selects.push((agent, cx.new(|cx| protocol_select(protocol_id, window, cx))));
+            protocol_selects.push((
+                agent,
+                cx.new(|cx| protocol_select(agent, protocol_id, window, cx)),
+            ));
         }
 
         for (agent, select) in &model_selects {
@@ -185,12 +183,6 @@ impl ConnectorView {
             })
             .detach();
         }
-        cx.subscribe(&initial_protocol, |_this, select, event, cx| {
-            if let SelectEvent::Selected(id) = event {
-                select.update(cx, |select, cx| select.set_selected(Some(id.clone()), cx));
-            }
-        })
-        .detach();
         cx.subscribe(&model_search, |this, _, event: &TextInputEvent, cx| {
             if let TextInputEvent::Change(value) = event {
                 this.model_query = value.to_string();
@@ -210,15 +202,6 @@ impl ConnectorView {
             if let SelectEvent::Selected(id) = event {
                 select.update(cx, |select, cx| select.set_selected(Some(id.clone()), cx));
                 this.use_model_for_all(id.to_string(), cx);
-            }
-        })
-        .detach();
-        cx.subscribe(&all_protocol, |this, select, event, cx| {
-            if let SelectEvent::Selected(id) = event {
-                select.update(cx, |select, cx| select.set_selected(Some(id.clone()), cx));
-                if let Ok(protocol) = id.parse() {
-                    this.use_protocol_for_all(protocol, cx);
-                }
             }
         })
         .detach();
@@ -292,9 +275,7 @@ impl ConnectorView {
             model_query: String::new(),
             plaza_search,
             plaza_query: String::new(),
-            initial_protocol,
             all_model,
-            all_protocol,
             model_selects,
             protocol_selects,
             save_in_flight: false,
@@ -401,12 +382,6 @@ impl ConnectorView {
         }
         let base_url = self.gateway_url.read(cx).value().to_string();
         let raw_key = self.api_key.read(cx).value().to_string();
-        let protocol = self
-            .initial_protocol
-            .read(cx)
-            .selected_id()
-            .and_then(|id| id.parse().ok())
-            .unwrap_or(Protocol::Auto);
         let display_name = display_name(&base_url);
         let backend = Arc::clone(&self.backend);
         self.state = AppState::Connecting;
@@ -429,7 +404,6 @@ impl ConnectorView {
                                     request: ConnectRequestWithoutCredential {
                                         display_name,
                                         base_url,
-                                        protocol,
                                     },
                                     manifest_url,
                                     manifest: *manifest,
@@ -453,7 +427,6 @@ impl ConnectorView {
                         display_name,
                         base_url,
                         api_key,
-                        protocol,
                     }) {
                         Ok(result) => ConnectOutcome::Connected(Box::new(result)),
                         Err(BackendError::BrowserLoginRequired(offer)) => {
@@ -511,12 +484,6 @@ impl ConnectorView {
     }
 
     fn complete_connection(&mut self, result: ConnectionResult, cx: &mut Context<Self>) {
-        for (agent, select) in &self.protocol_selects {
-            let selected = result.profile.agents[agent].protocol.as_str();
-            select.update(cx, |select, cx| {
-                select.set_selected(Some(selected.into()), cx)
-            });
-        }
         self.api_key.update(cx, |input, cx| input.set_value("", cx));
         self.save_error = None;
         self.action_error = None;
@@ -525,7 +492,7 @@ impl ConnectorView {
         }
         self.state = AppState::connected(result);
         self.sync_model_selects(cx);
-        self.sync_all_protocol(cx);
+        self.sync_protocol_selects(cx);
         self.begin_projection_status(cx);
     }
 
@@ -630,14 +597,18 @@ impl ConnectorView {
             return;
         }
         self.sync_model_selects(cx);
-        self.sync_all_protocol(cx);
         self.queue_profile_save(cx);
         cx.notify();
     }
 
     fn commit_protocol(&mut self, agent: AgentId, protocol: Protocol, cx: &mut Context<Self>) {
-        self.state.update_protocol(agent, protocol);
-        self.sync_all_protocol(cx);
+        if let Err(error) = self.state.update_protocol(agent, protocol) {
+            self.action_error = Some(error);
+            self.sync_protocol_selects(cx);
+            cx.notify();
+            return;
+        }
+        self.sync_protocol_selects(cx);
         self.queue_profile_save(cx);
         cx.notify();
     }
@@ -654,30 +625,39 @@ impl ConnectorView {
         cx.notify();
     }
 
-    fn use_protocol_for_all(&mut self, protocol: Protocol, cx: &mut Context<Self>) {
-        for (agent, select) in &self.protocol_selects {
-            self.state.update_protocol(*agent, protocol);
-            select.update(cx, |select, cx| {
-                select.set_selected(Some(protocol.as_str().into()), cx)
-            });
-        }
-        self.sync_all_protocol(cx);
-        self.queue_profile_save(cx);
-        cx.notify();
-    }
-
-    fn sync_all_protocol(&self, cx: &mut Context<Self>) {
+    fn sync_protocol_selects(&self, cx: &mut Context<Self>) {
         let AppState::Connected { connection, .. } = &self.state else {
             return;
         };
-        let first = connection.profile.agents[&AgentId::Claude].protocol;
-        let common = AgentId::ALL
-            .iter()
-            .all(|agent| connection.profile.agents[agent].protocol == first)
-            .then_some(first.as_str());
-        self.all_protocol.update(cx, |select, cx| {
-            select.set_selected(common.map(Into::into), cx)
-        });
+        for (agent, select) in &self.protocol_selects {
+            let selected = connection.profile.agents[agent].protocol;
+            let options = agent
+                .supported_protocols()
+                .iter()
+                .copied()
+                .map(|protocol| {
+                    let available = protocol == Protocol::Auto
+                        || connection.manifest.as_ref().is_none_or(|manifest| {
+                            protocol
+                                .wire_protocol()
+                                .is_some_and(|wire| manifest.gateway.protocols.contains(&wire))
+                        });
+                    let mut option = SelectOption::new(protocol.as_str(), protocol.display_name());
+                    if !available {
+                        option = option
+                            .description("This protocol is not advertised by the Gateway")
+                            .disabled(true);
+                    }
+                    option
+                })
+                .collect::<Vec<_>>();
+            let disabled = self.projection_busy || options.len() == 1;
+            select.update(cx, |select, cx| {
+                select.set_options(options, cx);
+                select.set_selected(Some(selected.as_str().into()), cx);
+                select.set_disabled(disabled, cx);
+            });
+        }
     }
 
     fn queue_profile_save(&mut self, cx: &mut Context<Self>) {
@@ -735,12 +715,8 @@ impl ConnectorView {
 
     fn set_projection_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
         self.projection_busy = busy;
-        for (_, select) in &self.protocol_selects {
-            select.update(cx, |select, cx| select.set_disabled(busy, cx));
-        }
-        self.all_protocol
-            .update(cx, |select, cx| select.set_disabled(busy, cx));
         self.sync_model_selects(cx);
+        self.sync_protocol_selects(cx);
     }
 
     fn begin_refresh(&mut self, cx: &mut Context<Self>) {
@@ -942,10 +918,6 @@ impl ConnectorView {
                         this.gateway_url.update(cx, |input, cx| {
                             input.set_value(profile.base_url.to_string(), cx)
                         });
-                        let protocol = profile.agents[&AgentId::Claude].protocol.as_str();
-                        this.initial_protocol.update(cx, |select, cx| {
-                            select.set_selected(Some(protocol.into()), cx)
-                        });
                         this.pending_save = None;
                         this.save_error = None;
                         this.action_error = None;
@@ -1015,7 +987,7 @@ impl ConnectorView {
                     )
                     .child(div().text_color(cx.theme().colors.text_muted).child(
                         locale.text(
-                            "Enter any OpenAI-compatible Gateway URL and API key.",
+                            "Enter a Gateway URL with OpenAI-style model discovery and the native Agent APIs you intend to use.",
                         ),
                     ))
                     .child(
@@ -1040,15 +1012,6 @@ impl ConnectorView {
                                 locale.text("Stored in this app's local profile config. Leave blank when the platform advertises browser login."),
                             )
                             .child(self.api_key.clone()),
-                    )
-                    .child(
-                        FormField::new(
-                            "connector.initial-protocol.field",
-                            locale.text("Default protocol"),
-                        )
-                            .control("connector.initial-protocol")
-                            .required(true)
-                            .child(self.initial_protocol.clone()),
                     )
                     .children(error.map(|message| {
                         Callout::new(message.to_owned(), Tone::Danger)
@@ -1718,9 +1681,8 @@ impl ConnectorView {
                             .child(
                                 div()
                                     .text_color(cx.theme().colors.text_muted)
-                                    .child(locale.text("Choose a shared default, then override any Agent on its page.")),
+                                    .child(locale.text("Choose a shared model, then override any Agent on its page. Protocols are configured per Agent.")),
                             )
-                            .child(self.all_protocol.clone())
                             .child(self.all_model.clone()),
                     ),
                 );
@@ -2068,6 +2030,7 @@ fn apply_theme(preference: ThemePreference, cx: &mut App) {
 }
 
 fn protocol_select(
+    agent: AgentId,
     id: impl Into<gpui_kit::foundation::Ident>,
     window: &mut Window,
     cx: &mut Context<Select>,
@@ -2075,7 +2038,9 @@ fn protocol_select(
     Select::new(id, window, cx)
         .name("Protocol")
         .options(
-            Protocol::ALL
+            agent
+                .supported_protocols()
+                .iter()
                 .map(|protocol| SelectOption::new(protocol.as_str(), protocol.display_name())),
         )
         .selected(Protocol::Auto.as_str())
